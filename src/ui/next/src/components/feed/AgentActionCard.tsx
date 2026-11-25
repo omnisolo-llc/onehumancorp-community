@@ -1,0 +1,2853 @@
+import { ShiftReassignmentCard } from "../../app/dashboard/ShiftReassignmentCard";
+import { InstagramDMCard } from "../../app/dashboard/InstagramDMCard";
+import { AmbassadorReplyCard } from "../../app/dashboard/AmbassadorReplyCard";
+import { QuoteReviewModal } from "../QuoteReviewModal";
+import { ReviewFeedCard } from "../../app/dashboard/ReviewFeedCard";
+import React from "react";
+
+import type { AgentFeedItem } from '@/lib/agent-feed-types';
+
+const specializedFeatureTypes = new Set([
+  "ambassador_reply", "autonomous_booking_quote", "booking_draft", "booking_approval",
+  "booking_reengagement", "create_product", "incident_resolution",
+  "instagram_dm", "invoice", "invoice_draft", "invoice_followup",
+  "newsletter_draft", "onboarding_welcome", "order", "proactive_ops",
+  "quote_draft", "review", "shift_reassignment", "social_post_draft",
+  "stockout_restock_and_price", "subscription_churn_risk",
+  "subscription_replenishment", "supply_order", "task", "triage",
+]);
+
+export interface AgentActionCardProps {
+  approval: AgentFeedItem;
+  queuedActionIds: Set<string>;
+  editingId: string | null;
+  editContent: string;
+  editQuotePrice: string;
+  editQuoteScope: string;
+  setEditingId: (id: string | null) => void;
+  setEditContent: (content: string) => void;
+  setEditQuotePrice: (price: string) => void;
+  setEditQuoteScope: (scope: string) => void;
+  handleDecision: (
+    id: string,
+    approved: boolean,
+    editContent?: string,
+    event_source?: string,
+  ) => void | boolean | Promise<void | boolean>;
+}
+
+export const AgentActionCard: React.FC<AgentActionCardProps> = ({ approval, queuedActionIds, editingId, editContent, setEditingId, setEditContent, handleDecision: rawHandleDecision }) => {
+  const [loadingAction, setLoadingAction] = React.useState<string | null>(null);
+  const [isDraftExpanded, setIsDraftExpanded] = React.useState(false);
+  const [isApproved, setIsApproved] = React.useState(false);
+
+  const handleDecision = async (
+    id: string,
+    approved: boolean,
+    editContentValue?: string,
+    event_source?: string,
+    actionName?: string,
+  ) => {
+    try {
+      setLoadingAction(actionName || (approved ? "approve" : "dismiss"));
+      const accepted = await rawHandleDecision(id, approved, editContentValue, event_source);
+      setIsApproved(approved && accepted === true);
+      return accepted === true;
+    } catch (e) {
+      console.error("Decision failed", e);
+      setIsApproved(false);
+      return false;
+    } finally {
+      // If the component is still mounted, remove loading state
+      setLoadingAction(null);
+    }
+  };
+
+  const wrapDecision = handleDecision;
+
+  const isActionLoading = (actionName: string) => loadingAction === actionName;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const safeJsonParse = (val: any): Record<string, any> => {
+    if (!val) return {};
+    if (typeof val === "object") return val;
+    if (typeof val === "string") {
+      try {
+        const parsed = JSON.parse(val);
+        return typeof parsed === "object" && parsed !== null ? parsed : { message: val, text: val };
+      } catch {
+        return { message: val, text: val };
+      }
+    }
+    return {};
+  };
+
+  const parsedProposed = safeJsonParse(approval.proposed_action);
+  const parsedContext = safeJsonParse(approval.context_payload);
+  const parsedDirectPayload = safeJsonParse(approval.payload);
+  const actionPayload = Object.keys(parsedProposed).length > 0 ? parsedProposed : (Object.keys(parsedDirectPayload).length > 0 ? parsedDirectPayload : parsedContext);
+  const proposedText = [actionPayload.generated_response, actionPayload.draft_reply]
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const isDailyPrepChecklist = parsedProposed.action_type === "Daily Prep Checklist"
+    || parsedContext.feature_type === "daily_prep_checklist"
+    || actionPayload.feature_type === "daily_prep_checklist";
+  const structuredContext = typeof actionPayload.context === "object" && actionPayload.context !== null ? actionPayload.context : {};
+  const hasSpecializedRenderer = isDailyPrepChecklist
+    || specializedFeatureTypes.has(actionPayload.feature_type)
+    || parsedContext.feature_type === "ambassador_reply"
+    || approval.event_source.toLowerCase() === "ambassador";
+
+  if (
+    actionPayload?.feature_type ===
+    "shift_reassignment"
+  ) {
+    return (
+      <ShiftReassignmentCard
+        approval={approval}
+        queuedActionIds={queuedActionIds}
+        handleDecision={handleDecision}
+      />
+    );
+  }
+
+  if (
+    approval.event_source === "CustomerSuccessAgent" ||
+    approval.event_source === "customer_success_agent"
+  ) {
+    const draftText =
+      (actionPayload?.draft as string) ||
+      (actionPayload?.draft_reply as string) ||
+      (parsedProposed?.draft as string) ||
+      (parsedProposed?.draft_reply as string) ||
+      (parsedDirectPayload?.draft as string) ||
+      (parsedContext?.draft as string) ||
+      "No draft available.";
+    const description =
+      parsedContext?.description ||
+      approval.context_payload?.description ||
+      approval.description ||
+      "";
+    return (
+      <div
+        key={approval.id}
+        className={`glassmorphism app-list-item bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(0,102,255,0.4)] rounded-[16px] p-5 shadow-sm flex flex-col gap-4 transition-all duration-300 overflow-hidden break-words whitespace-normal relative ${isApproved || approval.lifecycle_state === "APPROVED" ? "!border-green-500 border-green-500 scale-95" : ""}`}
+        data-testid={`triage-card-${approval.id}`}
+      >
+        <div className="absolute top-0 left-0 w-1 h-full bg-[#0066FF]" />
+        <div className="flex justify-between items-start mb-2">
+          <h2 className="text-xl font-bold text-[#1D1D1F] dark:text-[#F5F5F7] flex items-center gap-2 m-0 font-outfit">
+            <span className="text-2xl">✨</span> Needs Attention: Pending Draft
+          </h2>
+          <div className="text-xs font-semibold text-[#0066FF] bg-[#0066FF]/10 px-2 py-1 rounded-[8px]">
+            Action Needed
+          </div>
+        </div>
+        <div className="font-medium text-base text-[#1D1D1F] dark:text-[#F5F5F7]">
+          {description}
+        </div>
+        <div
+          className="bg-[#0066FF]/5 border border-[#0066FF]/10 p-3 rounded-[8px] mb-2 text-sm text-[#0044BB] dark:text-[#60A5FA]"
+          data-testid={`triage-draft-${approval.id}`}
+        >
+          <span className="font-semibold text-[10px] uppercase tracking-wider mb-1 block">
+            Agent&apos;s Proposed Reply
+          </span>
+          {draftText}
+        </div>
+        <div className="flex flex-col gap-2 mt-2">
+          <button
+            className="w-full min-h-[44px] min-w-[44px] bg-[#0066FF] text-white p-3 rounded-[16px] font-semibold border-none shadow-[0_4px_12px_rgba(0,102,255,0.3)] cursor-pointer flex items-center justify-center transition-all hover:bg-blue-600"
+            data-testid={`triage-approve-${approval.id}`}
+            onClick={() => handleDecision(approval.id, true, draftText, approval.event_source)}
+          >
+            <span className="btn-text">Approve & Send</span>
+          </button>
+          <button
+            className="w-full min-h-[44px] min-w-[44px] bg-white/65 dark:bg-black/40 backdrop-blur-[30px] border border-[#0066FF]/30 rounded-[16px] text-[#0066FF] dark:text-blue-400 p-3 font-semibold cursor-pointer hover:bg-white/80"
+            data-testid={`triage-dismiss-${approval.id}`}
+            onClick={() => handleDecision(approval.id, false, undefined, approval.event_source)}
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      key={approval.id}
+      className={`glassmorphism app-list-item bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] rounded-[16px] p-5 shadow-sm flex flex-col gap-4 transition-all duration-300 overflow-hidden break-words whitespace-normal ${isApproved || approval.lifecycle_state === "APPROVED" ? "!border-green-500 border-green-500 scale-95" : ""} ${approval.event_source?.includes("marketing") ? "!border-t-[4px] !border-t-pink-500" : approval.event_source?.includes("operations") ? "!border-t-[4px] !border-t-blue-500" : approval.event_source?.includes("sales") || approval.event_source?.includes("triage") ? "!border-t-[4px] !border-t-green-500" : ""}`}
+      data-testid={`triage-card-${approval.id}`}
+    >
+      <div className="flex flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-bold uppercase tracking-wider text-[#0066FF] bg-[#0066FF]/10 dark:bg-[#0066FF]/20 px-2 py-1 rounded-[8px]">
+            Approval
+          </span>
+          <span className="text-xs font-bold uppercase tracking-wider text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-900/30 px-2 py-1 rounded-[8px]">
+            {approval.event_source.replace("_", " ")}
+          </span>
+          {approval.lifecycle_state === "PENDING_APPROVAL" && (
+            <span className="text-xs font-bold uppercase tracking-wider text-green-700 bg-green-100 px-2 py-1 rounded-[8px]">
+              {approval.event_source === "customer_success_agent" ||
+              approval.event_source === "instagram_dm" ||
+              approval.context_payload?.feature_type === "ambassador_reply"
+                ? "Action Required: Approve Reply"
+                : "Action Needed"}
+            </span>
+          )}
+          {queuedActionIds.has(approval.id) && (
+            <span
+              className="text-xs font-bold uppercase tracking-wider text-yellow-600 bg-yellow-50 px-2 py-1 rounded-[8px] shadow-sm border border-yellow-200"
+              data-testid="queued-badge"
+            >
+              Queued
+            </span>
+          )}
+        </div>
+        <h3 className="text-lg font-semibold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] leading-snug mt-1 tracking-wide break-words">
+          {actionPayload
+            ?.feature_type === "invoice_draft"
+            ? `Draft Invoice ready for ${actionPayload?.milestone_name || "Phase 1"}`
+            : actionPayload
+                  ?.feature_type === "ambassador_reply"
+              ? "Action Required: Approve Reply"
+              : approval.description ||
+                approval.context_payload?.description ||
+                approval.proposed_action?.message ||
+                approval.proposed_action?.description ||
+                approval.proposed_action?.action_type ||
+                approval.event_source}
+        </h3>
+        {(isDailyPrepChecklist || actionPayload?.context ||
+          actionPayload
+            ?.remaining_stock !== undefined ||
+          actionPayload
+            ?.feature_type === "quote_draft" ||
+          actionPayload
+            ?.feature_type === "create_product" ||
+          actionPayload
+            ?.feature_type === "social_post_draft" ||
+          actionPayload
+            ?.feature_type === "invoice_draft" ||
+          actionPayload
+            ?.feature_type === "invoice_followup" ||
+          actionPayload
+            ?.feature_type === "ambassador_reply" ||
+          actionPayload
+            ?.feature_type === "incident_resolution" ||
+          actionPayload
+            ?.feature_type === "booking_draft" ||
+          actionPayload
+            ?.feature_type === "booking_approval" ||
+          actionPayload
+            ?.feature_type === "booking_reengagement" ||
+          actionPayload
+            ?.feature_type === "instagram_dm" ||
+          actionPayload
+            ?.feature_type === "subscription_replenishment" ||
+          actionPayload
+            ?.feature_type === "subscription_churn_risk" ||
+          actionPayload
+            ?.feature_type === "onboarding_welcome" ||
+          actionPayload
+            ?.feature_type === "proactive_ops" ||
+          actionPayload
+            ?.feature_type === "invoice_followup") && (
+          <div className="mt-2 flex flex-col gap-1 p-3 bg-gray-50 dark:bg-gray-800/50 rounded-[8px]">
+            {actionPayload
+              ?.feature_type === "incident_resolution" && (
+              <div
+                className="mb-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/50 flex flex-col gap-3"
+                data-testid="incident-resolution-card"
+              >
+                <div className="flex items-center gap-2 text-red-600 font-semibold text-sm">
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                    />
+                  </svg>
+                  CRITICAL INCIDENT
+                </div>
+                <p className="text-gray-700 dark:text-gray-300 text-sm break-words">
+                  {actionPayload
+                    ?.description ||
+                    "An operational issue requires immediate attention."}
+                </p>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "onboarding_welcome" && (
+              <div
+                className="mb-4 p-4 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] flex flex-col gap-3"
+                data-testid="onboarding-welcome-card"
+              >
+                <div className="flex items-center gap-2 text-[#0066FF] font-semibold text-sm">
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M5 13l4 4L19 7"
+                    />
+                  </svg>
+                  Setup Complete
+                </div>
+                <p className="text-sm text-gray-800 dark:text-gray-200">
+                  {approval.context_payload?.description ||
+                    approval.proposed_action?.description ||
+                    "Welcome to OmniSolo OneHumanCorp! I've set up your business. Click here to review your new storefront."}
+                </p>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "instagram_dm" && (
+              <InstagramDMCard
+                approval={approval}
+                onApprove={() =>
+                  wrapDecision(
+                    approval.id,
+                    true,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                onDismiss={() =>
+                  wrapDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+              />
+            )}
+            {actionPayload
+              ?.feature_type === "invoice_draft" && (
+              <div className="flex flex-col gap-3">
+                <div className="bg-green-50 dark:bg-green-900/20 p-3 rounded-lg border border-green-100 dark:border-green-800/50">
+                  <p className="text-[13px] text-green-700 dark:text-green-300 font-medium mb-1">
+                    Generated Invoice
+                  </p>
+                  <p className="text-[11px] text-green-600/70 dark:text-green-400/70">
+                    Review the drafted invoice. Select "Approve & Send" to email
+                    the client and generate a secure payment link.
+                  </p>
+                </div>
+                <div className="space-y-3 mt-2">
+                  <div className="p-3 bg-white dark:bg-gray-800 rounded-lg border border-gray-100 dark:border-gray-700 shadow-sm">
+                    <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1 flex items-center gap-1">
+                      Project
+                    </p>
+                    <p className="text-[13px] font-medium text-gray-800 dark:text-gray-200">
+                      {
+                        actionPayload
+                          ?.project_name
+                      }
+                    </p>
+                    <p className="text-[11px] text-gray-500 mt-0.5">
+                      {
+                        actionPayload
+                          ?.milestone_name
+                      }
+                    </p>
+                  </div>
+                  {actionPayload?.line_items && (
+                    <div className="p-3 bg-white dark:bg-gray-800 rounded-lg border border-gray-100 dark:border-gray-700 shadow-sm mt-2">
+                       <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-1">
+                        Line Items
+                      </p>
+                      <ul className="space-y-2">
+                        {(actionPayload?.line_items || []).map((item, idx) => (
+                           <li key={idx} className="flex justify-between items-center text-[12px]">
+                            <span className="text-gray-700 dark:text-gray-300">{item.description}</span>
+                            <span className="font-medium text-gray-900 dark:text-gray-100">${(item.amount_cents / 100).toFixed(2)}</span>
+                           </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-center p-3 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-100 dark:border-gray-700 mt-2">
+                    <span className="text-[12px] font-medium text-gray-600 dark:text-gray-400">
+                      Total Amount Due
+                    </span>
+                    <span className="text-[16px] font-bold text-gray-900 dark:text-white">
+                      $
+                      {(
+                        actionPayload
+                          ?.amount_cents / 100
+                      ).toFixed(2)}
+                    </span>
+                  </div>
+                  {actionPayload?.drafted_email && (
+                     <div className="p-3 bg-white dark:bg-gray-800 rounded-lg border border-gray-100 dark:border-gray-700 shadow-sm mt-2">
+                         <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1 flex items-center gap-1">
+                          Drafted Email
+                        </p>
+                        <p className="text-[12px] text-gray-700 dark:text-gray-300 italic whitespace-pre-wrap">
+                          "{actionPayload?.drafted_email?.generated_message}"
+                        </p>
+                     </div>
+                  )}
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "invoice" && (
+              <div className="mb-4 p-4 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] flex flex-col gap-3 shadow-sm rounded-xl" data-testid="invoice-card">
+                <div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-400 font-semibold text-sm">
+                  <span className="w-5 h-5 flex items-center justify-center text-xl">
+                    🧾
+                  </span>
+                  Invoice Follow-up
+                </div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 font-medium break-words">
+                  Details: <span className="inline break-words font-semibold text-gray-800 dark:text-gray-200">{(approval.context_payload)?.description || "Invoice requires attention."}</span>
+                </div>
+
+                <div className="flex flex-col sm:flex-row gap-3 w-full mt-2">
+                  <button
+                    type="button"
+                    className="app-btn-primary flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 bg-indigo-600 text-white rounded-[8px] font-medium hover:bg-indigo-700 shadow-md transition-all flex items-center justify-center"
+                    onClick={() =>
+                      wrapDecision(approval.id, true, undefined, "invoice")
+                    }
+                    disabled={loadingAction !== null}
+                    data-testid="feed-approve-btn"
+                  >
+                    {isActionLoading("approve") ? (
+                      <span className="animate-pulse">Processing...</span>
+                    ) : (
+                      "Send Reminder"
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] hover:bg-gray-100 dark:hover:bg-gray-800 rounded-[8px] font-medium transition-all"
+                    onClick={() =>
+                      wrapDecision(approval.id, false, undefined, "invoice")
+                    }
+                    disabled={loadingAction !== null}
+                    data-testid="feed-dismiss-btn"
+                  >
+                    {isActionLoading("dismiss") ? (
+                      <span className="animate-pulse">Loading...</span>
+                    ) : (
+                      "Dismiss"
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "invoice_followup" && (
+              <div className="flex flex-col gap-3">
+                <div className="bg-amber-50 dark:bg-amber-900/20 p-3 rounded-lg border border-amber-100 dark:border-amber-800/50">
+                  <p className="text-[13px] text-amber-700 dark:text-amber-300 font-medium mb-1">
+                    {actionPayload?.original_message}
+                  </p>
+                  <p className="text-[11px] text-amber-600/70 dark:text-amber-400/70">
+                    Drafted a reminder for {actionPayload?.suggested_channel || 'email'}.
+                  </p>
+                </div>
+                <div className="p-3 bg-white dark:bg-gray-800 rounded-lg border border-gray-100 dark:border-gray-700 shadow-sm relative group">
+                  <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1 flex items-center gap-1">Drafted Message</span>
+                  <p className="text-[13px] text-gray-800 dark:text-gray-200 mt-1">{actionPayload?.generated_response}</p>
+                </div>
+              </div>
+            )}
+            {(actionPayload?.feature_type === "ambassador_reply" ||
+              parsedProposed?.feature_type === "ambassador_reply" ||
+              parsedContext?.feature_type === "ambassador_reply" ||
+              approval.event_source?.toLowerCase() === "ambassador") && (
+              <AmbassadorReplyCard
+                approval={approval}
+                isEditing={editingId === approval.id}
+                editContent={editContent}
+                setEditContent={setEditContent}
+                onEdit={() => {
+                  setEditingId(approval.id);
+                  const textToEdit = approval.payload?.generated_response || actionPayload?.generated_response || actionPayload?.original_payload?.generated_response || approval.payload?.original_payload?.generated_response || "";
+                  setEditContent(textToEdit);
+                }}
+                onCancelEdit={() => setEditingId(null)}
+                onSaveEdit={() => {
+                  handleDecision(approval.id, true, editContent, approval.event_source);
+                  setEditingId(null);
+                }}
+                onApprove={() =>
+                  wrapDecision(
+                    approval.id,
+                    true,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                onDismiss={() =>
+                  wrapDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+              />
+            )}
+            {actionPayload
+              ?.feature_type === "review" && (
+              <ReviewFeedCard
+                review={approval.context_payload?.review}
+                response={approval.proposed_action?.response}
+                onApprove={async (responseId, content) => {
+                  if (responseId !== approval.proposed_action?.response?.id) throw new Error('Review response does not match this approval');
+                  await wrapDecision(approval.id, true, content, "review");
+                }}
+                onDismiss={async () => {
+                  await wrapDecision(approval.id, false, undefined, "review");
+                }}
+              />
+            )}
+            {actionPayload
+              ?.feature_type === "order" && (
+              <div className="mb-4 p-4 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800/50 flex flex-col gap-3">
+                <div className="flex items-center gap-2 text-yellow-600 font-semibold text-sm">
+                  <span className="w-5 h-5 flex items-center justify-center">
+                    📦
+                  </span>
+                  Order Needs Fulfillment
+                </div>
+                <p className="text-sm text-gray-800 dark:text-gray-200">
+                  {approval.context_payload?.description ||
+                    "An order is waiting to be fulfilled."}
+                </p>
+                <div className="flex gap-2 w-full mt-1">
+                  <button
+                    type="button"
+                    className="app-btn-primary flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 bg-[#0066FF] text-white rounded-[8px]"
+                    onClick={() =>
+                      wrapDecision(approval.id, true, undefined, "order")
+                    }
+                    disabled={loadingAction !== null}
+                  >
+                    {isActionLoading("approve") ? (
+                      <span className="animate-pulse">Loading...</span>
+                    ) : (
+                      "Fulfill Order"
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center bg-gray-100 dark:bg-gray-800 rounded-[8px]"
+                    onClick={() =>
+                      wrapDecision(approval.id, false, undefined, "order")
+                    }
+                    disabled={loadingAction !== null}
+                  >
+                    {isActionLoading("dismiss") ? (
+                      <span className="animate-pulse">Loading...</span>
+                    ) : (
+                      "Dismiss"
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "triage" && (
+              <div className="mb-4 p-4 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] flex flex-col gap-3 shadow-sm rounded-xl">
+                <div className="flex items-center gap-2 text-[#0066FF] font-semibold text-sm">
+                  <span className="w-5 h-5 flex items-center justify-center text-xl">
+                    ✨
+                  </span>
+                  Message Requires Attention
+                </div>
+                <div className="text-xs text-gray-500 dark:text-gray-400 font-medium break-words">
+                  Customer: <div className="triage-context inline break-words font-semibold text-gray-800 dark:text-gray-200">{(approval.context_payload)?.description || "You have an open customer conversation waiting for your reply."}</div>
+                </div>
+                <div className="text-sm text-[#1D1D1F] dark:text-[#F5F5F7] bg-white/50 dark:bg-black/20 p-3 rounded-[8px] break-words shadow-sm mt-1 border border-gray-100 dark:border-gray-800">
+                  <div className="font-semibold text-xs uppercase mb-1 block tracking-wider text-blue-600 dark:text-blue-400">Drafted Action:</div>
+                  <div className="whitespace-pre-wrap">{approval.proposed_action?.draft_reply || approval.proposed_action?.message || "Resolve Message"}</div>
+                </div>
+
+                {editingId === approval.id ? (
+                  <div className="flex flex-col gap-3 w-full mt-2">
+                    <textarea
+                      className="w-full min-h-[44px] p-3 rounded-[8px] border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-[#1D1D1F] dark:text-[#F5F5F7] text-sm focus:ring-2 focus:ring-[#0066FF] outline-none transition-all resize-none"
+                      rows={4}
+                      value={editContent}
+                      onChange={(e) => setEditContent(e.target.value)}
+                      data-testid="edit-triage-reply-textarea"
+                      autoFocus
+                    />
+                    <div className="flex gap-3">
+                      <button
+                        onClick={() => {
+                          wrapDecision(
+                            approval.id,
+                            true,
+                            editContent,
+                            "triage",
+                          );
+                          setEditingId(null);
+                        }}
+                        className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all shadow-md flex items-center justify-center"
+                        data-testid="save-send-triage-reply"
+                      >
+                        Save & Send
+                      </button>
+                      <button
+                        onClick={() => setEditingId(null)}
+                        className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all flex items-center justify-center"
+                        data-testid="cancel-edit-triage-reply"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col sm:flex-row gap-3 w-full mt-2">
+                    <button
+                      type="button"
+                      className="app-btn-primary flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 bg-[#0066FF] text-white rounded-[8px] font-medium hover:bg-[#0052CC] shadow-md transition-all flex items-center justify-center"
+                      onClick={() =>
+                        wrapDecision(approval.id, true, undefined, "triage")
+                      }
+                      disabled={loadingAction !== null}
+                      data-testid="feed-approve-btn"
+                    >
+                      {isActionLoading("approve") ? (
+                        <span className="animate-pulse flex items-center gap-2">Processing...</span>
+                      ) : (
+                        "Approve & Send"
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] hover:bg-gray-100 dark:hover:bg-gray-800 rounded-[8px] font-medium transition-all"
+                      onClick={() => {
+                        setEditingId(approval.id);
+                        setEditContent(approval.proposed_action?.draft_reply || approval.proposed_action?.message || "");
+                      }}
+                      disabled={loadingAction !== null}
+                      data-testid="feed-modify-btn"
+                    >
+                      Modify
+                    </button>
+
+                    <button
+                      type="button"
+                      className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] hover:bg-gray-100 dark:hover:bg-gray-800 rounded-[8px] font-medium transition-all"
+                      onClick={() =>
+                        wrapDecision(approval.id, false, undefined, "triage")
+                      }
+                      disabled={loadingAction !== null}
+                      data-testid="feed-dismiss-btn"
+                    >
+                      {isActionLoading("dismiss") ? (
+                        <span className="animate-pulse">Loading...</span>
+                      ) : (
+                        "Dismiss"
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "proactive_ops" && (
+              <div className="mb-4 p-4 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 flex flex-col gap-3 relative overflow-hidden">
+                <div className="absolute top-0 left-0 w-1 h-full bg-[#FF9500]"></div>
+                <div className="flex items-center gap-2 text-orange-600 font-semibold text-sm">
+                  <span className="w-5 h-5 flex items-center justify-center">
+                    ✨
+                  </span>
+                  Needs Attention Today
+                </div>
+                <p className="text-sm text-gray-800 dark:text-gray-200 font-medium">
+                  {approval.context_payload?.description ||
+                    "A proactive ops task needs your attention."}
+                </p>
+                <div className="flex gap-2 w-full mt-1">
+                  <button
+                    type="button"
+                    className="app-btn-primary flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 bg-[#FF9500] text-white rounded-[8px]"
+                    aria-label={
+                      approval.proposed_action?.message || "Approve"
+                    }
+                    onClick={() =>
+                      wrapDecision(approval.id, true, undefined, "operations")
+                    }
+                  >
+                    {approval.proposed_action?.message || "Approve"}
+                  </button>
+                  <button
+                    type="button"
+                    className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center border border-orange-200 text-orange-900 dark:text-orange-100 rounded-[8px]"
+                    onClick={() =>
+                      wrapDecision(approval.id, false, undefined, "operations")
+                    }
+                    disabled={loadingAction !== null}
+                  >
+                    {isActionLoading("dismiss") ? (
+                      <span className="animate-pulse">Loading...</span>
+                    ) : (
+                      "Dismiss"
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "task" && (
+              <div className="mb-4 p-4 bg-purple-50 dark:bg-purple-900/20 border border-purple-200 dark:border-purple-800/50 flex flex-col gap-3">
+                <div className="flex items-center gap-2 text-purple-600 font-semibold text-sm">
+                  <span className="w-5 h-5 flex items-center justify-center">
+                    ✅
+                  </span>
+                  Pending Task
+                </div>
+                <p className="text-sm text-gray-800 dark:text-gray-200">
+                  {approval.context_payload?.description ||
+                    "You have a pending task."}
+                </p>
+                <div className="flex gap-2 w-full mt-1">
+                  <button
+                    type="button"
+                    className="app-btn-primary flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 bg-[#0066FF] text-white rounded-[8px]"
+                    onClick={() =>
+                      wrapDecision(approval.id, true, undefined, "task")
+                    }
+                    disabled={loadingAction !== null}
+                  >
+                    {isActionLoading("approve") ? (
+                      <span className="animate-pulse">Loading...</span>
+                    ) : (
+                      "Complete Task"
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center bg-gray-100 dark:bg-gray-800 rounded-[8px]"
+                    onClick={() =>
+                      wrapDecision(approval.id, false, undefined, "task")
+                    }
+                    disabled={loadingAction !== null}
+                  >
+                    {isActionLoading("dismiss") ? (
+                      <span className="animate-pulse">Loading...</span>
+                    ) : (
+                      "Dismiss"
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "autonomous_booking_quote" && (
+              <div
+                className="mb-4 p-4 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] flex flex-col gap-3"
+                data-testid="autonomous-booking-quote-card"
+              >
+                <div className="flex items-center gap-2 text-[#0066FF] font-semibold text-sm">
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                    />
+                  </svg>
+                  Draft quote and propose schedule for{" "}
+                  {actionPayload
+                    .service || "Emergency Handyman Service"}
+                </div>
+
+                {editingId === approval.id ? (
+                  <div
+                    role="dialog"
+                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"
+                  >
+                    <div className="bg-white dark:bg-gray-900 p-6 max-w-sm w-full shadow-2xl border border-gray-200 dark:border-gray-800 flex flex-col gap-4">
+                      <h3 className="text-lg font-bold text-gray-900 dark:text-gray-100">
+                        Review Booking Quote
+                      </h3>
+
+                      <div className="flex flex-col gap-2">
+                        <div className="text-sm text-gray-500 font-semibold">
+                          Proposed Schedule
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {(
+                            actionPayload.proposed_slots || []
+                          ).map((slot, idx) => {
+                            const timeStr = slot.start_time
+                              ? new Date(slot.start_time).toLocaleTimeString(
+                                  [],
+                                  {
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                    hour12: false,
+                                  },
+                                )
+                              : "14:00";
+                            return (
+                              <button
+                                key={idx}
+                                className="px-3 py-1.5 rounded-lg border border-[#0066FF] text-[#0066FF] bg-[#0066FF]/10 text-sm font-medium"
+                              >
+                                {timeStr}
+                              </button>
+                            );
+                          })}
+                          {!actionPayload.proposed_slots?.length && (
+                            <button className="px-3 py-1.5 rounded-lg border border-[#0066FF] text-[#0066FF] bg-[#0066FF]/10 text-sm font-medium">
+                              14:00
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex justify-between items-center bg-gray-50 dark:bg-gray-800 p-3 rounded-lg mt-2">
+                        <span className="text-sm text-gray-500">
+                          Total Price
+                        </span>
+                        <span
+                          className="font-bold text-lg text-gray-900 dark:text-gray-100"
+                          data-testid="modal-quote-total"
+                        >
+                          $
+                          {Number(
+                            actionPayload.suggested_price || 180,
+                          ).toFixed(2)}
+                        </span>
+                      </div>
+
+                      <div className="flex gap-3 mt-4">
+                        <button
+                          onClick={() => {
+                            setEditingId(null);
+                          }}
+                          className="flex-1 py-3 px-4 rounded-[8px] border border-gray-300 dark:border-gray-700 font-medium text-gray-700 dark:text-gray-300"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          data-testid="modal-approve-btn"
+                          onClick={() => {
+                            wrapDecision(
+                              approval.id,
+                              true,
+                              undefined,
+                              "operations",
+                            );
+                            setEditingId(null);
+                          }}
+                          className="flex-1 py-3 px-4 rounded-[8px] bg-[#0066FF] hover:bg-[#0052CC] font-medium text-white shadow-md"
+                          disabled={loadingAction !== null}
+                        >
+                          {isActionLoading("approve") ? (
+                            <span className="animate-pulse">Loading...</span>
+                          ) : (
+                            "Approve & Send"
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex gap-2 w-full mt-2">
+                    <button
+                      type="button"
+                      className="app-btn-primary flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 bg-[#0066FF] text-white rounded-[8px]"
+                      onClick={() => setEditingId(approval.id)}
+                    >
+                      Review
+                    </button>
+                    <button
+                      type="button"
+                      className="app-button flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden py-2 text-center bg-gray-100 dark:bg-gray-800 rounded-[8px]"
+                      onClick={() =>
+                        wrapDecision(
+                          approval.id,
+                          false,
+                          undefined,
+                          "operations",
+                        )
+                      }
+                      disabled={loadingAction !== null}
+                    >
+                      {isActionLoading("dismiss") ? (
+                        <span className="animate-pulse">Loading...</span>
+                      ) : (
+                        "Dismiss"
+                      )}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "create_product" && (
+              <div
+                className="mb-4 p-4 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] flex flex-col gap-3"
+                data-testid="create-product-card"
+              >
+                <div className="flex items-center gap-2 text-[#0066FF] font-semibold text-sm">
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                    xmlns="http://www.w3.org/2000/svg"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 6v6m0 0v6m0-6h6m-6 0H6"
+                    />
+                  </svg>
+                  <span>Proposed Product</span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <span className="text-gray-500 dark:text-gray-400 text-xs uppercase tracking-wider">
+                    Product Name
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {
+                      actionPayload
+                        ?.product_name || "New Product"
+                    }
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <span className="text-gray-500 dark:text-gray-400 text-xs uppercase tracking-wider">
+                    Description
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {
+                      actionPayload
+                        ?.description
+                    }
+                  </span>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <span className="text-gray-500 dark:text-gray-400 text-xs uppercase tracking-wider">
+                    Suggested Price
+                  </span>
+                  <span className="font-semibold text-green-600 dark:text-green-400">
+                    ${actionPayload
+                      ?.suggested_price || 0}
+                  </span>
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "quote_draft" && (
+              <div
+                className="mb-4 p-4 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] flex flex-col gap-3"
+                data-testid="quote-draft-card"
+              >
+                <div className="flex items-center gap-2 text-[#0066FF] font-semibold text-sm">
+                  <svg
+                    className="w-5 h-5"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                    />
+                  </svg>
+                  Action Required: Approve Estimate for{" "}
+                  {actionPayload
+                    .service || "Plumbing Fix"}{" "}
+
+                </div>
+                <div className="text-xs text-[#0066FF] dark:text-blue-400 font-medium break-words">
+                  {
+                    actionPayload
+                      .customer_inquiry
+                  }
+                </div>
+                <div className="bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] p-3 rounded-[8px] relative mt-2">
+                  <div className="text-[10px] uppercase font-bold text-gray-500 mb-2">
+                    AI Proposed Quote
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex justify-between">
+                      <span className="text-xs text-gray-500">
+                        Calculated Total:
+                      </span>
+                      <span className="text-xs font-semibold text-gray-900 dark:text-gray-100">
+                        $
+                        {
+                          actionPayload
+                            .suggested_price
+                        }
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-xs text-gray-500">
+                        Scope of Work:
+                      </span>
+                      <span className="text-xs font-medium text-gray-800 dark:text-gray-200">
+                        {
+                          actionPayload
+                            .scope
+                        }
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-xs text-gray-500">
+                        Suggested Time:
+                      </span>
+                      <span className="text-xs font-medium text-gray-800 dark:text-gray-200">
+                        {
+                          actionPayload
+                            .suggested_time
+                        }
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {actionPayload
+              ?.feature_type === "newsletter_draft" ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400 font-semibold">
+                    Weekly Newsletter Draft Ready!
+                  </span>
+                  <span className="text-indigo-500 font-bold text-xs">
+                    Review and send
+                  </span>
+                </div>
+
+                <div className="bg-white/50 dark:bg-black/20 p-3 rounded-lg border border-gray-100 dark:border-gray-800">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                      Subject
+                    </span>
+                  </div>
+                  <p className="text-sm font-medium text-gray-900 dark:text-gray-100 leading-snug">
+                    {
+                      actionPayload
+                        .subject
+                    }
+                  </p>
+                </div>
+                <div className="bg-white/50 dark:bg-black/20 p-3 rounded-lg border border-gray-100 dark:border-gray-800">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                      Preview
+                    </span>
+                  </div>
+                  <p className="text-sm text-gray-700 dark:text-gray-300 italic line-clamp-3 leading-snug">
+                    "
+                    {
+                      actionPayload
+                        .content_preview
+                    }
+                    "
+                  </p>
+                </div>
+              </div>
+            ) : actionPayload
+                ?.feature_type === "social_post_draft" ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400 font-semibold">
+                    New product detected!
+                  </span>
+                  <span className="text-pink-500 font-bold text-xs">
+                    Schedule a post?
+                  </span>
+                </div>
+                <div className="app-card dark:bg-gray-800 p-3 rounded-[8px] border border-pink-100 dark:border-pink-900/50">
+                  <div className="text-[10px] uppercase font-bold text-gray-400 mb-2 flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-pink-500"></span>{" "}
+                    Instagram / TikTok Draft
+                  </div>
+                  <div className="text-xs text-gray-700 dark:text-gray-300 italic line-clamp-3">
+                    "
+                    {actionPayload
+                      .instagram ||
+                      actionPayload
+                        .tiktok ||
+                      "Check out our new product!"}
+                    "
+                  </div>
+                </div>
+              </div>
+            ) : actionPayload
+                ?.feature_type === "subscription_churn_risk" ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-2 text-red-600 font-semibold text-sm">
+                  ⚠️ High Churn Risk
+                </div>
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-200 border-l-2 border-red-400 pl-2">
+                  {approval.context_payload?.reason ||
+                    approval.proposed_action?.reason ||
+                    "Health score dropped due to inactivity."}
+                </div>
+                <div className="text-sm text-gray-600 dark:text-gray-400 italic">
+                  "
+                  {approval.proposed_action?.generated_response ||
+                    approval.proposed_action?.message}
+                  "
+                </div>
+              </div>
+            ) : actionPayload
+                ?.feature_type === "subscription_replenishment" ? (
+              <div className="flex flex-col gap-2">
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-200">
+                  Autopilot Recommendation
+                </div>
+                <div className="text-sm text-gray-600 dark:text-gray-400">
+                  {(typeof approval.proposed_action?.context === 'string' ? approval.proposed_action.context : approval.proposed_action?.context?.description) ||
+                    "Based on this customer's order history and the estimated consumption rate, they are due for a replenishment. Would you like me to generate a personalized checkout link and draft an email suggesting they refill?"}
+                </div>
+              </div>
+            ) : actionPayload
+                ?.feature_type === "supply_order" ? (
+              <>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Current Stock:
+                  </span>
+                  <span
+                    className="font-semibold text-gray-800 dark:text-gray-200"
+                    data-testid="supply-order-stock"
+                  >
+                    {
+                      actionPayload
+                        .remaining_stock
+                    }{" "}
+                    units
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Est. Runout:
+                  </span>
+                  <span className="font-semibold text-gray-800 dark:text-gray-200">
+                    {
+                      actionPayload
+                        .est_runout_days
+                    }{" "}
+                    days
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Reorder Quantity:
+                  </span>
+                  <span
+                    className="font-bold text-blue-600 dark:text-blue-400 text-base"
+                    data-testid="supply-order-quantity"
+                  >
+                    {
+                      actionPayload
+                        .suggested_reorder_quantity
+                    }{" "}
+                    Units
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm mb-3">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Vendor:
+                  </span>
+                  <span className="font-semibold text-gray-800 dark:text-gray-200">
+                    {
+                      actionPayload
+                        .vendor_name
+                    }{" "}
+                    (
+                    {
+                      actionPayload
+                        .vendor_contact
+                    }
+                    )
+                  </span>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-800 p-3 rounded-[8px] border border-gray-200 dark:border-gray-700">
+                  <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">
+                    Drafted Message:
+                  </div>
+                  <div className="text-sm text-gray-800 dark:text-gray-200 italic font-medium">
+                    "
+                    {
+                      actionPayload
+                        .draft_message
+                    }
+                    "
+                  </div>
+                </div>
+              </>
+            ) : actionPayload
+                ?.feature_type === "stockout_restock_and_price" ? (
+              <>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Current Price:
+                  </span>
+                  <span className="font-semibold text-gray-400 dark:text-gray-500 line-through">
+                    $
+                    {Number(
+                      actionPayload
+                        .old_price,
+                    ).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Suggested Price:
+                  </span>
+                  <span
+                    className="font-bold text-green-600 dark:text-green-400 text-base"
+                    data-testid="stockout-new-price"
+                  >
+                    $
+                    {Number(
+                      actionPayload
+                        .new_price,
+                    ).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Reorder Quantity:
+                  </span>
+                  <span
+                    className="font-bold text-blue-600 dark:text-blue-400 text-base"
+                    data-testid="stockout-reorder"
+                  >
+                    {
+                      actionPayload
+                        .suggested_reorder_quantity
+                    }{" "}
+                    Units
+                  </span>
+                </div>
+                <div className="text-sm font-medium text-gray-800 dark:text-gray-200 mt-2">
+                  {
+                    actionPayload
+                      .message
+                  }
+                </div>
+              </>
+            ) : isDailyPrepChecklist ? (
+              <div className="flex flex-col sm:flex-row gap-3 w-full">
+                <button
+                  onClick={() =>
+                    handleDecision(
+                      approval.id,
+                      true,
+                      undefined,
+                      approval.event_source,
+                    )
+                  }
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-all duration-200 shadow-md flex items-center justify-center"
+                  aria-label="Mark Complete"
+                  data-testid="feed-approve-btn"
+                >
+                  Mark Complete
+                </button>
+                <button
+                  onClick={() =>
+                    handleDecision(
+                      approval.id,
+                      true,
+                      "Assign to Staff",
+                      approval.event_source,
+                    )
+                  }
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+                  aria-label="Assign to Staff"
+                  data-testid="feed-assign-btn"
+                >
+                  Assign to Staff
+                </button>
+                <button
+                  onClick={() =>
+                    handleDecision(
+                      approval.id,
+                      false,
+                      undefined,
+                      approval.event_source,
+                    )
+                  }
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                  aria-label="Dismiss task"
+                  data-testid="feed-dismiss-btn"
+                  disabled={loadingAction !== null}
+                >
+                  {isActionLoading("dismiss") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Dismiss"
+                  )}
+                </button>
+              </div>
+            ) : structuredContext.smart_pricing === true ? (
+              <>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Current Price:
+                  </span>
+                  <span className="font-semibold text-gray-400 dark:text-gray-500 line-through">
+                    $
+                    {Number(
+                      structuredContext.old_price,
+                    ).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm mb-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Suggested Price:
+                  </span>
+                  <span
+                    className="font-bold text-green-600 dark:text-green-400 text-base"
+                    data-testid="smart-pricing-new-price"
+                  >
+                    $
+                    {Number(
+                      structuredContext.new_price,
+                    ).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Sales Projection:
+                  </span>
+                  <span
+                    className="font-semibold text-indigo-600 dark:text-indigo-400"
+                    data-testid="smart-pricing-sales-projection"
+                  >
+                    {
+                      structuredContext.sales_projection
+                    }
+                  </span>
+                </div>
+              </>
+            ) : actionPayload
+                ?.feature_type === "incident_resolution" ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Proposed Actions:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {
+                      (
+                        actionPayload
+                          .actions || []
+                      ).length
+                    }{" "}
+                    steps
+                  </span>
+                </div>
+                <div className="w-full h-px bg-gray-200 dark:bg-gray-700 my-1"></div>
+                {(
+                  actionPayload
+                    .actions || []
+                ).map((action, idx) => (
+                  <div key={idx} className="flex flex-col mb-2">
+                    <span className="text-xs font-semibold text-gray-700 dark:text-gray-300">
+                      {action.action}
+                    </span>
+                    <span className="text-xs text-gray-500">
+                      {action.details}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : actionPayload
+                ?.feature_type === "ambassador_reply" ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Context:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {actionPayload
+                      .source || "Message"}
+                  </span>
+                </div>
+                <div className="flex flex-col text-sm mt-1">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Draft:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100 line-clamp-2 mt-1">
+                    {
+                      actionPayload
+                        .generated_response
+                    }
+                  </span>
+                </div>
+              </div>
+            ) : actionPayload
+                ?.feature_type === "quote_draft" ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Context:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {actionPayload
+                      .customer_inquiry || "Client Inquiry"}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Scope:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {actionPayload
+                      .scope ||
+                      actionPayload
+                        .service}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Timeline:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    {actionPayload
+                      .suggested_time || "TBD"}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Price:
+                  </span>
+                  <span className="font-semibold text-green-600 dark:text-green-400">
+                    $
+                    {Number(
+                      actionPayload
+                        .suggested_price ||
+                        actionPayload
+                          .price ||
+                        0,
+                    ).toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center text-sm">
+                  <span className="text-gray-500 dark:text-gray-400">
+                    Required Deposit:
+                  </span>
+                  <span className="font-semibold text-gray-900 dark:text-gray-100">
+                    $
+                    {Number(
+                      actionPayload
+                        .suggested_price ||
+                        actionPayload
+                          .price ||
+                        0,
+                    ) * 0.2}
+                  </span>
+                </div>
+                {(actionPayload
+                  .proposed_slot_id ||
+                  actionPayload
+                    .suggested_time) && (
+                  <div className="flex justify-between items-center text-sm mt-1 pt-1 border-t border-gray-200 dark:border-gray-700">
+                    <span className="text-gray-500 dark:text-gray-400">
+                      Provisional Slot Held:
+                    </span>
+                    <span className="font-semibold text-[#0066FF] dark:text-blue-400">
+                      Yes (
+                      {actionPayload
+                        .suggested_time || "Pending"}
+                      )
+                    </span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                {structuredContext.weekly_health_report === true ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="text-sm text-gray-700 dark:text-gray-300">
+                      <span className="font-semibold">Summary:</span>{" "}
+                      {
+                        structuredContext.summary
+                      }
+                    </div>
+                    <div className="text-sm text-indigo-600 dark:text-indigo-400 font-medium">
+                      <span className="font-semibold text-gray-700 dark:text-gray-300">
+                        Suggestion:
+                      </span>{" "}
+                      {
+                        structuredContext.actionable_suggestion
+                      }
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {structuredContext.abandoned_carts_count !== undefined && (
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-gray-500 dark:text-gray-400">
+                          Abandoned Carts:
+                        </span>
+                        <span className="font-semibold text-gray-900 dark:text-gray-100">
+                          {
+                            structuredContext.abandoned_carts_count
+                          }
+                        </span>
+                      </div>
+                    )}
+                    {structuredContext.potential_revenue !== undefined && (
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-gray-500 dark:text-gray-400">
+                          Potential Revenue:
+                        </span>
+                        <span className="font-semibold text-green-600 dark:text-green-400">
+                          $
+                          {Number(
+                            structuredContext.potential_revenue,
+                          ).toFixed(2)}
+                        </span>
+                      </div>
+                    )}
+                    {actionPayload
+                      ?.remaining_stock !== undefined && (
+                      <div className="flex flex-col gap-2">
+                        <div className="flex justify-between items-center text-sm">
+                          <span className="text-gray-500 dark:text-gray-400">
+                            Product ID:
+                          </span>
+                          <span className="font-semibold text-gray-900 dark:text-gray-100">
+                            {
+                              actionPayload.product_id
+                            }
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center text-sm">
+                          <span className="text-gray-500 dark:text-gray-400">
+                            Remaining Stock:
+                          </span>
+                          <span className="font-semibold text-red-600 dark:text-red-400">
+                            {
+                              actionPayload.remaining_stock
+                            }
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center text-sm">
+                          <span className="text-gray-500 dark:text-gray-400">
+                            Alert Message:
+                          </span>
+                          <span className="font-semibold text-gray-900 dark:text-gray-100">
+                            {
+                              actionPayload.message
+                            }
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
+        {!hasSpecializedRenderer && proposedText && (
+          <div className="mt-2 p-3 bg-gray-50 dark:bg-gray-800/50 rounded-[8px]">
+            <span className="block text-xs font-semibold text-gray-500 dark:text-gray-400 mb-1">
+              Proposed draft
+            </span>
+            <p className="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap break-words">
+              {proposedText}
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-3 w-full mt-2">
+        {actionPayload
+          ?.feature_type === "onboarding_welcome" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <a
+              href="/storefront-builder"
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Review Storefront"
+              data-testid="review-storefront-btn"
+            >
+              Review Storefront
+            </a>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss"
+              data-testid="dismiss-onboarding-welcome"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "booking_reengagement" ? (
+          editingId === approval.id ? (
+            <div className="flex flex-col gap-3 w-full">
+              <textarea
+                className="w-full min-h-[44px] p-3 rounded-[8px] border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-[#1D1D1F] dark:text-[#F5F5F7] text-sm focus:ring-2 focus:ring-[#0066FF] outline-none transition-all resize-none"
+                rows={4}
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                data-testid="edit-booking-reengagement-textarea"
+                autoFocus
+              />
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    handleDecision(
+                      approval.id,
+                      true,
+                      editContent,
+                      approval.event_source,
+                    );
+                    setEditingId(null);
+                  }}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all shadow-md flex items-center justify-center"
+                  data-testid="save-booking-reengagement"
+                  disabled={loadingAction !== null}
+                >
+                  {isActionLoading("approve") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Save & Approve"
+                  )}
+                </button>
+                <button
+                  onClick={() => setEditingId(null)}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all flex items-center justify-center"
+                  data-testid="cancel-edit-booking-reengagement"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="p-3 bg-white/50 dark:bg-gray-800/50 rounded-lg mb-3 border border-gray-200 dark:border-gray-700 backdrop-blur-[10px]">
+                <p className="text-sm font-medium text-gray-900 dark:text-white mb-1">
+                  Drafted Re-engagement Message
+                </p>
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  {approval.proposed_action?.draft_action ||
+                    approval.proposed_action?.message}
+                </p>
+              </div>
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    true,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="w-full min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-500 text-white font-medium hover:bg-green-600 transition-all duration-200 shadow-md flex items-center justify-center mb-3"
+                aria-label={`Approve Re-engagement for ${approval.context_payload?.customer_name || "Customer"}`}
+                data-testid="approve-booking-reengagement"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("approve") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  `Approve Re-engagement for ${approval.context_payload?.customer_name || "Customer"}`
+                )}
+              </button>
+              <div className="flex flex-col sm:flex-row gap-3 w-full">
+                <button
+                  onClick={() => {
+                    setEditingId(approval.id);
+                    setEditContent(
+                      approval.proposed_action?.draft_action ||
+                        approval.proposed_action?.message ||
+                        "",
+                    );
+                  }}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                  aria-label="Edit booking re-engagement"
+                  data-testid="edit-booking-reengagement"
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() =>
+                    handleDecision(
+                      approval.id,
+                      false,
+                      undefined,
+                      approval.event_source,
+                    )
+                  }
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                  aria-label="Reject booking re-engagement"
+                  data-testid="reject-booking-reengagement"
+                  disabled={loadingAction !== null}
+                >
+                  {isActionLoading("dismiss") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Deny"
+                  )}
+                </button>
+              </div>
+            </>
+          )
+        ) : actionPayload
+            ?.feature_type === "booking_draft" || actionPayload?.feature_type === "booking_approval" ? (
+          editingId === approval.id ? (
+            <div className="flex flex-col gap-3 w-full">
+              <textarea
+                className="w-full min-h-[44px] p-3 rounded-[8px] border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-[#1D1D1F] dark:text-[#F5F5F7] text-sm focus:ring-2 focus:ring-[#0066FF] outline-none transition-all resize-none"
+                rows={4}
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                data-testid="edit-booking-draft-textarea"
+                autoFocus
+              />
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    handleDecision(
+                      approval.id,
+                      true,
+                      editContent,
+                      approval.event_source,
+                    );
+                    setEditingId(null);
+                  }}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all shadow-md flex items-center justify-center"
+                  data-testid="save-booking-draft"
+                  disabled={loadingAction !== null}
+                >
+                  {isActionLoading("approve") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Save & Approve"
+                  )}
+                </button>
+                <button
+                  onClick={() => setEditingId(null)}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all flex items-center justify-center"
+                  data-testid="cancel-edit-booking-draft"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="p-3 bg-white/50 dark:bg-gray-800/50 rounded-lg mb-3 border border-gray-200 dark:border-gray-700 backdrop-blur-[10px]">
+                <p className="text-sm font-medium text-gray-900 dark:text-white mb-1">
+                  Audio Summary
+                </p>
+                <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400 bg-white dark:bg-gray-800 p-2 rounded border border-gray-200 dark:border-gray-700">
+                  <span className="text-lg">▶️</span>
+                  <span>
+                    0:10 AI Summary (
+                    {
+                      actionPayload
+                        ?.caller_phone
+                    }
+                    )
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    true,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="w-full min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center mb-3"
+                aria-label="Approve Route & Send Confirmation"
+                data-testid="approve-booking-draft"
+              >
+                Approve Route & Send Confirmation
+              </button>
+              <div className="flex flex-col sm:flex-row gap-3 w-full">
+                <button
+                  onClick={() => {
+                    setEditingId(approval.id);
+                    setEditContent(
+                      actionPayload
+                        ?.summary || "",
+                    );
+                  }}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                  aria-label="Edit booking draft"
+                  data-testid="edit-booking-draft"
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() =>
+                    handleDecision(
+                      approval.id,
+                      false,
+                      undefined,
+                      approval.event_source,
+                    )
+                  }
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                  aria-label="Reject booking draft"
+                  data-testid="reject-booking-draft"
+                  disabled={loadingAction !== null}
+                >
+                  {isActionLoading("dismiss") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Deny"
+                  )}
+                </button>
+              </div>
+            </>
+          )
+        ) : actionPayload
+            ?.feature_type === "incident_resolution" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-red-600 text-white font-medium hover:bg-red-700 transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Execute Plan"
+              data-testid="approve-incident-resolution"
+            >
+              Execute Plan
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss Plan"
+              data-testid="dismiss-incident-resolution"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "subscription_churn_risk" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full sm:flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-red-600 text-white font-bold hover:bg-red-700 transition-all duration-200 shadow-md flex items-center justify-center transform active:scale-95"
+              aria-label="Send Win-Back Offer"
+              data-testid={`action-card-approve-${approval.id}`}
+            >
+              Send Win-Back Offer
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full sm:w-auto min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-6 rounded-[8px] glass-control bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 font-semibold hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss"
+              data-testid={`action-card-dismiss-${approval.id}`}
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "subscription_replenishment" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full sm:flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-blue-600 transition-all duration-200 shadow-sm flex items-center justify-center"
+              aria-label="Generate & Send Email"
+              data-testid="approve-subscription-replenishment"
+            >
+              Generate & Send Email
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full sm:w-auto min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-6 rounded-[8px] bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 font-medium hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "subscription_replenishment" ? (
+          <div className="flex flex-col gap-2">
+            <div className="flex justify-between items-center">
+              <span className="text-gray-500 dark:text-gray-400">Action:</span>
+              <span className="font-medium">Send Check-in Email</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-gray-500 dark:text-gray-400">Offer:</span>
+              <span className="font-medium">1-Click Repurchase Link</span>
+            </div>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "supply_order" ? (
+          <>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-500 text-white font-medium hover:bg-green-600 transition-all duration-200 shadow-md flex items-center justify-center mb-3"
+              aria-label="Approve & Send"
+              data-testid="approve-supply-order"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve & Send"
+              )}
+            </button>
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <button
+                onClick={() => {
+                  setEditingId(approval.id);
+                  setEditContent(
+                    actionPayload
+                      .draft_message,
+                  );
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Edit message"
+                data-testid="edit-supply-order"
+              >
+                Edit
+              </button>
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Deny supply order"
+                data-testid="reject-supply-order"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("dismiss") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Deny"
+                )}
+              </button>
+            </div>
+          </>
+        ) : actionPayload
+            ?.feature_type === "newsletter_draft" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Approve & Send"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve & Send"
+              )}
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Skip this week"
+            >
+              Skip this week
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "social_post_draft" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-gradient-to-r from-pink-500 to-indigo-500 text-white font-medium hover:from-pink-600 hover:to-indigo-600 transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Schedule Posts"
+              data-testid="approve-social-post"
+            >
+              Schedule Posts
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss proposal"
+              data-testid="dismiss-social-post"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "supply_order" ? (
+          <>
+            <div className="flex justify-between items-center text-sm mb-1">
+              <span className="text-gray-500 dark:text-gray-400">
+                Current Stock:
+              </span>
+              <span
+                className="font-semibold text-gray-800 dark:text-gray-200"
+                data-testid="supply-order-stock"
+              >
+                {
+                  actionPayload
+                    .remaining_stock
+                }{" "}
+                units
+              </span>
+            </div>
+            <div className="flex justify-between items-center text-sm mb-1">
+              <span className="text-gray-500 dark:text-gray-400">
+                Est. Runout:
+              </span>
+              <span className="font-semibold text-gray-800 dark:text-gray-200">
+                {
+                  actionPayload
+                    .est_runout_days
+                }{" "}
+                days
+              </span>
+            </div>
+            <div className="flex justify-between items-center text-sm mb-1">
+              <span className="text-gray-500 dark:text-gray-400">
+                Reorder Quantity:
+              </span>
+              <span
+                className="font-bold text-blue-600 dark:text-blue-400 text-base"
+                data-testid="supply-order-quantity"
+              >
+                {
+                  actionPayload
+                    .suggested_reorder_quantity
+                }{" "}
+                Units
+              </span>
+            </div>
+            <div className="flex justify-between items-center text-sm mb-3">
+              <span className="text-gray-500 dark:text-gray-400">Vendor:</span>
+              <span className="font-semibold text-gray-800 dark:text-gray-200">
+                {
+                  actionPayload
+                    .vendor_name
+                }{" "}
+                (
+                {
+                  actionPayload
+                    .vendor_contact
+                }
+                )
+              </span>
+            </div>
+            <div className="bg-gray-50 dark:bg-gray-800 p-3 rounded-[8px] border border-gray-200 dark:border-gray-700">
+              <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">
+                Drafted Message:
+              </div>
+              <div className="text-sm text-gray-800 dark:text-gray-200 italic font-medium">
+                "
+                {
+                  actionPayload
+                    .draft_message
+                }
+                "
+              </div>
+            </div>
+          </>
+        ) : actionPayload
+            ?.feature_type === "stockout_restock_and_price" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-600 text-white font-medium hover:bg-green-700 transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Approve"
+              data-testid="approve-stockout"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve"
+              )}
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss"
+              data-testid="dismiss-stockout"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "invoice_draft" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              disabled={isActionLoading(approval.id)}
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all shadow-md flex items-center justify-center opacity-100"
+              data-testid="feed-approve-btn"
+            >
+              {isActionLoading(approval.id) ? (
+                <span className="flex items-center gap-2">
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                  Processing...
+                </span>
+              ) : (
+                "Approve & Send"
+              )}
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              disabled={isActionLoading(approval.id)}
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all flex items-center justify-center"
+              data-testid="feed-dismiss-btn"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : isDailyPrepChecklist || actionPayload
+            ?.feature_type === "review" ||
+          actionPayload
+            ?.feature_type === "order" ||
+          actionPayload
+            ?.feature_type === "triage" ||
+          actionPayload
+            ?.feature_type === "task" ||
+          actionPayload
+            ?.feature_type === "proactive_ops" ||
+          actionPayload
+            ?.feature_type === "invoice_followup" ||
+          actionPayload
+            ?.feature_type === "invoice" ? null : actionPayload?.feature_type === "ambassador_reply" ? (
+          editingId === approval.id ? (
+            <div className="flex flex-col gap-3 w-full">
+              <textarea
+                className="w-full min-h-[44px] p-3 rounded-[8px] border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-[#1D1D1F] dark:text-[#F5F5F7] text-sm focus:ring-2 focus:ring-[#0066FF] outline-none transition-all resize-none"
+                rows={4}
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                data-testid="edit-ambassador-reply-textarea"
+                autoFocus
+              />
+              <div className="flex gap-3">
+                <button
+                  onClick={() => {
+                    handleDecision(
+                      approval.id,
+                      true,
+                      editContent,
+                      approval.event_source,
+                    );
+                    setEditingId(null);
+                  }}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all shadow-md flex items-center justify-center"
+                  data-testid="save-send-ambassador-reply"
+                >
+                  Save & Send
+                </button>
+                <button
+                  onClick={() => setEditingId(null)}
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all flex items-center justify-center"
+                  data-testid="cancel-edit-ambassador-reply"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    true,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+                aria-label="Approve & Send Draft"
+                data-testid="approve-ambassador-reply"
+              >
+                ✨ Approve & Send Draft
+              </button>
+              <button
+                onClick={() => {
+                  setEditingId(approval.id);
+                  setEditContent(
+                    actionPayload
+                      ?.generated_response ||
+                      actionPayload
+                        ?.draft_reply ||
+                      "",
+                  );
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Edit Draft"
+                data-testid="edit-ambassador-reply"
+              >
+                Edit
+              </button>
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Dismiss Draft"
+                data-testid="dismiss-ambassador-reply"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("dismiss") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Dismiss"
+                )}
+              </button>
+            </div>
+          )
+        ) : actionPayload
+            ?.feature_type === "quote_draft" ? (
+          <div className="flex flex-col gap-3 w-full">
+            <QuoteReviewModal
+              isOpen={editingId === approval.id}
+              onClose={() => setEditingId(null)}
+              initialPayload={actionPayload || approval.proposed_action || approval.context_payload}
+              onApprove={(updatedPayload) => {
+                setTimeout(() => {
+                  handleDecision(
+                    approval.id,
+                    true,
+                    JSON.stringify(updatedPayload),
+                    approval.event_source,
+                  );
+                }, 2000);
+                setTimeout(() => {
+                  setEditingId(null);
+                }, 2500);
+              }}
+            />
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    true,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+                aria-label="Approve & Send"
+                data-testid="approve-quote-draft"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("approve") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Approve & Send"
+                )}
+              </button>
+              <button
+                onClick={() => {
+                  setEditingId(approval.id);
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Review Draft"
+                data-testid="review-quote-draft"
+              >
+                Review
+              </button>
+            </div>
+          </div>
+        ) : structuredContext.smart_pricing === true ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Approve & Run Sale"
+              data-testid="approve-run-sale"
+            >
+              Approve & Run Sale
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss proposal"
+              data-testid="feed-dismiss-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : (approval.action_type || "") ===
+          "Review Proposed Win-back" ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Approve"
+              data-testid="feed-approve-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve"
+              )}
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss"
+              data-testid="feed-dismiss-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("reject") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : structuredContext.weekly_health_report === true ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            {!isDraftExpanded ? (
+              <button
+                onClick={() => setIsDraftExpanded(true)}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-600 text-white font-medium hover:bg-green-700 transition-all duration-200 shadow-md flex items-center justify-center"
+                aria-label="Draft it"
+                data-testid="feed-approve-btn"
+              >
+                Yes, draft it!
+              </button>
+            ) : (
+              <div className="flex flex-col gap-2 w-full">
+                <div className="p-3 bg-white dark:bg-gray-800 rounded border border-gray-200 dark:border-gray-700 text-sm">
+                  <p className="font-medium text-gray-700 dark:text-gray-300">
+                    Drafted Content:
+                  </p>
+                  <p className="mt-1 text-gray-600 dark:text-gray-400">
+                    {structuredContext.actionable_suggestion ||
+                      "Here is the drafted content..."}
+                  </p>
+                </div>
+                <button
+                  onClick={() =>
+                    handleDecision(
+                      approval.id,
+                      true,
+                      undefined,
+                      approval.event_source,
+                    )
+                  }
+                  className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-600 text-white font-medium hover:bg-green-700 transition-all duration-200 shadow-md flex items-center justify-center"
+                  aria-label="Approve & Send"
+                  data-testid="feed-approve-btn"
+                  disabled={loadingAction !== null}
+                >
+                  {isActionLoading("approve") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Approve & Send"
+                  )}
+                </button>
+              </div>
+            )}
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss proposal"
+              data-testid="feed-dismiss-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.remaining_stock !== undefined ? (
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-amber-500 text-white font-medium hover:bg-amber-600 transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Approve Restock"
+              data-testid="feed-approve-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve Restock"
+              )}
+            </button>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  false,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Dismiss restock"
+              data-testid="feed-dismiss-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("dismiss") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Dismiss"
+              )}
+            </button>
+          </div>
+        ) : actionPayload
+            ?.feature_type === "create_product" ? (
+          <>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-500 text-white font-medium hover:bg-green-600 transition-all duration-200 shadow-md flex items-center justify-center mb-3"
+              aria-label="Approve & Create"
+              data-testid="feed-approve-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve & Create"
+              )}
+            </button>
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Ask Agent to Adjust"
+                data-testid="feed-dismiss-btn"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("dismiss") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Ask Agent to Adjust"
+                )}
+              </button>
+            </div>
+          </>
+        ) : actionPayload
+            ?.feature_type === "quote_draft" ? (
+          <>
+            <button
+              onClick={() =>
+                handleDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                )
+              }
+              className="w-full min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-500 text-white font-medium hover:bg-green-600 transition-all duration-200 shadow-md flex items-center justify-center mb-3"
+              aria-label="Approve & Send"
+              data-testid="feed-approve-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve & Send"
+              )}
+            </button>
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <a
+                href={`/quotes/${actionPayload?.quote_id || approval.id}`}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Edit Draft"
+                data-testid="edit-quote-draft"
+              >
+                Edit Draft
+              </a>
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Ask Agent to Adjust"
+                data-testid="feed-dismiss-btn"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("dismiss") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Ask Agent to Adjust"
+                )}
+              </button>
+            </div>
+          </>
+        ) : editingId === approval.id ? (
+          <>
+            <textarea
+              className="w-full min-h-[44px] p-3 rounded-[8px] border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-[#1D1D1F] dark:text-[#F5F5F7] text-sm focus:ring-2 focus:ring-[#0066FF] outline-none transition-all resize-none"
+              rows={4}
+              value={editContent}
+              onChange={(e) => setEditContent(e.target.value)}
+              data-testid="edit-proposal-textarea"
+              autoFocus
+            />
+            <div className="flex gap-3 w-full">
+              <button
+                onClick={async () => {
+                  const accepted = await wrapDecision(
+                    approval.id,
+                    true,
+                    editContent,
+                    approval.event_source,
+                    "approve",
+                  );
+                  if (accepted) setEditingId(null);
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all shadow-md flex items-center justify-center"
+                data-testid="save-proposal"
+                disabled={loadingAction !== null}
+              >
+                <span data-testid="save-edit-approve-btn">
+                  {isActionLoading("approve") ? (
+                    <span className="animate-pulse">Loading...</span>
+                  ) : (
+                    "Save & Approve"
+                  )}
+                </span>
+              </button>
+              <button
+                onClick={async () => {
+                  const accepted = await wrapDecision(
+                    approval.id,
+                    true,
+                    editContent,
+                    approval.event_source,
+                    "approve",
+                  );
+                  if (accepted) setEditingId(null);
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-500 text-white font-medium hover:bg-green-600 transition-all shadow-md flex items-center justify-center"
+                data-testid="feed-approve-btn"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("approve") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Approve"
+                )}
+              </button>
+              <button
+                onClick={() => setEditingId(null)}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all flex items-center justify-center"
+                data-testid="cancel-edit-proposal"
+              >
+                Cancel
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="flex flex-col gap-3 w-full">
+            <button
+              onClick={() =>
+                wrapDecision(
+                  approval.id,
+                  true,
+                  undefined,
+                  approval.event_source,
+                  "approve",
+                )
+              }
+              className="w-full min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-green-500 text-white font-medium hover:bg-green-600 transition-all duration-200 shadow-md flex items-center justify-center mb-3"
+              aria-label="Approve proposal"
+              data-testid="feed-approve-btn"
+              disabled={loadingAction !== null}
+            >
+              {isActionLoading("approve") ? (
+                <span className="animate-pulse">Loading...</span>
+              ) : (
+                "Approve"
+              )}
+            </button>
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <button
+                onClick={() => {
+                  setEditingId(approval.id);
+                  const textToEdit =
+                    proposedText ||
+                    approval.context_payload?.description ||
+                    approval.proposed_action?.message ||
+                    approval.proposed_action?.action_type ||
+                    approval.event_source;
+                  setEditContent(textToEdit || "");
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Edit proposal"
+                data-testid="edit-proposal"
+              >
+                Edit
+              </button>
+              <button
+                onClick={() =>
+                  handleDecision(
+                    approval.id,
+                    false,
+                    undefined,
+                    approval.event_source,
+                  )
+                }
+                className="flex-1 min-h-[44px] min-w-[44px] max-w-full overflow-hidden px-4 rounded-[8px] bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-900/50 transition-all duration-200 flex items-center justify-center"
+                aria-label="Reject proposal"
+                data-testid="feed-dismiss-btn"
+                disabled={loadingAction !== null}
+              >
+                {isActionLoading("dismiss") ? (
+                  <span className="animate-pulse">Loading...</span>
+                ) : (
+                  "Deny"
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};

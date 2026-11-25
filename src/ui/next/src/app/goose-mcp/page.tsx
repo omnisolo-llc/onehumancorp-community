@@ -1,0 +1,115 @@
+'use client';
+
+import { errorMessage } from '@/lib/errors';
+import React, { useState, useEffect } from 'react';
+
+export default function GooseMcpPage() {
+  const [extensions, setExtensions] = useState<{ id: string; name: string; description?: string }[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [extensionsRead, setExtensionsRead] = useState(false);
+  const [execResult, setExecResult] = useState<string | null>(null);
+
+  const fetchExtensions = async () => {
+    setLoading(true);
+    setError(null);
+    setExtensionsRead(false);
+    setExtensions([]);
+    try {
+      const res = await fetch('/api/v1/agents/goose');
+      const data = await res.json();
+      if (res.status !== 200 || !data || typeof data !== 'object' || data.error != null
+          || !Array.isArray(data.result) || !data.result.every((extension: { id?: unknown; name?: unknown; description?: unknown } | null) =>
+            extension && typeof extension.id === 'string' && extension.id.trim()
+            && typeof extension.name === 'string' && extension.name.trim()
+            && (extension.description === undefined || typeof extension.description === 'string'))) {
+        throw new Error(typeof data?.error === 'string' ? data.error : 'Extension history could not be verified.');
+      }
+      setExtensions(data.result);
+      setExtensionsRead(true);
+    } catch (err) {
+      setError(errorMessage(err, ''));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchExtensions();
+  }, []);
+
+  const handleExecute = async (id: string) => {
+    try {
+      const res = await fetch('/api/v1/agents/goose/execute', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          id,
+          args: { echo: 'hello from UI' }
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setExecResult('Error: ' + JSON.stringify(data.error));
+      } else {
+        setExecResult(JSON.stringify(data.result, null, 2));
+      }
+    } catch (err) {
+      setExecResult('Error: ' + errorMessage(err, ''));
+    }
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-8 font-sans">
+      <h1 className="text-3xl font-bold mb-4">Goose MCP Extensions UI</h1>
+      {error && (
+        <div className="border border-red-200 p-4 mb-4 rounded-xl shadow-sm bg-red-50/80 backdrop-blur-[30px] saturate-[210%] text-red-700" id="goose-error" role="alert">
+          <p className="font-bold">Error:</p>
+          <p>{error}</p>
+        </div>
+      )}
+      <h2 className="text-xl font-semibold mb-2">Available Extensions</h2>
+      {loading ? (
+        <p>Loading...</p>
+      ) : !extensionsRead ? (
+        <p>Extension history has not been verified.</p>
+      ) : extensions.length === 0 ? (
+        <p>No extensions found.</p>
+      ) : (
+        <ul className="mb-4">
+          {extensions.map((ext, idx) => (
+            <li key={idx} className="p-6 border border-white/20 dark:border-white/10 rounded-2xl shadow-xl bg-white/40 dark:bg-black/40 backdrop-blur-2xl saturate-[210%] mb-4 transition-all hover:bg-white/50 dark:hover:bg-black/50 hover:shadow-2xl">
+              <h3 className="font-bold" id={`extension-${ext.id}`}>{ext.name}</h3>
+              <p>{ext.description}</p>
+              <button
+                className="mt-4 px-4 py-2 bg-[#0071E3] text-white rounded-lg shadow-sm font-medium hover:bg-[#0071E3] transition-colors"
+                onClick={() => handleExecute(ext.id)}
+                id={`execute-${ext.id}`}
+              >
+                Execute
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <button
+        className="px-6 py-3 border border-white/20 dark:border-white/10 rounded-xl shadow-lg hover:shadow-xl hover:bg-white/60 dark:hover:bg-black/60 transition-all font-medium mb-8 bg-white/40 dark:bg-black/40 backdrop-blur-2xl saturate-[210%]"
+        onClick={fetchExtensions}
+        disabled={loading}
+      >
+        Refresh List
+      </button>
+
+      <h2 className="text-xl font-semibold mb-2">Execute Extension</h2>
+      <div className="p-6 border border-white/20 dark:border-white/10 rounded-3xl min-h-[150px] shadow-2xl bg-white/40 dark:bg-black/40 backdrop-blur-2xl saturate-[210%] overflow-hidden" id="exec-result">
+        {execResult ? (
+          <pre>{execResult}</pre>
+        ) : (
+          <p>Select an extension from the list to execute it.</p>
+        )}
+      </div>
+    </div>
+  );
+}

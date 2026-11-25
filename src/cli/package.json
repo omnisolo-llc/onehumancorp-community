@@ -1,0 +1,47 @@
+{
+  "name": "cli",
+  "version": "1.0.1",
+  "description": "",
+  "main": "dist/index.js",
+  "bin": {
+    "cli": "dist/index.js",
+    "omnisolo": "dist/index.js"
+  },
+  "scripts": {
+    "start": "tsx src/index.tsx",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --coverage"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "ink": "^7.0.1",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.5"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "@vitest/coverage-v8": "^4.1.11",
+    "c8": "^11.0.0",
+    "ink-testing-library": "^4.0.0",
+    "jsdom": "^29.1.1",
+    "react-dom": "^19.2.5",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.12",
+    "nanoid": "3.3.18",
+    "postcss": "8.5.23",
+    "undici": "7.29.1"
+  },
+  "type": "module"
+}

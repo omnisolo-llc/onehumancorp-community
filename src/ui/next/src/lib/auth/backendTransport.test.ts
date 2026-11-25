@@ -1,0 +1,673 @@
+import { describe, expect, it, vi } from "vitest";
+import { parseAuthRuntimeConfig } from "./runtimeConfig";
+import { sealSession } from "./sessionCodec";
+import { parseSessionKeyRing } from "./sessionKeys";
+import { cookieForSession, serializeSessionCookie, sessionCodecContext } from "./sessionCookie";
+import type { WebSession } from "./sessionTypes";
+import {
+  createRecoverableLoader,
+  stripBrowserIdentityJsonRequestBody,
+  validateJsonRequestBody,
+  proxyAuthenticatedRequest,
+  type BackendTransportDependencies,
+} from "./backendTransport";
+
+const NOW = 1_800_000_000;
+const SECRET = "Ww7LSLEn9AaAN6IT5kwJ0yGqVO11CMI9nOEqi7wF10I";
+
+async function dependencies(
+  fetchImpl: typeof fetch,
+  overrides: Partial<BackendTransportDependencies> = {},
+): Promise<BackendTransportDependencies> {
+  const config = parseAuthRuntimeConfig({
+    OMNISOLO_WEB_CANONICAL_ORIGIN: "https://app.example.com",
+    BACKEND_URL: "https://api.example.com",
+  });
+  return {
+    config,
+    ring: await parseSessionKeyRing({
+      OMNISOLO_WEB_SESSION_KEY_ID: "test-v1",
+      OMNISOLO_WEB_SESSION_SECRET: SECRET,
+    }),
+    now: () => NOW,
+    fetchImpl,
+    timeoutMs: 50,
+    requestLimitBytes: 64,
+    responseLimitBytes: 64,
+    ...overrides,
+  };
+}
+
+async function sessionCookie(
+  deps: BackendTransportDependencies,
+  overrides: Partial<WebSession> = {},
+): Promise<string> {
+  const session: WebSession = {
+    version: 1,
+    iat: NOW,
+    exp: NOW + 3_600,
+    accessToken: "verified.backend.token",
+    user: {
+      id: "user-7",
+      username: "Alice",
+      roles: ["ADMIN"],
+      organizationId: "tenant-7",
+    },
+    ...overrides,
+  };
+  const compact = await sealSession(
+    session,
+    deps.ring,
+    sessionCodecContext(deps.config),
+    { now: session.exp <= NOW ? session.iat : NOW, backendExpiresAt: session.exp },
+  );
+  return serializeSessionCookie(
+    cookieForSession(deps.config, compact, session.iat, session.exp),
+  ).split(";", 1)[0];
+}
+
+async function request(
+  deps: BackendTransportDependencies,
+  path = "/api/v1/orders?state=open",
+  init: RequestInit = {},
+): Promise<Request> {
+  return new Request(`https://app.example.com${path}`, {
+    method: init.method ?? "GET",
+    body: init.body,
+    headers: {
+      cookie: await sessionCookie(deps),
+      ...((init.headers as Record<string, string>) ?? {}),
+    },
+  });
+}
+
+describe("server-only authenticated backend transport", () => {
+  it("rejects missing, malformed, and expired sessions without backend I/O", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await dependencies(fetchImpl);
+    const missing = new Request("https://app.example.com/api/v1/orders");
+    const malformed = new Request("https://app.example.com/api/v1/orders", {
+      headers: { cookie: "__Host-omnisolo_session=malformed" },
+    });
+    const expired = new Request("https://app.example.com/api/v1/orders", {
+      headers: {
+        cookie: await sessionCookie(deps, { iat: NOW - 3_600, exp: NOW - 1 }),
+      },
+    });
+
+    for (const input of [missing, malformed, expired]) {
+      const response = await proxyAuthenticatedRequest(input, "/api/v1/orders", deps);
+      expect(response.status).toBe(401);
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("confines the URL and derives all identity headers from the verified session", async () => {
+    let forwardedBody = "";
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      expect(String(input)).toBe(
+        "https://api.example.com/api/v1/orders?state=open&tenant_id=tenant-7&user_id=user-7",
+      );
+      expect(init?.method).toBe("POST");
+      expect(init?.redirect).toBe("manual");
+      expect(init?.cache).toBe("no-store");
+      const headers = new Headers(init?.headers);
+      expect(headers.get("authorization")).toBe("Bearer verified.backend.token");
+      expect(headers.get("x-tenant-id")).toBe("tenant-7");
+      expect(headers.get("x-user-id")).toBe("user-7");
+      expect(headers.get("content-type")).toBe("application/json");
+      expect(headers.get("cookie")).toBeNull();
+      expect(headers.get("x-spiffe-id")).toBeNull();
+      expect(headers.get("x-user-roles")).toBeNull();
+      forwardedBody = await new Response(init?.body).text();
+      return new Response('{"ok":true}', {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "set-cookie": "backend=secret",
+          server: "private-backend",
+        },
+      });
+    });
+    const deps = await dependencies(fetchImpl);
+    const input = await request(
+      deps,
+      "/api/v1/orders?state=open&tenant_id=attacker&tenant_id=other&user_id=attacker&roles=owner",
+      {
+        method: "POST",
+        body: '{"item":"tea"}',
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer attacker-token",
+          "x-tenant-id": "attacker-tenant",
+          "x-user-id": "attacker-user",
+          "x-spiffe-id": "spiffe://attacker",
+          "x-user-roles": "owner",
+        },
+      },
+    );
+
+    const response = await proxyAuthenticatedRequest(input, "/api/v1/orders", deps);
+
+    expect(forwardedBody).toBe('{"item":"tea"}');
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true });
+    expect(response.headers.get("content-type")).toBe("application/json");
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("server")).toBeNull();
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+  });
+
+  it.each([
+    "//evil.example/steal",
+    "/api/v1/../admin",
+    "/api/v1/%2fadmin",
+    "/api/v1/orders?override=true",
+    "/api/v1/orders#fragment",
+    "/api\\orders",
+  ])("rejects backend path injection %s", async (backendPath) => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await dependencies(fetchImpl);
+    const response = await proxyAuthenticatedRequest(
+      await request(deps),
+      backendPath,
+      deps,
+    );
+    expect(response.status).toBe(400);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("bounds declared and streamed request bodies before fetching", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await dependencies(fetchImpl, { requestLimitBytes: 8 });
+    const declared = await request(deps, "/api/v1/orders", {
+      method: "POST",
+      body: "123456789",
+      headers: { "content-length": "9" },
+    });
+    const streamed = await request(deps, "/api/v1/orders", {
+      method: "POST",
+      body: "123456789",
+    });
+
+    expect((await proxyAuthenticatedRequest(declared, "/api/v1/orders", deps)).status).toBe(413);
+    expect((await proxyAuthenticatedRequest(streamed, "/api/v1/orders", deps)).status).toBe(413);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("resolves a body-derived backend path only after bounded parsing", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      expect(String(input)).toBe(
+        "https://api.example.com/api/v1/assistant/tasks/task-7/artifacts",
+      );
+      return Response.json({ ok: true });
+    });
+    const deps = await dependencies(fetchImpl);
+    const input = await request(deps, "/api/v1/assistant/artifacts", {
+      method: "POST",
+      body: '{"taskId":"task-7"}',
+      headers: { "content-type": "application/json" },
+    });
+
+    const response = await proxyAuthenticatedRequest(
+      input,
+      "/unused",
+      deps,
+      {
+        resolveBackendPath: (body) => {
+          const value = JSON.parse(new TextDecoder().decode(body));
+          return `/api/v1/assistant/tasks/${value.taskId}/artifacts`;
+        },
+      },
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  it("does not resolve a body-derived path for an oversized request", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = { ...(await dependencies(fetchImpl)), requestLimitBytes: 8 };
+    const input = await request(deps, "/api/v1/assistant/artifacts", {
+      method: "POST",
+      body: '{"taskId":"task-7"}',
+    });
+    const resolveBackendPath = vi.fn(() => "/api/v1/assistant/tasks/task-7/artifacts");
+
+    const response = await proxyAuthenticatedRequest(input, "/unused", deps, {
+      resolveBackendPath,
+    });
+
+    expect(response.status).toBe(413);
+    expect(resolveBackendPath).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("allows a trusted route to override the backend method", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(init?.method).toBe("PUT");
+      return Response.json({ ok: true });
+    });
+    const deps = await dependencies(fetchImpl);
+    const input = await request(deps, "/api/v1/quotes?id=quote-7", {
+      method: "POST",
+      body: '{"status":"SENT"}',
+      headers: { "content-type": "application/json" },
+    });
+
+    const response = await proxyAuthenticatedRequest(
+      input,
+      "/api/v1/quotes/quote-7",
+      deps,
+      { backendMethod: "PUT" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("allows a trusted route to suppress inbound query forwarding", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      expect(String(input)).toBe("https://api.example.com/api/v1/fulfillment");
+      return Response.json({ ok: true });
+    });
+    const deps = await dependencies(fetchImpl);
+    const input = await request(
+      deps,
+      "/api/v1/fulfillment?status=preparing&tenant_id=attacker",
+    );
+
+    const response = await proxyAuthenticatedRequest(
+      input,
+      "/api/v1/fulfillment",
+      deps,
+      { forwardQuery: false },
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("allows a trusted action route to suppress the caller request body", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBeUndefined();
+      return Response.json({ ok: true });
+    });
+    const deps = await dependencies(fetchImpl);
+    const input = await request(deps, "/api/v1/quotes/quote-7/accept", {
+      method: "POST",
+      body: '{"attacker":"payload"}',
+      headers: { "content-type": "application/json" },
+    });
+
+    const response = await proxyAuthenticatedRequest(
+      input,
+      "/api/v1/quotes/quote-7/accept",
+      deps,
+      { suppressRequestBody: true },
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("validates JSON without changing bytes or large integer precision", () => {
+    const source = ' { "id": 9007199254740993, "nested": { "ok": true } } ';
+
+    const validated = validateJsonRequestBody(
+      new TextEncoder().encode(source),
+    );
+
+    expect(new TextDecoder().decode(validated)).toBe(source);
+  });
+
+  it("removes browser-selected identity recursively while preserving domain roles", () => {
+    const source = {
+      tenant_id: "attacker-tenant",
+      tenant: "attacker-tenant",
+      organization_id: "attacker-tenant",
+      user_id: "attacker-user",
+      user: "attacker-user",
+      roles: ["owner"],
+      spiffe_id: "spiffe://attacker",
+      authorization: "Bearer attacker",
+      token: "attacker",
+      message: "keep me",
+      nested: {
+        user_id: "attacker-user",
+        rows: [{ authorization: "Bearer attacker", role: "Cashier", roles: ["editor"], safe: true }],
+      },
+    };
+
+    const sanitized = stripBrowserIdentityJsonRequestBody(
+      new TextEncoder().encode(JSON.stringify(source)),
+    );
+
+    expect(JSON.parse(new TextDecoder().decode(sanitized))).toEqual({
+      message: "keep me",
+      roles: ["owner"],
+      nested: { rows: [{ role: "Cashier", roles: ["editor"], safe: true }] },
+    });
+  });
+
+  it("removes browser identity aliases regardless of casing or separators", () => {
+    const sanitized = stripBrowserIdentityJsonRequestBody(
+      new TextEncoder().encode(JSON.stringify({
+        TenantId: "attacker-tenant",
+        "ORGANIZATION-ID": "attacker-org",
+        userId: "attacker-user",
+        "X-User-Roles": ["owner"],
+        AccessToken: "attacker-token",
+        nested: { AUTHORIZATION: "Bearer attacker", safe: "kept" },
+      })),
+    );
+
+    expect(JSON.parse(new TextDecoder().decode(sanitized))).toEqual({
+      nested: { safe: "kept" },
+    });
+  });
+
+  it("rejects malformed JSON and invalid UTF-8 request bodies", () => {
+    expect(() => validateJsonRequestBody(new TextEncoder().encode("{"))).toThrow();
+    expect(() => validateJsonRequestBody(Uint8Array.from([0xc3, 0x28]))).toThrow();
+  });
+
+  it("authenticates and bounds the request before transforming its body", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await dependencies(fetchImpl, { requestLimitBytes: 8 });
+    const transformRequestBody = vi.fn(validateJsonRequestBody);
+    const unauthenticated = new Request("https://app.example.com/api/v1/orders", {
+      method: "POST",
+      body: "{}",
+    });
+    const oversized = await request(deps, "/api/v1/orders", {
+      method: "POST",
+      body: '{"x":123}',
+    });
+
+    expect(
+      (
+        await proxyAuthenticatedRequest(
+          unauthenticated,
+          "/api/v1/orders",
+          deps,
+          { transformRequestBody },
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await proxyAuthenticatedRequest(oversized, "/api/v1/orders", deps, {
+          transformRequestBody,
+        })
+      ).status,
+    ).toBe(413);
+    expect(transformRequestBody).not.toHaveBeenCalled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["text/plain", "text/plain"],
+  ])(
+    "allows a trusted JSON route to override a %s caller content type",
+    async (_case, callerContentType) => {
+      const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+        expect(new Headers(init?.headers).get("content-type")).toBe(
+          "application/json",
+        );
+        await expect(new Response(init?.body).text()).resolves.toBe(
+          ' { "ok": true } ',
+        );
+        return Response.json({ ok: true });
+      });
+      const deps = await dependencies(fetchImpl);
+      const input = await request(deps, "/api/v1/checkout", {
+        method: "POST",
+        body: new TextEncoder().encode(' { "ok": true } '),
+        headers:
+          callerContentType === undefined
+            ? undefined
+            : { "content-type": callerContentType },
+      });
+
+      const response = await proxyAuthenticatedRequest(
+        input,
+        "/api/v1/checkout",
+        deps,
+        {
+          requestContentType: "application/json",
+          transformRequestBody: validateJsonRequestBody,
+        },
+      );
+
+      expect(response.status).toBe(200);
+      expect(fetchImpl).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("preserves the caller content type when no override is configured", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(new Headers(init?.headers).get("content-type")).toBe("text/plain");
+      return Response.json({ ok: true });
+    });
+    const deps = await dependencies(fetchImpl);
+    const input = await request(deps, "/api/v1/orders", {
+      method: "POST",
+      body: "plain text",
+      headers: { "content-type": "text/plain" },
+    });
+
+    const response = await proxyAuthenticatedRequest(
+      input,
+      "/api/v1/orders",
+      deps,
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  it("rejects backend redirects and oversized responses", async () => {
+    const redirectBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("redirect"));
+      },
+      cancel() {},
+    });
+    const redirected = vi.fn<typeof fetch>(async () =>
+      new Response(redirectBody, { status: 302, headers: { location: "https://evil.example" } }),
+    );
+    const redirectDeps = await dependencies(redirected);
+    expect(
+      (await proxyAuthenticatedRequest(await request(redirectDeps), "/api/v1/orders", redirectDeps))
+        .status,
+    ).toBe(502);
+
+    const oversized = vi.fn<typeof fetch>(async () => new Response("123456789"));
+    const sizeDeps = await dependencies(oversized, { responseLimitBytes: 8 });
+    expect(
+      (await proxyAuthenticatedRequest(await request(sizeDeps), "/api/v1/orders", sizeDeps))
+        .status,
+    ).toBe(502);
+  });
+
+  it.each([401, 403, 429])("preserves backend authorization status %s and safe headers", async (status) => {
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      new Response('{"error":"denied"}', {
+        status,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "30",
+          "www-authenticate": 'Bearer realm="ohc"',
+          "x-internal-debug": "secret",
+        },
+      }),
+    );
+    const deps = await dependencies(fetchImpl);
+
+    const response = await proxyAuthenticatedRequest(
+      await request(deps),
+      "/api/v1/orders",
+      deps,
+    );
+
+    expect(response.status).toBe(status);
+    expect(response.headers.get("retry-after")).toBe("30");
+    expect(response.headers.get("www-authenticate")).toBe('Bearer realm="ohc"');
+    expect(response.headers.get("x-internal-debug")).toBeNull();
+  });
+
+  it("times out bounded backend work", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+      }),
+    );
+    const deps = await dependencies(fetchImpl, { timeoutMs: 5 });
+
+    const response = await proxyAuthenticatedRequest(
+      await request(deps),
+      "/api/v1/orders",
+      deps,
+    );
+
+    expect(response.status).toBe(504);
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+  });
+
+  it("rejects unsupported methods before backend I/O", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await dependencies(fetchImpl);
+    const input = await request(deps, "/api/v1/orders", { method: "OPTIONS" });
+
+    const response = await proxyAuthenticatedRequest(input, "/api/v1/orders", deps);
+
+    expect(response.status).toBe(405);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+it('forwards SSE incrementally and cancels upstream when the browser disconnects', async () => {
+  const cancel = vi.fn();
+  const upstream = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode('event: metrics\ndata: []\n\n')); },
+    cancel,
+  });
+  const deps = await dependencies(vi.fn<typeof fetch>().mockResolvedValue(new Response(upstream, {
+    headers: { 'content-type': 'text/event-stream' },
+  })));
+  const response = await proxyAuthenticatedRequest(await request(deps), '/api/v1/agents/metrics/stream', deps, { streamResponse: true });
+  expect(response.status).toBe(200);
+  const reader = response.body!.getReader();
+  expect(new TextDecoder().decode((await reader.read()).value)).toContain('event: metrics');
+  await reader.cancel();
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+it('bounds SSE bytes and does not forward an oversized chunk', async () => {
+  const cancel = vi.fn();
+  const upstream = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new Uint8Array(65)); }, cancel,
+  });
+  const deps = await dependencies(vi.fn<typeof fetch>().mockResolvedValue(new Response(upstream, { headers: { 'content-type': 'text/event-stream' } })));
+  const response = await proxyAuthenticatedRequest(await request(deps), '/api/v1/agents/metrics/stream', deps, { streamResponse: true });
+  await expect(response.body!.getReader().read()).rejects.toThrow('limit exceeded');
+  expect(cancel).toHaveBeenCalledOnce();
+});
+
+describe('offline owner precondition', () => {
+  it.each([
+    { 'x-ohc-expected-user': 'another-user', 'x-ohc-expected-tenant': 'tenant-7' },
+    { 'x-ohc-expected-user': 'user-7', 'x-ohc-expected-tenant': 'another-tenant' },
+    { 'x-ohc-expected-user': 'user-7' },
+  ])('rejects a queued owner mismatch before backend I/O', async headers => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ success: true }));
+    const deps = await dependencies(fetchImpl);
+    const response = await proxyAuthenticatedRequest(await request(deps, '/api/v1/sync/events', {
+      method: 'POST', headers, body: '{}',
+    }), '/api/v1/sync/events', deps);
+    expect(response.status).toBe(409);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('uses the sealed session as authority and does not forward the precondition', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ success: true }));
+    const deps = await dependencies(fetchImpl);
+    const response = await proxyAuthenticatedRequest(await request(deps, '/api/v1/sync/events', {
+      method: 'POST', headers: { 'x-ohc-expected-user': 'user-7', 'x-ohc-expected-tenant': 'tenant-7', 'x-user-id': 'spoofed' }, body: '{}',
+    }), '/api/v1/sync/events', deps);
+    expect(response.status).toBe(200);
+    const headers = fetchImpl.mock.calls[0][1]?.headers as Headers;
+    expect(headers.get('x-user-id')).toBe('user-7');
+    expect(headers.has('x-ohc-expected-user')).toBe(false);
+    expect(headers.has('x-ohc-expected-tenant')).toBe(false);
+  });
+});
+
+describe('proxied active document CSP & recoverable dependency cache', () => {
+  it.each(['text/html; charset=utf-8', 'image/svg+xml'])(
+    'enforces strict scriptless CSP and nosniff when proxying %s without CSP',
+    async (contentType) => {
+      const fetchImpl = vi.fn<typeof fetch>(async () =>
+        new Response('<html><body>ok</body></html>', {
+          status: 200,
+          headers: { 'content-type': contentType },
+        }),
+      );
+      const deps = await dependencies(fetchImpl);
+      const response = await proxyAuthenticatedRequest(
+        await request(deps, '/api/v1/growth/discount-code/embed'),
+        '/api/v1/growth/discount-code/embed',
+        deps,
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(response.headers.get('content-security-policy')).toContain("default-src 'none'");
+      expect(response.headers.get('content-security-policy')).toContain("script-src 'none'");
+    },
+  );
+
+  it('preserves strict scriptless CSP sent by backend instead of stripping it', async () => {
+    const strictCsp = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; base-uri 'none'";
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      new Response('<svg></svg>', {
+        status: 200,
+        headers: {
+          'content-type': 'image/svg+xml',
+          'content-security-policy': strictCsp,
+        },
+      }),
+    );
+    const deps = await dependencies(fetchImpl);
+    const response = await proxyAuthenticatedRequest(
+      await request(deps, '/api/v1/growth/milestone/card'),
+      '/api/v1/growth/milestone/card',
+      deps,
+    );
+
+    expect(response.headers.get('content-security-policy')).toBe(strictCsp);
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+  });
+
+  it('clears cached promise on transient rejection so subsequent calls recover', async () => {
+    let attempts = 0;
+    const load = createRecoverableLoader(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('transient startup error');
+      }
+      return 'ready';
+    });
+
+    await expect(load()).rejects.toThrow('transient startup error');
+    await expect(load()).resolves.toBe('ready');
+    await expect(load()).resolves.toBe('ready');
+    expect(attempts).toBe(2);
+  });
+});

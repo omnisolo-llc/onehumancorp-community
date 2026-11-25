@@ -1,0 +1,92 @@
+import { describe, expect, it } from "vitest";
+import { parseAuthRuntimeConfig } from "./runtimeConfig";
+
+const production = {
+  OMNISOLO_WEB_CANONICAL_ORIGIN: "https://app.example.com",
+  BACKEND_URL: "https://api.example.com:8443",
+  OMNISOLO_WEB_LOCAL_DEV: "false",
+};
+
+describe("authentication runtime configuration", () => {
+  it("accepts canonical HTTPS and preserves an explicit backend port", () => {
+    expect(parseAuthRuntimeConfig(production)).toEqual({
+      canonicalOrigin: "https://app.example.com",
+      backendOrigin: "https://api.example.com:8443",
+      localDev: false,
+      cookieName: "__Host-omnisolo_session",
+      secureCookie: true,
+      sessionAudience: "https://app.example.com",
+    });
+  });
+
+  it("accepts an explicitly configured HTTPS LAN origin", () => {
+    expect(
+      parseAuthRuntimeConfig({
+        ...production,
+        OMNISOLO_WEB_CANONICAL_ORIGIN: "https://192.168.1.40:8443",
+        BACKEND_URL: "http://127.0.0.1:18789",
+      }),
+    ).toMatchObject({
+      canonicalOrigin: "https://192.168.1.40:8443",
+      cookieName: "__Host-omnisolo_session",
+      secureCookie: true,
+    });
+  });
+
+  it("allows plaintext only for explicit loopback local development", () => {
+    expect(parseAuthRuntimeConfig({ OMNISOLO_WEB_LOCAL_DEV: "true" })).toEqual({
+      canonicalOrigin: "http://127.0.0.1:3000",
+      backendOrigin: "http://127.0.0.1:18789",
+      localDev: true,
+      cookieName: "omnisolo_session",
+      secureCookie: false,
+      sessionAudience: "http://127.0.0.1:3000",
+    });
+  });
+
+  it.each([
+    "http://10.0.0.12:3000",
+    "http://172.16.4.8:3000",
+    "http://172.31.255.254:3000",
+    "http://192.168.1.40:3000",
+    "http://[fd00::40]:3000",
+    "http://[fe80::40]:3000",
+  ])("allows an explicit private LAN origin in local development: %s", (origin) => {
+    expect(parseAuthRuntimeConfig({
+      OMNISOLO_WEB_LOCAL_DEV: "true",
+      OMNISOLO_WEB_CANONICAL_ORIGIN: origin,
+    }).canonicalOrigin).toBe(origin);
+  });
+
+  it.each([
+    [{ ...production, OMNISOLO_WEB_CANONICAL_ORIGIN: undefined }, "OMNISOLO_WEB_CANONICAL_ORIGIN is required"],
+    [{ ...production, BACKEND_URL: undefined }, "BACKEND_URL is required"],
+    [{ ...production, OMNISOLO_WEB_LOCAL_DEV: "yes" }, "OMNISOLO_WEB_LOCAL_DEV must be true or false"],
+    [{ ...production, OMNISOLO_WEB_CANONICAL_ORIGIN: "http://app.example.com" }, "canonical origin must use HTTPS"],
+    [{ ...production, OMNISOLO_WEB_CANONICAL_ORIGIN: "https://app.example.com/path" }, "canonical origin must not contain"],
+    [{ ...production, OMNISOLO_WEB_CANONICAL_ORIGIN: "https://user@app.example.com" }, "canonical origin must not contain"],
+    [{ ...production, BACKEND_URL: "http://8.8.8.8:8080" }, "backend origin must use HTTPS or loopback HTTP"],
+    [{ ...production, BACKEND_URL: "http://omnisolo.attacker.example" }, "backend origin must use HTTPS or loopback HTTP"],
+    [{ ...production, BACKEND_URL: "http://api-omnisolo.public.example:18789" }, "backend origin must use HTTPS or loopback HTTP"],
+    [{ ...production, BACKEND_URL: "http://fake.cluster.local:18789" }, "backend origin must use HTTPS or loopback HTTP"],
+    [{ ...production, BACKEND_URL: "https://api.example.com/path" }, "backend origin must not contain"],
+    [{ OMNISOLO_WEB_LOCAL_DEV: "true", OMNISOLO_WEB_CANONICAL_ORIGIN: "http://8.8.8.8:3000" }, "local development canonical origin must be loopback or a private LAN IP"],
+    [{ OMNISOLO_WEB_LOCAL_DEV: "true", OMNISOLO_WEB_CANONICAL_ORIGIN: "http://devbox.local:3000" }, "local development canonical origin must be loopback or a private LAN IP"],
+  ] as const)("rejects invalid configuration %#", (env, message) => {
+    expect(() => parseAuthRuntimeConfig(env)).toThrow(message);
+  });
+
+  it.each([
+    "http://127.0.0.1:18789",
+    "http://10.0.0.15:18789",
+    "http://backend:18789",
+    "http://omnisolo-backend.omnisolo.svc.cluster.local:18789",
+  ])("allows plaintext HTTP only for explicit internal backend origins: %s", (backendUrl) => {
+    expect(
+      parseAuthRuntimeConfig({
+        ...production,
+        BACKEND_URL: backendUrl,
+      }).backendOrigin,
+    ).toBe(backendUrl);
+  });
+});

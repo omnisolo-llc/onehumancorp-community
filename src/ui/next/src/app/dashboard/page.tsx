@@ -1,0 +1,1317 @@
+"use client";
+import { messageDeliveryStatus } from "@/lib/messageDeliveryStatus";
+import { SyncManager } from "../../lib/sync/SyncManager";
+import { QUEUE_IDENTITY_EPOCH_KEY } from "../../lib/sync/queueIdentity";
+import type { AgentFeedData, AgentFeedItem, ActivityItem, TriageItem } from '@/lib/agent-feed-types';
+import type { Step } from '@/components/Walkthrough';
+import type { ApprovalRequest } from '../team/page';
+import { MorningBriefingCard } from "./MorningBriefingCard";
+
+import { CFOAgentCard } from "./CFOAgentCard";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { AppShell } from "../components/AppShell";
+import { InteractiveWalkthrough, WalkthroughTarget } from "../../components/Walkthrough";
+import { WithTooltip } from "../../components/TooltipRegistry";
+import { DashboardViralInviteWidget } from "./DashboardViralInviteWidget";
+import { UnlockProFeaturesWidget } from "./UnlockProFeaturesWidget";
+import AiTimeSavingsWidget from "../components/AiTimeSavingsWidget";
+
+import { SmartBlock } from "../builder/components";
+import { UnifiedAgentFeed } from "./UnifiedAgentFeed";
+import './ReviewFeedCard';
+
+import { PromoterCard } from "./PromoterCard";
+import { GrowBusinessCard } from "./GrowBusinessCard";
+import { FundingOpportunityCard } from "./FundingOpportunityCard";
+import { ViralLoopPerformanceWidget } from "./ViralLoopPerformanceWidget";
+import { SuccessMilestoneWidget } from "./SuccessMilestoneWidget";
+import AffiliateMarketingWidget from "./AffiliateMarketingWidget";
+import { CartRecoveryWidget } from "./CartRecoveryWidget";
+import { WrappedWidget } from "./WrappedWidget";
+import ReferralMilestonesWidget from "../components/ReferralMilestonesWidget";
+import { ReferralTierWidget } from "./ReferralTierWidget";
+import { QuickActionFAB } from "./QuickActionFAB";
+
+type DashboardMetrics = {
+  active_customers: number;
+  pending_orders: number;
+  total_sales: number;
+  total_campaigns_sent?: number;
+  auto_replied?: number;
+};
+
+type Order = {
+  id: string;
+  customer_name?: string;
+  total_amount?: number;
+  status?: string;
+  created_at?: string;
+};
+
+type InboxMessage = {
+  id: string;
+  source?: string;
+  content?: string;
+  draft_reply?: string;
+  status?: string;
+  created_at?: string;
+};
+
+type SupplyPayload = {
+  vendors: unknown[];
+  raw_materials: Array<{
+    id: string;
+    name: string;
+    current_quantity: number;
+    reorder_threshold: number;
+  }>;
+  bom_items: unknown[];
+};
+
+const emptyMetrics: DashboardMetrics = {
+  active_customers: 0,
+  pending_orders: 0,
+  total_sales: 0,
+  total_campaigns_sent: 0,
+  auto_replied: 0,
+};
+
+function tenantId() {
+  if (typeof window === "undefined") return "default";
+  return localStorage.getItem("business_display_name") || "default";
+}
+
+function money(value: number | undefined) {
+  return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value || 0);
+}
+
+function statusTone(status?: string) {
+  const delivery = messageDeliveryStatus(status);
+  if (delivery) return delivery.tone;
+  const normalized = (status || "").toLowerCase();
+  if (["paid", "completed", "shipped", "delivered", "auto_replied"].includes(normalized)) return "good";
+  if (["pending", "unfulfilled", "open"].includes(normalized)) return "warn";
+  if (["failed", "cancelled", "canceled"].includes(normalized)) return "bad";
+  return "neutral";
+}
+
+function formatStatus(status?: string) {
+  const normalized = (status || "").toLowerCase();
+  const delivery = messageDeliveryStatus(normalized);
+  if (delivery) return delivery.label;
+  return status || "Open";
+}
+
+
+const DEFAULT_DASHBOARD_WALKTHROUGH: Step[] = [
+  { targetId: "dashboard-title", target_id: "dashboard-title", title: "Business Analytics", content: "Welcome to your dashboard! This is your control center." },
+  { targetId: "operations-map", target_id: "operations-map", title: "Operations Map", content: "View and manage your operations in real-time." },
+];
+
+export default function Dashboard() {
+  const router = useRouter();
+  const [metrics, setMetrics] = useState<DashboardMetrics>(emptyMetrics);
+  const [orders, setOrders] = useState<Order[]>([]);
+  const [messages, setMessages] = useState<InboxMessage[]>([]);
+  const [supply, setSupply] = useState<SupplyPayload>({ vendors: [], raw_materials: [], bom_items: [] });
+  const [supplyAvailable, setSupplyAvailable] = useState(false);
+  const [, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [dashboardData, setDashboardData] = useState<AgentFeedData & { initialAgentFeed?: AgentFeedData }>({ pendingReviews: [] });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [isOffline, setIsOffline] = useState(false);
+  const [offlineQueueCount, setOfflineQueueCount] = useState(0);
+  const [isWalkthroughOpen, setIsWalkthroughOpen] = useState(false);
+  const [walkthroughSteps, setWalkthroughSteps] = useState<Step[]>(DEFAULT_DASHBOARD_WALKTHROUGH);
+  const [pendingApprovals, setPendingApprovals] = useState<(AgentFeedItem | ApprovalRequest)[]>([]);
+  const [activities, setActivities] = useState<ActivityItem[]>([]);
+  const [initialTriage, setInitialTriage] = useState<TriageItem[]>([]);
+  const [userName, setUserName] = useState("Human");
+  const [showMigration, setShowMigration] = useState(false);
+  const [actionMessage] = useState("");
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncErrorCount, setSyncErrorCount] = useState(0);
+  const [queueReadError, setQueueReadError] = useState("");
+  const [activeDepartments, setActiveDepartments] = useState<string[]>([]);
+  const [onboardingStatus, setOnboardingStatus] = useState<string | null>(null);
+  const [showReferralModal, setShowReferralModal] = useState(false);
+  const [showEmbedModal, setShowEmbedModal] = useState(false);
+
+
+
+  useEffect(() => {
+    let queueActive = true; let queueVersion = 0; let syncVersion = 0;
+    fetch("/api/v1/walkthrough/dashboard")
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setWalkthroughSteps(data);
+        }
+      })
+      .catch((err) => {
+        if (err instanceof Error && (err.name === 'AbortError' || err.message.includes('Failed to fetch'))) return;
+        console.error("Walkthrough fetch failed:", err);
+      });
+
+    try {
+      const storedName = localStorage.getItem("user_name");
+      if (storedName) {
+        setUserName(storedName);
+      }
+    } catch {
+      // ignore
+    }
+
+    const updateOfflineStatus = async () => {
+      const version = ++queueVersion;
+      setIsOffline(!navigator.onLine);
+      try {
+        const summary = await SyncManager.getInstance().getQueueSummary();
+        if (!queueActive || version !== queueVersion) return;
+        setOfflineQueueCount(summary.pending);
+        setSyncErrorCount(summary.needsAttention + summary.reconciliation);
+        setQueueReadError(summary.storageUnavailable ? 'Queue status is unavailable for one local adapter. Saved actions remain held.' : '');
+      } catch {
+        if (queueActive && version === queueVersion) setQueueReadError('Queue status is unavailable. Saved actions remain held until your session and local storage can be verified.');
+      }
+    };
+
+    const handleSync = async () => {
+      if (!navigator.onLine) return;
+      const version = ++syncVersion;
+      setIsSyncing(true);
+      try {
+        await SyncManager.getInstance().sync();
+        if (queueActive && version === syncVersion) await updateOfflineStatus();
+      } catch {
+        if (queueActive && version === syncVersion) setQueueReadError('Queue status is unavailable. Saved actions remain held until their result can be verified.');
+      } finally {
+        if (queueActive && version === syncVersion) setIsSyncing(false);
+      }
+    };
+    const handleIdentityChanged = () => {
+      syncVersion += 1; setIsSyncing(false); setOfflineQueueCount(0); setSyncErrorCount(0);
+      setQueueReadError('Queue status is unavailable while your session is being verified.');
+      void updateOfflineStatus();
+    };
+
+    const handleQueueStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === QUEUE_IDENTITY_EPOCH_KEY) handleIdentityChanged();
+      else void updateOfflineStatus();
+    };
+
+    async function loadDashboard() {
+      setLoading(true);
+      setSupplyAvailable(false);
+      setError("");
+
+      try {
+        const unifiedPromise = fetch(`/api/v1/ui/dashboard/unified-feed?mobile_optimized=${window.innerWidth < 768}`)
+          .then(res => res.ok ? res.json() : null)
+          .catch(() => null);
+
+        const onboardingPromise = fetch(`/api/v1/onboarding/state`)
+          .then(res => res.ok ? res.json() : null)
+          .catch(() => null);
+
+        const [unifiedData, onboardingData] = await Promise.all([
+          unifiedPromise,
+          onboardingPromise,
+        ]);
+
+        const approvalsData = unifiedData?.pending_approvals || [];
+        const agentFeedData = { items: unifiedData?.agent_feed || [] };
+
+        setDashboardData((prev) => ({ ...prev, initialAgentFeed: agentFeedData }));
+
+        if (approvalsData && Array.isArray(approvalsData) && approvalsData.length > 0 && !agentFeedData.items?.length) {
+            setPendingApprovals(approvalsData.filter((i: ApprovalRequest) => i.status !== "APPROVED" && i.status !== "REJECTED" && i.status !== "PAUSED"));
+            setActivities(approvalsData.filter((i: ApprovalRequest) => i.status === "APPROVED" || i.status === "REJECTED" || i.status === "PAUSED").map((i: ApprovalRequest) => ({ id: i.id, department: i.department, event_type: i.status, payload: { original_payload: { ...i.payload, description: i.description } }, created_at: i.created_at })));
+        } else if (agentFeedData && agentFeedData.items) {
+            setPendingApprovals(agentFeedData.items.filter((i: AgentFeedItem) => i.lifecycle_state !== "APPROVED" && i.lifecycle_state !== "DISMISSED" && i.lifecycle_state !== "PAUSED"));
+            setActivities(agentFeedData.items.filter((i: AgentFeedItem) => i.lifecycle_state === "APPROVED" || i.lifecycle_state === "DISMISSED" || i.lifecycle_state === "PAUSED").map((a: AgentFeedItem) => ({
+                id: a.id,
+                event_type: a.lifecycle_state,
+                department: a.event_source,
+                payload: typeof a.context_payload === 'object' ? JSON.stringify({ original_payload: a.context_payload }) : a.context_payload,
+                created_at: a.created_at
+            })));
+        }
+
+        const metricsData = unifiedData?.metrics || {};
+        const ordersData = unifiedData?.orders || [];
+        const inboxData = unifiedData?.inbox || [];
+        const supplyData = unifiedData?.supply || {};
+
+        if (Array.isArray(onboardingData?.wizardState?.aiAgents)) {
+          setActiveDepartments(onboardingData.wizardState.aiAgents.filter((department: unknown): department is string => typeof department === "string"));
+        } else {
+          setActiveDepartments([]);
+        }
+        setOnboardingStatus(onboardingData?.status || null);
+
+        setMetrics({ ...emptyMetrics, ...metricsData });
+        setOrders(Array.isArray(ordersData) ? ordersData : []);
+        setMessages(Array.isArray(inboxData) ? inboxData : []);
+        setSupplyAvailable(supplyData?.error == null && supplyData?.success !== false
+          && Array.isArray(supplyData?.vendors) && Array.isArray(supplyData?.raw_materials) && Array.isArray(supplyData?.bom_items));
+        setSupply({
+          vendors: Array.isArray(supplyData?.vendors) ? supplyData.vendors : [],
+          raw_materials: Array.isArray(supplyData?.raw_materials) ? supplyData.raw_materials : [],
+          bom_items: Array.isArray(supplyData?.bom_items) ? supplyData.bom_items : [],
+        });
+        setApprovals(Array.isArray(approvalsData?.approvals) ? approvalsData.approvals : (Array.isArray(approvalsData) ? approvalsData : []));
+        if (unifiedData?.triage) {
+          setInitialTriage(unifiedData.triage);
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "";
+        setError(msg && !msg.toLowerCase().includes("failed to load") ? msg : "Dashboard data temporarily unavailable");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    updateOfflineStatus();
+    loadDashboard();
+    handleSync();
+    window.addEventListener("online", updateOfflineStatus);
+    window.addEventListener("online", handleSync);
+    window.addEventListener("offline", updateOfflineStatus);
+    window.addEventListener("storage", handleQueueStorage);
+    window.addEventListener("omnisolo_queue_updated", updateOfflineStatus);
+    window.addEventListener("omnisolo_auth_changed", handleIdentityChanged);
+
+
+
+
+  return () => {
+      queueActive = false; queueVersion += 1; syncVersion += 1;
+      window.removeEventListener("omnisolo_queue_updated", updateOfflineStatus);
+      window.removeEventListener("omnisolo_auth_changed", handleIdentityChanged);
+      window.removeEventListener("online", updateOfflineStatus);
+      window.removeEventListener("online", handleSync);
+      window.removeEventListener("offline", updateOfflineStatus);
+      window.removeEventListener("storage", handleQueueStorage);
+    };
+  }, []);
+
+  const lowStockCount = useMemo(
+    () => supply.raw_materials.every((item) => item && Number.isSafeInteger(item.current_quantity) && item.current_quantity >= 0
+      && Number.isSafeInteger(item.reorder_threshold) && item.reorder_threshold >= 0)
+      ? supply.raw_materials.filter((item) => item.current_quantity <= item.reorder_threshold).length : null,
+    [supply.raw_materials],
+  );
+
+  const supplyCount = loading ? "Loading…" : supplyAvailable ? String(supply.vendors.length) : "Unavailable";
+  const stockCount = loading ? "Loading…" : supplyAvailable && lowStockCount !== null ? String(lowStockCount) : "Unavailable";
+
+  const statusItems = [
+    { label: "API", value: error ? "Degraded" : "Online", tone: error ? "bad" as const : "good" as const },
+    { label: "Orders", value: String(metrics.pending_orders || 0), tone: metrics.pending_orders > 0 ? "warn" as const : "good" as const },
+    { label: "Stock", value: stockCount, tone: !supplyAvailable || lowStockCount === null || lowStockCount > 0 ? "warn" as const : "good" as const },
+    {
+      label: "Growth",
+      value: loading ? "Unknown" : error ? "Unavailable" : activeDepartments.some((department) => department.trim().toLowerCase() === "growth") ? "Active" : "Inactive",
+      tone: loading || error ? "neutral" as const : activeDepartments.some((department) => department.trim().toLowerCase() === "growth") ? "good" as const : "neutral" as const,
+    },
+  ];
+
+
+  const feedInitialData = useMemo(() => ({
+    items: dashboardData?.initialAgentFeed?.items,
+    proposals: pendingApprovals,
+    activity: activities,
+    orders,
+    inbox: messages,
+    triage: initialTriage,
+    priority_tasks: dashboardData?.priority_tasks || [],
+    pendingReviews: dashboardData?.pendingReviews || []
+  }), [
+    dashboardData?.initialAgentFeed?.items,
+    pendingApprovals,
+    activities,
+    orders,
+    messages,
+    initialTriage,
+    dashboardData?.priority_tasks,
+    dashboardData?.pendingReviews
+  ]);
+
+  return (
+    <>
+    <AppShell
+      title="Dashboard"
+      subtitle="Network-style command center for your store operations."
+      statusItems={statusItems}
+      actions={[
+        { label: "Sell In Person", href: "/pos/terminal" },
+        { label: "Campaigns", href: "/dashboard/campaigns", icon: "campaigns" },
+        { label: "New Product", href: "/products/new", primary: true },
+      ]}
+    >
+      <div className="mb-6 p-6 rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm flex flex-col sm:flex-row justify-between sm:items-center gap-4">
+        <div>
+          <WalkthroughTarget id="dashboard-title">
+            <h2 className="text-2xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Welcome back.{userName ? ` ${userName}` : ''}</h2>
+          </WalkthroughTarget>
+          <p className="text-gray-600 dark:text-gray-400">Your agents are working on your behalf.</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowReferralModal(true)}
+          className="app-button min-h-[44px]"
+        >
+          Referral Program
+        </button>
+      </div>
+
+      {onboardingStatus !== "launched" && (
+        <div className="mb-6 p-6 rounded-[12px] bg-blue-50 border border-blue-200 shadow-sm dark:bg-blue-950/20 dark:border-blue-900">
+          <h2 className="text-xl font-bold text-blue-900 dark:text-blue-100 mb-2">Complete Your Business Setup</h2>
+          <p className="text-blue-700 dark:text-blue-300 mb-4 font-medium font-outfit">Set up your business profile, customize your website, and activate your AI agents to start selling!</p>
+          <button
+            onClick={() => router.push("/onboarding")}
+            className="flex min-h-[44px] items-center justify-center rounded-xl bg-blue-600 px-6 font-bold text-white shadow-md hover:bg-blue-700 transition"
+          >
+            Start business setup
+          </button>
+        </div>
+      )}
+
+      <div className="mb-6 w-full overflow-hidden">
+        {/* Action Feed: prioritized on mobile (top), rendered below metrics on desktop. */}
+        <UnifiedAgentFeed initialData={feedInitialData} />
+      </div>
+
+      <nav aria-label="Additional dashboard tools" className="mb-6 flex flex-wrap gap-3">
+        <a className="app-button" href="/agent-card.html">Create Agent Card</a>
+        <a className="app-button" href="/viral-certificate-generator.html">Certificate Generator</a>
+      </nav>
+
+      <WalkthroughTarget id="wrapped-summary"><AiTimeSavingsWidget /></WalkthroughTarget>
+      <MorningBriefingCard tenant={tenantId()} />
+      <CFOAgentCard />
+      <div className="bg-white/65 dark:bg-[#16161A]/70 backdrop-blur-[30px] saturate-[210%] border border-white/40 dark:border-white/10 rounded-[16px] p-6 shadow-sm mb-6" data-testid="dashboard-financials-card">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-xl font-bold font-outfit text-gray-900 dark:text-gray-100">Financials</h2>
+          <Link href="/dashboard/ledger" className="text-sm font-semibold text-[#0066FF] hover:underline">
+            Recent Activity
+          </Link>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="text-sm text-gray-500 dark:text-gray-400">Total Balance</span>
+          <span className="text-2xl font-bold font-outfit text-gray-900 dark:text-gray-100">Balance unavailable</span>
+          <p className="text-sm text-gray-500 dark:text-gray-400">Recorded activity does not establish an available balance across accounts or currencies.</p>
+        </div>
+      </div>
+
+      <InteractiveWalkthrough
+        steps={walkthroughSteps}
+        isOpen={isWalkthroughOpen}
+        onClose={() => setIsWalkthroughOpen(false)}
+      />
+
+      <div className="mb-4 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            try {
+              localStorage.setItem("TEST_WALKTHROUGH", "true");
+            } catch {
+              // ignore storage failures
+            }
+            setIsWalkthroughOpen(true);
+          }}
+          id="dashboard-walkthrough-btn"
+          className="app-button min-h-[44px]"
+        >
+          Start Tour
+        </button>
+        <button type="button" onClick={() => router.push("/onboarding")} className="app-button min-h-[44px]">
+          Launch Site
+        </button>
+        <button type="button" onClick={() => setShowMigration((open) => !open)} className="app-button min-h-[44px]">
+          Migrate Existing Store
+        </button>
+        <div id="queue-dashboard" className={offlineQueueCount > 0 ? "app-badge warn block" : "hidden"}>
+          {offlineQueueCount} Actions Pending Sync
+        </div>
+        <div id="network-status-indicator" className={isOffline ? "app-badge warn block" : "hidden"} style={{ display: isOffline ? 'block' : 'none' }}>
+          Offline - queued actions still need a verified result
+        </div>
+        {isSyncing && (
+          <div className="fixed bottom-4 right-4 bg-[#0f766e] text-white px-4 py-3 rounded-xl shadow-lg font-medium animate-in slide-in-from-bottom-5 z-50 flex items-center gap-2">
+            <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            Checking {offlineQueueCount} pending actions...
+          </div>
+        )}
+        {queueReadError && <p role="status" className="app-badge warn">{queueReadError}</p>}
+        {syncErrorCount > 0 && (
+          <div className="app-badge bad" role="alert">
+            {syncErrorCount} action{syncErrorCount > 1 ? 's need' : ' needs'} attention or reconciliation. Their saved copies are retained.
+          </div>
+        )}
+        {error && <div className="app-badge bad">{error}</div>}
+        {actionMessage && <div className="app-badge good" role="status">{actionMessage}</div>}
+      </div>
+
+      <div className="flex flex-col md:flex-col">
+        <div className="order-last md:order-first">
+          <WrappedWidget />
+          <SuccessMilestoneWidget />
+          <ViralLoopPerformanceWidget />
+          <div className="mb-6">
+            <div className="mb-4"><CartRecoveryWidget /></div>
+            <AffiliateMarketingWidget />
+          </div>
+        </div>
+      </div>
+
+      <div className="mb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+          <SmartBlock type="PoweredBy" props={{ tenantId: tenantId(), isPremium: false }} />
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setShowReferralModal(true)}
+              className="h-[44px] px-6 bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 font-medium hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors border border-indigo-200 dark:border-indigo-800/50 rounded-lg"
+              data-testid="referral-program-btn"
+            >
+              Referral Program
+            </button>
+            <button
+              onClick={() => router.push("/incidents")}
+              className="h-[44px] px-6 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 font-medium hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors border border-red-200 dark:border-red-800/50"
+              data-testid="report-incident-btn"
+            >
+              Report Incident
+            </button>
+          </div>
+      </div>
+
+      <section className="app-panel rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm border border-white/40 dark:border-white/10 mb-6">
+        <div className="app-panel-header">
+          <div>
+            <h2 className="app-panel-title">2024 Store Wrapped</h2>
+            <div className="app-list-subtitle">A shareable snapshot of your strongest store moments.</div>
+          </div>
+          <span className="app-badge good">Viral Loop</span>
+        </div>
+        <div className="app-panel-body">
+          <p className="app-list-subtitle mb-3">Turn your sales, products, and milestones into a referral-friendly recap.</p>
+          <Link href="/wrapped" className="app-button min-h-[44px]">View Your Wrapped 🎁</Link>
+        </div>
+      </section>
+
+      {showMigration && (
+        <section className="app-panel rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm border border-white/40 dark:border-white/10 mb-6" aria-labelledby="store-migration-title">
+          <div className="app-panel-header">
+            <h2 id="store-migration-title" className="app-panel-title">Store Migration</h2>
+          </div>
+          <div className="app-panel-body">
+            <p role="status" className="app-list-subtitle mb-3">
+              Automatic store migration is not available yet. No import has been started.
+            </p>
+            <p className="app-list-subtitle mb-3">You can add and edit products in your catalog.</p>
+            <Link href="/products" className="app-button primary min-h-[44px]">Open product catalog</Link>
+          </div>
+        </section>
+      )}
+
+      <div id="dashboard-screen" className="app-grid" style={{ gap: 16 }}>
+        {activeDepartments.length > 0 && (
+          <section className="mb-6 w-full col-span-full">
+            <h2 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-4">Active AI Departments</h2>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+              {activeDepartments.map(dept => (
+                <div key={dept} className="rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-4 border border-white/40 dark:border-white/10 shadow-sm flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-sm text-[#1D1D1F] dark:text-[#F5F5F7]">{dept}</span>
+                    <span className="w-2 h-2 rounded-full bg-[#34C759]"></span>
+                  </div>
+                  <span className="text-xs text-gray-500 dark:text-[#A1A1A6]">Active & Monitoring</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <div className="mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Link href="/assistant" className="app-card block p-5 min-h-[44px] hover:shadow-md transition-all group">
+            <div className="flex items-center gap-4">
+              <div className="w-11 h-11 bg-[#0f766e] flex items-center justify-center text-white text-xl shadow-sm">
+                <span aria-hidden="true">A</span>
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7]">
+                  Assistant Tasks <span className="sr-only">Open WorkBuddy Assistant</span>
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Open the dashboard task workspace for conversations, artifacts, and assistant actions.</p>
+              </div>
+              <div className="text-[#0f766e] opacity-0 group-hover:opacity-100 transition-opacity transform group-hover:translate-x-1 duration-200">
+                →
+              </div>
+            </div>
+          </Link>
+
+          <Link id="sell-in-person-btn" href="/pos/terminal" className="app-card block p-5 min-h-[44px] hover:shadow-md transition-all group bg-gradient-to-br from-blue-50/50 to-indigo-50/50 dark:from-blue-900/20 dark:to-indigo-900/20 border border-blue-100/50 dark:border-blue-800/30">
+            <div className="flex items-center gap-4">
+              <div className="w-11 h-11 bg-[#0066FF] flex items-center justify-center text-white shadow-md shadow-blue-500/20">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7]">Sell In Person</h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">Tap-to-Pay, inventory sync, and cash sales.</p>
+              </div>
+              <div className="text-[#0066FF] opacity-0 group-hover:opacity-100 transition-opacity transform group-hover:translate-x-1 duration-200">
+                →
+              </div>
+            </div>
+          </Link>
+        </div>
+
+        <GrowBusinessCard />
+        <PromoterCard />
+        <FundingOpportunityCard />
+
+        <section>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="app-panel-title">Business Analytics</h2>
+              <p className="app-list-subtitle">Live performance, orders, and inbox activity.</p>
+            </div>
+            <Link href="/business-analytics" className="app-button min-h-[44px]">Business Analytics</Link>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-[1fr_300px] gap-6">
+            {loading ? (
+              <p className="app-list-subtitle">Loading business metrics…</p>
+            ) : error ? (
+              <p className="text-sm text-red-600">Business metrics are unavailable.</p>
+            ) : (
+            <div className="app-grid metrics !grid-cols-2 lg:!grid-cols-4">
+              <div className="app-card">
+                <WithTooltip id="total-sales-tooltip" defaultText="Total revenue generated from your orders.">
+                  <div className="app-metric-label">Total Sales</div>
+                </WithTooltip>
+                <div className="app-metric-value">{money(metrics.total_sales)}</div>
+                <div className="app-metric-note">{loading ? "Loading your data..." : "All recorded orders"}</div>
+              </div>
+              <div className="app-card">
+                <div className="app-metric-label">Customers</div>
+                <div className="app-metric-value">{metrics.active_customers}</div>
+                <div className="app-metric-note">Customer records</div>
+              </div>
+              <div className="app-card">
+                <div className="app-metric-label">Pending Orders</div>
+                <div className="app-metric-value">{metrics.pending_orders}</div>
+                <div className="app-metric-note">Open fulfillment workload</div>
+              </div>
+              <div className="app-card">
+                <div className="app-metric-label">Low Stock</div>
+                <div className="app-metric-value">{stockCount}</div>
+                <div className="app-metric-note">Materials below threshold</div>
+              </div>
+            </div>
+            )}
+            <div className="app-card flex flex-col justify-between border-dashed border-indigo-200 bg-indigo-50/40 p-4 dark:border-indigo-900/50 dark:bg-indigo-950/20">
+              <div>
+                <div className="flex items-center gap-2 font-bold text-indigo-900 dark:text-indigo-200">
+                  <span>Analytics</span>
+                </div>
+                <p className="mt-1 text-xs text-indigo-700 dark:text-indigo-300">
+                  Review revenue trends, restocking signals, and retention insights.
+                </p>
+              </div>
+              <Link
+                href="/business-analytics"
+                className="mt-4 rounded-lg bg-indigo-600 px-3 py-2 text-center text-xs font-semibold text-white shadow-sm hover:bg-indigo-700"
+              >
+                Open Analytics
+              </Link>
+            </div>
+          </div>
+        </section>
+
+        <section className="app-grid two">
+          <WalkthroughTarget id="operations-map">
+          <div id="operations-map" className="app-panel rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm border border-white/40 dark:border-white/10">
+            <div className="app-panel-header">
+              <div>
+                <div className="app-panel-title">Operations Map</div>
+                <div className="app-list-subtitle">Live overview of your store workflow.</div>
+              </div>
+              <Link href="/orders" className="app-button min-h-[44px]">Open Orders</Link>
+            </div>
+            <div className="app-panel-body">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                <div className="app-card">
+                  <div className="app-metric-label">Orders</div>
+                  <div className="app-metric-value">{orders.length}</div>
+                  <div className="app-metric-note">Rows returned</div>
+                </div>
+                <div className="app-card">
+                  <div className="app-metric-label">Inbox</div>
+                  <div className="app-metric-value">{messages.length}</div>
+                  <div className="app-metric-note">Messages returned</div>
+                </div>
+                <div className="app-card">
+                  <div className="app-metric-label">Vendors</div>
+                  <div className="app-metric-value">{supplyCount}</div>
+                  <div className="app-metric-note">Supply partners</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          </WalkthroughTarget>
+        </section>
+
+
+        <section className="app-grid two">
+          <div className="app-panel rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm border border-white/40 dark:border-white/10">
+            <div className="app-panel-header">
+              <WithTooltip id="recent-orders-tooltip" defaultText="View the latest orders placed by your customers." className="app-panel-title">Recent Orders</WithTooltip>
+              <Link href="/orders" className="app-button min-h-[44px]">View All</Link>
+            </div>
+            {orders.length === 0 ? (
+              <div className="app-empty">{loading ? "Loading your orders..." : "No orders found."}</div>
+            ) : (
+              <div className="app-table-wrap">
+                <table className="app-table">
+                  <thead>
+                    <tr>
+                      <th>Order</th>
+                      <th>Customer</th>
+                      <th>Total</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {orders.slice(0, 8).map((order) => (
+                      <tr key={order.id}>
+                        <td><Link href={`/orders/${order.id}`} className="font-semibold text-blue-700">{order.id}</Link></td>
+                        <td>{order.customer_name || "Unknown"}</td>
+                        <td>{money(order.total_amount)}</td>
+                        <td><span className={`app-badge ${statusTone(order.status)}`}>{order.status || "Unknown"}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="app-panel rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm border border-white/40 dark:border-white/10">
+            <div className="app-panel-header">
+              <WithTooltip id="inbox-activity-tooltip" defaultText="Keep track of recent customer messages." className="app-panel-title">Inbox Activity</WithTooltip>
+              <Link href="/inbox" className="app-button min-h-[44px]">Open Inbox</Link>
+            </div>
+            <div className="app-list">
+              {messages.length === 0 ? (
+                <div className="app-empty">{loading ? "Loading your messages..." : "No messages found."}</div>
+              ) : messages.slice(0, 6).map((message) => (
+                <div key={message.id} className="app-list-item">
+                  <div>
+                    <div className="app-list-title">{message.source || "Unknown source"}</div>
+                    <div className="app-list-subtitle">{message.content || "Empty message"}</div>
+                  </div>
+                  <span className={`app-badge ${statusTone(message.status)}`}>{formatStatus(message.status)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section id="subscription-replenishment-section" className="app-panel p-4 mt-4">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7]">Subscription Replenishment</h2>
+            <span className="app-badge good">Automated</span>
+          </div>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+            You have <strong>12</strong> one-time buyers of consumable products. Convert them to recurring revenue.
+          </p>
+          <a
+            href="subscription-generator.html"
+            className="app-button primary inline-block text-center min-h-[44px] min-w-[44px]"
+          >
+            Draft Subscription Offer
+          </a>
+        </section>
+
+        <section className="mt-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <ReferralMilestonesWidget />
+            <DashboardViralInviteWidget />
+            <UnlockProFeaturesWidget />
+            <ReferralTierWidget />
+          </div>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="app-panel-title">Growth & Virality</h2>
+              <p className="app-list-subtitle">Unlock new customers and track milestones.</p>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowReferralModal(true)}
+                className="app-button px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-50 text-indigo-700 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:text-indigo-300 min-h-[44px]"
+              >
+                Referral Program
+              </button>
+              <button
+                onClick={() => setShowEmbedModal(true)}
+                className="app-button px-3 py-1.5 text-xs font-semibold rounded-lg bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300 min-h-[44px]"
+              >
+                Embed Storefront
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <Link href="/viral-tier-list-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-purple-200/40 dark:border-purple-800/20 bg-gradient-to-br from-purple-50/40 to-fuchsia-50/40 dark:from-purple-900/10 dark:to-fuchsia-900/10" id="tier-list-generator-link">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-purple-100 dark:bg-purple-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🏆</div>
+                <div className="text-purple-600 dark:text-purple-400 font-semibold text-sm bg-purple-50 dark:bg-purple-900/30 px-3 py-1 rounded-full">Viral</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Tier List Generator</h3>
+              <p className="text-sm text-[#86868B] font-medium leading-relaxed">
+                Rank your favorites and capture leads while going viral.
+              </p>
+            </Link>
+
+            <Link href="/feed" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-sky-50 dark:bg-sky-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">↗</div>
+                <div className="text-sky-700 dark:text-sky-300 font-semibold text-sm bg-sky-50 dark:bg-sky-900/30 px-3 py-1 rounded-full">Orchestrate</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Campaign Orchestration</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Plan, generate, review, and launch customer campaigns from live dashboard data.</p>
+            </Link>
+
+            <Link href="/zero-click-builder" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">⚡</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Zero-Click Builder</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Generate a business in 30 seconds to show friends how fast OmniSolo is.</p>
+            </Link>
+
+            <Link href="/referrals" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🤝</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Earn $50</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Referrals</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Invite other business owners to OmniSolo and earn premium credits.</p>
+            </Link>
+
+            <Link href="/referrals" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-purple-50 dark:bg-purple-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🎁</div>
+                <div className="text-purple-600 dark:text-purple-400 font-semibold text-sm bg-purple-50 dark:bg-purple-900/30 px-3 py-1 rounded-full">Referrals</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Referral Program</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Invite your network and earn credits for every business that signs up.</p>
+            </Link>
+            <Link href="/affiliate-badge-builder" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-orange-50 dark:bg-orange-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🏆</div>
+                <div className="text-orange-600 dark:text-orange-400 font-semibold text-sm bg-orange-50 dark:bg-orange-900/30 px-3 py-1 rounded-full">Viral</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Affiliate Badge Builder</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create an embeddable badge to grow your affiliate network.</p>
+            </Link>
+
+            <Link href="/finance" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-green-50 dark:bg-green-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">💰</div>
+                <div className="text-green-600 dark:text-green-400 font-semibold text-sm bg-green-50 dark:bg-green-900/30 px-3 py-1 rounded-full">Finance</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Finance & Invoicing</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Manage cash flow, invoices, and automated payment follow-ups.</p>
+            </Link>
+
+            <Link href="/invoice-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-cyan-50 dark:bg-cyan-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🧾</div>
+                <div className="text-cyan-600 dark:text-cyan-400 font-semibold text-sm bg-cyan-50 dark:bg-cyan-900/30 px-3 py-1 rounded-full">Billing</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">AI Invoice Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Generate professional, shareable invoices that bring new customers to OmniSolo.</p>
+            </Link>
+
+            <Link href="/pos/terminal" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📱</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Sales</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Sell In Person</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Instantly collect payments with Tap-to-Pay and keep inventory synced.</p>
+            </Link>
+
+            <Link href="/proposal-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📝</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Sales</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">AI Proposal Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create smart, shareable proposals with an interactive approval flow to win clients faster.</p>
+            </Link>
+
+            <Link href="/milestone-alerts" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-purple-50 dark:bg-purple-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform" aria-hidden="true">🏆</div>
+                <div className="text-purple-600 dark:text-purple-400 font-semibold text-sm bg-purple-50 dark:bg-purple-900/30 px-3 py-1 rounded-full">Share</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Milestones</h3>
+
+              <p className="text-sm text-gray-600 dark:text-gray-400">Track and share your business achievements with your audience.</p>
+            </Link>
+
+            <Link href="/loyalty-program" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-yellow-50 dark:bg-yellow-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🤝</div>
+                <div className="text-yellow-600 dark:text-yellow-400 font-semibold text-sm bg-yellow-50 dark:bg-yellow-900/30 px-3 py-1 rounded-full">Loyalty</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-gray-900 dark:text-white mb-2">Customer Loyalty</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Set up a 'Give X, Get Y' referral program and generate campaigns.</p>
+            </Link>
+
+            <Link href="/customer-referral-program" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">💸</div>
+                <div className="text-emerald-600 dark:text-emerald-400 font-semibold text-sm bg-emerald-50 dark:bg-emerald-900/30 px-3 py-1 rounded-full">Referrals</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Customer Referral Program</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Launch a Give $10, Get $10 program to turn your customers into advocates.</p>
+            </Link>
+
+            <Link href="/share-cards" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-pink-50 dark:bg-pink-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🎴</div>
+                <div className="text-pink-600 dark:text-pink-400 font-semibold text-sm bg-pink-50 dark:bg-pink-900/30 px-3 py-1 rounded-full">Cards</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Social Share Cards</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Generate Share Cards to promote your brand on social media.</p>
+            </Link>
+
+            <Link href="/storefront-widget" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🌐</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Widget</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Storefront Widget</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Embed a mini storefront on your blog or website to boost sales.</p>
+            </Link>
+
+            <Link href="/embed-builder" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🔌</div>
+                <div className="text-emerald-600 dark:text-emerald-400 font-semibold text-sm bg-emerald-50 dark:bg-emerald-900/30 px-3 py-1 rounded-full">Widget</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Interactive Embed</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Build custom intake, booking, or quote widgets for your site.</p>
+            </Link>
+
+            <Link href="/subscriptions" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-amber-50 dark:bg-amber-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📦</div>
+                <div className="text-amber-700 dark:text-amber-300 font-semibold text-sm bg-amber-50 dark:bg-amber-900/30 px-3 py-1 rounded-full">Recurring</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Subscriptions & Fulfillments</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Manage recurring products, subscribers, and shipping batches.</p>
+            </Link>
+
+            <Link href="/social-proof-nudge" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-green-50 dark:bg-green-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🚀</div>
+                <div className="text-green-600 dark:text-green-400 font-semibold text-sm bg-green-50 dark:bg-green-900/30 px-3 py-1 rounded-full">Proof</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Social Proof Nudge</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Show visitors that others are buying to increase conversions.</p>
+            </Link>
+
+            <Link href="/work-intake-widget" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📋</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Leads</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Work-Intake Widget</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Embed a smart lead capture form with a viral loop directly on your site.</p>
+            </Link>
+
+            <WithTooltip id="link-in-bio-tooltip" defaultText="One link to rule them all. Drive social traffic to your store.">
+            <Link href="/link-in-bio-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🔗</div>
+                <div className="text-emerald-600 dark:text-emerald-400 font-semibold text-sm bg-emerald-50 dark:bg-emerald-900/30 px-3 py-1 rounded-full">Bio</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Create Link-in-Bio Page</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Publish a lightweight social profile page for your storefront and offers.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="quiz-generator-tooltip" defaultText="Create AI-powered product recommendation quizzes to capture leads.">
+            <Link href="/quiz-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🧠</div>
+                <span className="text-xs font-semibold px-2 py-1 bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 rounded-full tracking-wider uppercase">Lead Gen</span>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Quiz Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create viral quizzes that capture leads and spread through social sharing.</p>
+            </Link>
+            </WithTooltip>
+
+            <Link href="/whatsapp-link-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-green-50 dark:bg-green-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">💬</div>
+                <div className="text-green-600 dark:text-green-400 font-semibold text-sm bg-green-50 dark:bg-green-900/30 px-3 py-1 rounded-full">Social</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">WhatsApp Link Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create shareable WhatsApp links to start conversations instantly.</p>
+            </Link>
+
+            <Link href="/calendar" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📅</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Schedule</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Calendar</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">View upcoming appointments and sync with your AI operations assistant.</p>
+            </Link>
+
+            <Link href="/giveaway" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-pink-50 dark:bg-pink-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🎁</div>
+                <div className="text-pink-600 dark:text-pink-400 font-semibold text-sm bg-pink-50 dark:bg-pink-900/30 px-3 py-1 rounded-full">Viral</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Giveaway Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Launch a viral sweepstakes to capture emails and drive social shares.</p>
+            </Link>
+
+            <Link href="/viral-leaderboard-generator" id="viral-leaderboard-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-yellow-50 dark:bg-yellow-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🏆</div>
+                <div className="text-yellow-600 dark:text-yellow-400 font-semibold text-sm bg-yellow-50 dark:bg-yellow-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Leaderboard</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Embed a gamified leaderboard on your storefront to encourage competition and referrals.</p>
+            </Link>
+
+            <Link href="/share-and-save-widget" id="share-and-save-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">💸</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Share & Save Widget</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">One-Tap share widget to reward your customers with discounts for sharing your storefront.</p>
+            </Link>
+
+            <Link href="/share-to-unlock-generator" id="share-to-unlock-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🔓</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Share-to-Unlock Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Require customers to share your page on social media to reveal a discount code.</p>
+            </Link>
+
+            <Link href="/viral-challenge-generator" id="challenge-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🎯</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Challenge Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create a viral challenge widget to build engagement and streaks.</p>
+            </Link>
+
+            <Link href="/viral-waitlist-generator" id="viral-waitlist-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🚀</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Waitlist Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create a viral waitlist to build hype for your new product or service.</p>
+            </Link>
+
+            <Link href="/interactive-quote-generator" id="interactive-quote-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🧮</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Interactive Quote Widget</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Build a pricing calculator to embed on your site to capture leads and drive referrals.</p>
+            </Link>
+
+            <Link href="/win-back" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-purple-50 dark:bg-purple-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">💌</div>
+                <div className="text-purple-600 dark:text-purple-400 font-semibold text-sm bg-purple-50 dark:bg-purple-900/30 px-3 py-1 rounded-full">Retain</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Customer Win-back</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Re-engage inactive customers with AI-generated email campaigns.</p>
+            </Link>
+
+            <Link href="/review-campaigns" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-yellow-50 dark:bg-yellow-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">⭐️</div>
+                <div className="text-yellow-600 dark:text-yellow-400 font-semibold text-sm bg-yellow-50 dark:bg-yellow-900/30 px-3 py-1 rounded-full">Reviews</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Automated Reviews</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Generate highly-converting, personalized review request emails.</p>
+            </Link>
+
+            <Link href="/seasonal-promo" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-teal-50 dark:bg-teal-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">✨</div>
+                <div className="text-teal-600 dark:text-teal-400 font-semibold text-sm bg-teal-50 dark:bg-teal-900/30 px-3 py-1 rounded-full">Promo</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Seasonal Promo Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create AI campaigns and promo codes for special occasions instantly.</p>
+            </Link>
+
+            <WithTooltip id="cart-recovery-tooltip" defaultText="Recover abandoned carts with personalized AI follow-ups.">
+            <Link href="/cart-recovery" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-orange-50 dark:bg-orange-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🛒</div>
+                <div className="text-orange-600 dark:text-orange-400 font-semibold text-sm bg-orange-50 dark:bg-orange-900/30 px-3 py-1 rounded-full">Recover</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Cart Recovery</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Recover abandoned carts with personalized AI follow-ups.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="flash-sale-tooltip" defaultText="Create high-converting flash sale countdown widgets.">
+            <Link href="/flash-sale-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-red-50 dark:bg-red-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">⚡</div>
+                <div className="text-red-600 dark:text-red-400 font-semibold text-sm bg-red-50 dark:bg-red-900/30 px-3 py-1 rounded-full">Urgency</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Flash Sale Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create high-converting flash sale countdown widgets.</p>
+            </Link>
+            </WithTooltip>
+
+
+            <WithTooltip id="pre-order-tooltip" defaultText="Launch an omnichannel pre-order engine with tiered waitlist capabilities.">
+            <Link href="/pre-order-widget" id="pre-order-waitlist-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">⏳</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Virality</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Pre-Order Waitlist</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Launch an omnichannel pre-order engine with tiered waitlist capabilities.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="pos-tooltip" defaultText="Universal Mobile POS & Tap-to-Pay with Agentic Inventory Sync.">
+            <Link href="/pos/terminal" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">💳</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Sales</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Sell In Person</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Universal Mobile POS & Tap-to-Pay.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="discount-code-tooltip" defaultText="Create discount code widgets for your customers.">
+            <Link href="/discount-code-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🎯</div>
+                <div className="text-[#0071E3] dark:text-blue-400 font-semibold text-sm bg-blue-50 dark:bg-blue-900/30 px-3 py-1 rounded-full">Leads</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Discount Code Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create discount code widgets for your customers.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="lead-magnet-tooltip" defaultText="Capture emails and grow your audience.">
+            <Link href="/lead-magnet-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🧲</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Leads</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Lead Magnet Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Capture emails and grow your audience.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="link-in-bio-tooltip" defaultText="One link to rule them all. Drive social traffic to your store.">
+            <Link href="/link-in-bio-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🔗</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Link in Bio Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">One link to rule them all. Drive social traffic to your store.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="testimonial-widget-tooltip" defaultText="Build a custom testimonial widget to increase social proof and conversions.">
+            <Link href="/testimonial-widget" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-yellow-50 dark:bg-yellow-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🌟</div>
+                <div className="text-yellow-600 dark:text-yellow-400 font-semibold text-sm bg-yellow-50 dark:bg-yellow-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Testimonial Widget</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Build a custom testimonial widget to increase social proof and conversions.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="viral-countdown-widget-tooltip" defaultText="Create urgency and drive sales with a viral countdown widget.">
+            <Link href="/viral-countdown-widget" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-red-50 dark:bg-red-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">⏳</div>
+                <div className="text-red-600 dark:text-red-400 font-semibold text-sm bg-red-50 dark:bg-red-900/30 px-3 py-1 rounded-full">Growth</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Countdown Widget</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create urgency and drive sales with a viral countdown widget.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="spin-to-win-tooltip" defaultText="Create interactive discount wheels to capture emails.">
+            <Link href="/spin-to-win-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-purple-50 dark:bg-purple-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🎡</div>
+                <div className="text-purple-600 dark:text-purple-400 font-semibold text-sm bg-purple-50 dark:bg-purple-900/30 px-3 py-1 rounded-full">Gamification</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Spin to Win Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create interactive discount wheels to capture emails.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="interactive-poll-tooltip" defaultText="Create engaging polls to capture leads and customer preferences.">
+            <Link href="/interactive-poll-generator" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-teal-50 dark:bg-teal-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📊</div>
+                <div className="text-teal-600 dark:text-teal-400 font-semibold text-sm bg-teal-50 dark:bg-teal-900/30 px-3 py-1 rounded-full">Engagement</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Interactive Poll Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create engaging polls to capture leads and customer preferences.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="share-to-unlock-tooltip" defaultText="Create share-to-unlock campaigns to drive viral word of mouth.">
+            <a href="share-to-unlock-generator.html" id="share-to-unlock-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-amber-50 dark:bg-amber-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">🔓</div>
+                <div className="text-amber-600 dark:text-amber-400 font-semibold text-sm bg-amber-50 dark:bg-amber-900/30 px-3 py-1 rounded-full">Viral</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Share-to-Unlock Generator</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Create viral unlock campaigns that reward users for sharing.</p>
+            </a>
+            </WithTooltip>
+
+            <WithTooltip id="loyalty-widget-tooltip" defaultText="Create viral loyalty stamp cards to reward returning customers.">
+            <a href="/viral-loyalty-widget.html" id="loyalty-link" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-orange-50 dark:bg-orange-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">☕</div>
+                <div className="text-orange-600 dark:text-orange-400 font-semibold text-sm bg-orange-50 dark:bg-orange-900/30 px-3 py-1 rounded-full">Loyalty</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Viral Loyalty Program</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Digital stamp card program with viral referral mechanics.</p>
+            </a>
+            </WithTooltip>
+
+            <WithTooltip id="field-ops-tooltip" defaultText="Offline-first mobile route management for field service workers.">
+            <Link href="/field-ops/jobs" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📍</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Operations</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Field Ops Route</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Offline-first mobile route management for field service workers.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="proposal-draft-tooltip" defaultText="Generate complex AI proposals instantly.">
+            <Link href="/proposals/new" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">📝</div>
+                <div className="text-indigo-600 dark:text-indigo-400 font-semibold text-sm bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1 rounded-full">Proposals</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Proposal Draft</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Generate complex AI proposals instantly.</p>
+            </Link>
+            </WithTooltip>
+
+            <WithTooltip id="settings-widget-tooltip" defaultText="Manage your account and preferences.">
+            <Link href="/settings" className="block rounded-[12px] bg-white/65 backdrop-blur-[30px] backdrop-saturate-[2.1] border border-white/40 dark:bg-[#16161a]/70 dark:backdrop-blur-[30px] dark:backdrop-saturate-[2.1] dark:border-white/10 shadow-sm p-6 min-h-[44px] hover:shadow-lg transition-all hover:-translate-y-0.5 group border border-white/40 dark:border-white/10">
+              <div className="flex items-start justify-between mb-4">
+                <div className="w-12 h-12 rounded-full bg-gray-50 dark:bg-gray-900/30 flex items-center justify-center text-2xl group-hover:scale-110 transition-transform">⚙️</div>
+                <div className="text-gray-600 dark:text-gray-400 font-semibold text-sm bg-gray-50 dark:bg-gray-900/30 px-3 py-1 rounded-full">Config</div>
+              </div>
+              <h3 className="text-xl font-bold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] mb-2">Workspace Preferences</h3>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Manage your account and preferences.</p>
+            </Link>
+            </WithTooltip>
+          </div>
+        </section>
+      </div>
+
+      {showReferralModal && (
+        <div role="dialog" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 max-w-md w-full shadow-xl">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold font-outfit text-gray-900 dark:text-white">Help a Business Grow!</h2>
+              <button onClick={() => setShowReferralModal(false)} className="text-gray-500 hover:text-gray-700 min-h-[44px] min-w-[44px] flex items-center justify-center">✕</button>
+            </div>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
+              Share OmniSolo with fellow entrepreneurs and get rewarded.
+            </p>
+            <div className="mb-4">
+              <p className="text-xs font-semibold text-gray-500 mb-1">Your Unique Link</p>
+              <input
+                aria-label="Unique referral link"
+                readOnly
+                value={`${typeof window !== 'undefined' ? window.location.origin : ''}/invite/e2e-tenant`}
+                className="w-full p-2 border rounded-lg text-sm bg-gray-50 dark:bg-gray-900 text-gray-800 dark:text-gray-200"
+              />
+            </div>
+            <button
+              onClick={() => setShowReferralModal(false)}
+              className="w-full py-2 bg-blue-600 text-white rounded-lg font-medium min-h-[44px]"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {showEmbedModal && (
+        <div role="dialog" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 max-w-md w-full shadow-xl">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold font-outfit text-gray-900 dark:text-white">Embed Storefront</h2>
+              <button onClick={() => setShowEmbedModal(false)} className="text-gray-500 hover:text-gray-700 min-h-[44px] min-w-[44px] flex items-center justify-center">✕</button>
+            </div>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
+              Embed your storefront on any external site or blog.
+            </p>
+            <button
+              onClick={() => setShowEmbedModal(false)}
+              className="w-full py-2 bg-blue-600 text-white rounded-lg font-medium mb-2 min-h-[44px]"
+            >
+              Copy Code
+            </button>
+            <button
+              onClick={() => setShowEmbedModal(false)}
+              className="w-full py-2 border rounded-lg font-medium min-h-[44px]"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      <QuickActionFAB />
+    </AppShell>
+    </>
+  );
+}

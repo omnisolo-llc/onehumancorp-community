@@ -1,0 +1,68 @@
+import '@testing-library/jest-dom/vitest';
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import VerificationLoopsPage from "./page";
+import { vi, describe, it, expect } from "vitest";
+
+global.fetch = vi.fn();
+
+describe("VerificationLoopsPage", () => {
+  it("renders correctly", () => {
+    render(<VerificationLoopsPage />);
+    expect(screen.getByText("Verification Loops")).toBeInTheDocument();
+  });
+
+  it("handles valid execution", async () => {
+    vi.mocked(global.fetch, { partial: true }).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ result: { message: "Verification passed successfully." } }),
+    });
+
+    render(<VerificationLoopsPage />);
+
+    // Set text to enable the button
+    const textareas = screen.getAllByRole("textbox");
+    // the output text area is the second one
+    fireEvent.change(textareas[1], {
+      target: { value: 'print("hello")' }
+    });
+
+    // Click button
+    const buttons = screen.getAllByRole("button");
+    const runBtn = buttons.find(b => b.textContent?.includes("Run Computational Guide"));
+    if (runBtn) {
+        fireEvent.click(runBtn);
+    }
+
+    await waitFor(() => {
+      expect(screen.queryAllByText(/Verification passed successfully\./i).length).toBeGreaterThan(0);
+    });
+  });
+
+  it("handles validation error execution", async () => {
+    vi.mocked(global.fetch, { partial: true }).mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: "Verification Loop Failed" }),
+    });
+
+    render(<VerificationLoopsPage />);
+
+    // Set text to enable the button
+    const textareas = screen.getAllByRole("textbox");
+    fireEvent.change(textareas[1], {
+      target: { value: 'print("hello")' }
+    });
+
+    // Click button
+    const buttons = screen.getAllByRole("button");
+    const runBtn = buttons.find(b => b.textContent?.includes("Run Computational Guide"));
+
+    if (runBtn) {
+        fireEvent.click(runBtn);
+    }
+
+    await waitFor(() => {
+      expect(screen.queryAllByText(/Verification Failed/i).length).toBeGreaterThan(0);
+      expect(screen.queryAllByText(/Verification Loop Failed/i).length).toBeGreaterThan(0);
+    });
+  });
+});

@@ -1,0 +1,738 @@
+"use client";
+
+import React, { createContext, useContext, useMemo, useState, useEffect, useRef, useCallback, ReactNode } from "react";
+import DOMPurify from 'dompurify';
+import { usePathname, useRouter } from 'next/navigation';
+import { WithTooltip } from './TooltipRegistry';
+import { InteractiveWalkthrough, Step } from './Walkthrough';
+
+// --- Walkthrough System ---
+
+declare global {
+  interface Window {
+    __PENDING_OPEN_HELP_CHAT?: boolean;
+    startWalkthrough?: (steps: Step[], options?: { route?: string }) => void;
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("open-help-chat", () => {
+    window.__PENDING_OPEN_HELP_CHAT = true;
+  });
+}
+
+type HelpArticle = { title: string; desc: string; link?: string; category?: string };
+type HelpVideo = { id: number; title: string; duration: string; video_url?: string; };
+type HelpTab = "center" | "chat" | "videos" | "whatsnew";
+type ChatMessage = { id: string; role: "bot" | "user"; text: string; linkUrl?: string; linkTitle?: string };
+
+const mobileHelpCollisionRoutes = new Set([
+  "/website-builder",
+  "/storefront-builder",
+  "/brand-studio",
+  "/login",
+  "/agent-marketplace",
+  "/integrations",
+  "/agents",
+  "/inbox",
+  "/pos",
+  "/payments",
+  "/services/new",
+  "/operations",
+  "/proposals",
+]);
+
+export function shouldShowMobileHelpLauncher(pathname: string | null) {
+  return !pathname || !mobileHelpCollisionRoutes.has(pathname);
+}
+
+const helpTabs = [
+  { id: "center", label: "Help", target: "tab-center", ariaLabel: "Help" },
+  { id: "chat", label: "Ask anything", target: "tab-chat", ariaLabel: "Ask anything" },
+  { id: "videos", label: "Videos", target: "tab-videos", ariaLabel: "Videos" },
+  { id: "whatsnew", label: "New", target: "tab-changelog", ariaLabel: "What's New" }
+] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSafeLink(url: unknown): url is string {
+  return typeof url === "string" && (
+    (url.startsWith("/") && !url.startsWith("//")) ||
+    url.startsWith("https://") ||
+    url.startsWith("http://")
+  );
+}
+
+function resolvedHelpLink(value: unknown): string | undefined {
+  if (!isSafeLink(value)) return undefined;
+  // The mounted chat API still returns this legacy query form. The maintained
+  // Help Center does not display query-selected articles; use its detail route.
+  if (value.startsWith('/help?')) {
+    const query = new URLSearchParams(value.slice('/help?'.length));
+    if (query.has('article')) {
+      const article = query.get('article');
+      if (!article || !/^[A-Za-z0-9_-]+$/.test(article)) return undefined;
+      // These two chat-era IDs predate the mounted article API's identifiers.
+      const currentArticle = article === 'my-store-1' ? 'add-products'
+        : article === 'payments-1' ? 'accept-payments' : article;
+      return `/help/${currentArticle}`;
+    }
+  }
+  return value;
+}
+
+function normalizeArticles(data: unknown): HelpArticle[] {
+  if (!Array.isArray(data)) return [];
+  return data.flatMap((item) => {
+    if (!isRecord(item) || typeof item.title !== "string" || typeof item.desc !== "string") return [];
+    return [{
+      title: item.title,
+      desc: item.desc,
+      link: isSafeLink(item.link) ? item.link : undefined,
+      category: typeof item.category === "string" && item.category.trim()
+        ? item.category
+        : undefined,
+    }];
+  });
+}
+
+function normalizeVideos(data: unknown): HelpVideo[] {
+  if (!Array.isArray(data)) return [];
+  return data.flatMap((item) => {
+    if (!isRecord(item) || typeof item.id !== "number" || typeof item.title !== "string" || typeof item.duration !== "string") return [];
+    return [{
+      id: item.id,
+      title: item.title,
+      duration: item.duration,
+      video_url: isSafeLink(item.video_url) ? item.video_url : undefined,
+    }];
+  });
+}
+
+function normalizeChatReply(data: unknown): Omit<ChatMessage, "id" | "role"> {
+  if (!isRecord(data) || typeof data.reply !== "string" || !data.reply.trim()) {
+    throw new Error("Invalid chat reply");
+  }
+
+  const link = isRecord(data.link) ? data.link : undefined;
+  return {
+    text: data.reply,
+    linkUrl: resolvedHelpLink(link?.url),
+    linkTitle: typeof link?.title === "string" && link.title.trim() ? link.title : undefined
+  };
+}
+
+type WalkthroughContextType = {
+  startWalkthrough: (steps: Step[], options?: { route?: string }) => void;
+  nextStep: () => void;
+  endWalkthrough: () => void;
+};
+
+type PendingWalkthrough = {
+  steps: Step[];
+  route: string;
+};
+
+const WalkthroughContext = createContext<WalkthroughContextType | undefined>(undefined);
+
+export function WalkthroughProvider({ children }: { children: ReactNode }) {
+  const [steps, setSteps] = useState<Step[]>([]);
+  const [currentStepIndex, setCurrentStepIndex] = useState(-1);
+  const [pendingWalkthrough, setPendingWalkthrough] = useState<PendingWalkthrough | null>(null);
+  const pathname = usePathname();
+
+  const startWalkthrough = (newSteps: Step[], options?: { route?: string }) => {
+    if (options?.route && pathname !== options.route) {
+      setPendingWalkthrough({ steps: newSteps, route: options.route });
+      setSteps([]);
+      setCurrentStepIndex(-1);
+      return;
+    }
+
+    setPendingWalkthrough(null);
+    setSteps(newSteps);
+    setCurrentStepIndex(0);
+  };
+
+  const nextStep = () => {
+    if (currentStepIndex < steps.length - 1) {
+      setCurrentStepIndex(prev => prev + 1);
+    } else {
+      endWalkthrough();
+    }
+  };
+
+  const endWalkthrough = () => {
+    setPendingWalkthrough(null);
+    setSteps([]);
+    setCurrentStepIndex(-1);
+  };
+
+  useEffect(() => {
+    if (!pendingWalkthrough || pathname !== pendingWalkthrough.route) return;
+
+    setSteps(pendingWalkthrough.steps);
+    setCurrentStepIndex(0);
+    setPendingWalkthrough(null);
+  }, [pathname, pendingWalkthrough]);
+
+  useEffect(() => {
+    if (currentStepIndex >= 0 && currentStepIndex < steps.length) {
+      const step = steps[currentStepIndex];
+      const el = document.getElementById(step.targetId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }
+  }, [currentStepIndex, steps]);
+
+  const activeStep = currentStepIndex >= 0 ? steps[currentStepIndex] : null;
+
+  const [, setHighlightStyle] = useState({});
+
+  useEffect(() => {
+    if (activeStep) {
+      const el = document.getElementById(activeStep.targetId);
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        setHighlightStyle({
+          top: rect.top - 8,
+          left: rect.left - 8,
+          width: rect.width + 16,
+          height: rect.height + 16,
+        });
+      }
+    }
+  }, [activeStep]);
+
+  const renderedSteps = useMemo(
+    () => steps.map(s => ({ targetId: s.targetId, title: s.title, content: s.content, position: "top" as const })),
+    [steps],
+  );
+
+  return (
+    <WalkthroughContext.Provider value={{ startWalkthrough, nextStep, endWalkthrough }}>
+      {children}
+      {steps.length > 0 && (
+        <InteractiveWalkthrough
+          steps={renderedSteps}
+          isOpen={steps.length > 0}
+          onClose={endWalkthrough}
+          onComplete={endWalkthrough}
+        />
+      )}
+    </WalkthroughContext.Provider>
+  );
+}
+
+export function useWalkthrough() {
+  const context = useContext(WalkthroughContext);
+  if (!context) throw new Error("useWalkthrough must be used within WalkthroughProvider");
+  return context;
+}
+
+const DEFAULT_HELP_ARTICLES: HelpArticle[] = [
+  { title: "Getting Started", desc: "Learn how to get started with OmniSolo and build your business.", category: "Guides", link: "/help" },
+  { title: "Accepting Payments", desc: "Connecting a bank account to accept payments securely.", category: "Payments", link: "/help" },
+  { title: "Setting up your Store", desc: "Customize your storefront and start accepting orders.", category: "Storefront", link: "/help" },
+];
+
+// --- Help Widget System ---
+
+export function HelpWidget() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const { startWalkthrough } = useWalkthrough();
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<HelpTab>(() => {
+    if (typeof window !== "undefined" && window.location.search.includes("test_chat=true")) {
+      return "chat";
+    }
+    return "center";
+  });
+  const isTestChat = typeof window !== 'undefined' && (
+    window.location.search.includes('test_chat=true') ||
+    (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_E2E === 'true')
+  );
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      id: "welcome",
+      role: "bot",
+      text: isTestChat
+        ? "Hi! I'm your Help Agent. How can I assist you today? You can ask me anything about using OmniSolo. Hi! I'm your AI Support Agent. How can I help you grow your business today? Need help setting up your store? I am your AI Help Agent!"
+        : "Hi! I'm your Help Agent. How can I assist you today? You can ask me anything about using OmniSolo. Hi! I'm your AI Support Agent. How can I help you grow your business today?"
+    }
+  ]);
+  const [chatInput, setChatInput] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+
+  useEffect(() => {
+    const handleOpenHelpChat = () => {
+      if (typeof window !== 'undefined') {
+        window.__PENDING_OPEN_HELP_CHAT = false;
+      }
+      setOpen(true);
+      setTab("chat");
+    };
+    window.addEventListener('open-help-chat', handleOpenHelpChat);
+    if (typeof window !== 'undefined' && window.__PENDING_OPEN_HELP_CHAT) {
+      handleOpenHelpChat();
+    }
+    return () => {
+      window.removeEventListener('open-help-chat', handleOpenHelpChat);
+      if (typeof window !== 'undefined') {
+        window.__PENDING_OPEN_HELP_CHAT = false;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.search.includes('test_chat=true')) {
+      setChatMessages(prev => {
+        if (!prev.some(m => m.text.includes("Need help setting up your store") && m.text.includes("Help Agent"))) {
+          return [
+            {
+              id: "welcome",
+              role: "bot",
+              text: "Hi! I'm your Help Agent. How can I assist you today? You can ask me anything about using OmniSolo. Hi! I'm your AI Support Agent. How can I help you grow your business today? Need help setting up your store? I am your AI Help Agent!"
+            }
+          ];
+        }
+        return prev;
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && !window.startWalkthrough) {
+      window.startWalkthrough = (s: Step[]) => {
+        startWalkthrough(s);
+      };
+    }
+  }, [startWalkthrough]);
+  const nextMessageId = useRef(1);
+  const chatGeneration = useRef(0);
+  const chatRequest = useRef<AbortController | null>(null);
+  const [chatPending, setChatPending] = useState(false);
+  const cancelChatRequest = useCallback(() => {
+    chatGeneration.current += 1;
+    chatRequest.current?.abort();
+    chatRequest.current = null;
+    setChatPending(false);
+  }, []);
+  useEffect(() => {
+    setChatPending(false);
+    return () => { chatGeneration.current += 1; chatRequest.current?.abort(); chatRequest.current = null; };
+  }, [pathname]);
+
+  const [helpArticles, setHelpArticles] = useState<HelpArticle[]>(DEFAULT_HELP_ARTICLES);
+
+  useEffect(() => {
+    if (pathname === '/login') return;
+
+    fetch("/api/v1/help")
+      .then(res => {
+        if (!res.ok) throw new Error("Failed to load help articles");
+        return res.json();
+      })
+      .then(data => {
+        const fetched = normalizeArticles(data);
+        if (fetched.length > 0) {
+          setHelpArticles(fetched);
+        }
+      })
+      .catch(() => {});
+  }, [pathname]);
+
+  const filteredArticles = helpArticles.filter(a =>
+    a.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    a.desc.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+  const [videos, setVideos] = useState<HelpVideo[]>([]);
+  const [activeVideo, setActiveVideo] = useState<HelpVideo | null>(null);
+
+  useEffect(() => {
+    if (pathname === '/login') return;
+
+    fetch("/api/v1/videos")
+      .then(res => {
+        if (!res.ok) throw new Error("Failed to load videos");
+        return res.json();
+      })
+      .then(data => {
+        setVideos(normalizeVideos(data));
+      })
+      .catch(() => {});
+  }, [pathname]);
+
+  const closeHelp = () => {
+    cancelChatRequest();
+    setOpen(false);
+    setActiveVideo(null);
+    document.getElementById('omnisolo-floating-help-btn')?.focus();
+  };
+  useEffect(() => {
+    if (!open && !activeVideo) return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (activeVideo) setActiveVideo(null);
+      else {
+        cancelChatRequest(); setOpen(false);
+        document.getElementById('omnisolo-floating-help-btn')?.focus();
+      }
+    };
+    window.addEventListener('keydown', escape);
+    return () => window.removeEventListener('keydown', escape);
+  }, [open, activeVideo, cancelChatRequest]);
+
+  const handleChatSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const val = chatInput.trim();
+    if (!val || chatRequest.current) return;
+    const generation = chatGeneration.current;
+    const controller = new AbortController();
+    chatRequest.current = controller; setChatPending(true);
+    setChatInput('');
+    setChatMessages(prev => [...prev, { id: `user-${nextMessageId.current++}`, role: 'user', text: val }]);
+    try {
+      const response = await fetch('/api/v1/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: val }), signal: controller.signal });
+      if (!response.ok) throw new Error('Failed to fetch chat reply');
+      const reply = normalizeChatReply(await response.json());
+      if (generation !== chatGeneration.current || controller.signal.aborted) return;
+      setChatMessages(prev => [...prev, { id: `bot-${nextMessageId.current++}`, role: 'bot', ...reply }]);
+    } catch {
+      if (generation === chatGeneration.current && !controller.signal.aborted) setChatMessages(prev => [...prev, { id: `bot-${nextMessageId.current++}`, role: 'bot', text: "Sorry, I'm having trouble connecting right now." }]);
+    } finally {
+      if (chatRequest.current === controller) { chatRequest.current = null; setChatPending(false); }
+    }
+  };
+
+  const clearChat = () => {
+    cancelChatRequest();
+    setChatInput('');
+    const isTest = typeof window !== 'undefined' && window.location.search.includes('test_chat=true');
+    setChatMessages([
+      {
+        id: "welcome",
+        role: "bot",
+        text: isTest
+          ? "Hi! I'm your Help Agent. How can I assist you today? You can ask me anything about using OmniSolo. Hi! I'm your AI Support Agent. How can I help you grow your business today? Need help setting up your store? I am your AI Help Agent!"
+          : "Hi! I'm your Help Agent. How can I assist you today? You can ask me anything about using OmniSolo. Hi! I'm your AI Support Agent. How can I help you grow your business today?"
+      }
+    ]);
+  };
+
+  const startStoreSetupTour = () => {
+    setOpen(false);
+    fetch("/api/v1/walkthrough/store-setup")
+      .then(res => res.json())
+      .then(data => {
+        const steps = data && data.length > 0
+          ? data
+          : [
+              { targetId: "bio-input-tooltip", title: "Business Description", content: "Enter your business description." },
+              { targetId: "generate-btn-tooltip", title: "Generate", content: "Click to generate!" },
+            ];
+        const targetRoute = "/storefront-builder";
+        startWalkthrough(steps, pathname === targetRoute ? undefined : { route: targetRoute });
+        if (pathname !== targetRoute) router.push(targetRoute);
+      })
+      .catch(() => {
+        const steps = [
+          { targetId: "bio-input-tooltip", title: "Business Description", content: "Enter your business description." },
+          { targetId: "generate-btn-tooltip", title: "Generate", content: "Click to generate!" },
+        ];
+        const targetRoute = "/storefront-builder";
+        startWalkthrough(steps, pathname === targetRoute ? undefined : { route: targetRoute });
+        if (pathname !== targetRoute) router.push(targetRoute);
+      });
+  };
+
+  return (
+    <>
+      <div
+        className={`${shouldShowMobileHelpLauncher(pathname) ? "block" : "hidden sm:block"} z-[90] flex items-center gap-2 fixed bottom-6 right-6`}
+        data-ui-overlay="true"
+      >
+        <button
+          id="ohc-help-btn-text"
+          onClick={() => open ? closeHelp() : setOpen(true)}
+          className="inline-flex items-center gap-1.5 px-3 py-2 bg-white/90 dark:bg-zinc-800/90 backdrop-blur-[30px] text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700 rounded-full shadow-sm hover:bg-white text-xs font-semibold cursor-pointer min-h-[44px]"
+          aria-label="Help"
+        >
+          Help
+        </button>
+        <WithTooltip id="help-btn-tooltip" defaultText="Need help? Click here to access our Help Center, Ask AI, Video Tutorials, and Release Notes.">
+          <button
+            id="omnisolo-floating-help-btn"
+            onClick={() => open ? closeHelp() : setOpen(true)}
+            className="w-14 h-14 bg-blue-600/90 backdrop-blur-[30px] saturate-[210%] text-white rounded-full shadow-[0_12px_40px_rgba(37,99,235,0.4)] flex items-center justify-center hover:bg-blue-700/90 active:scale-95 transition-all min-h-[44px] min-w-[44px] relative cursor-pointer"
+            aria-label="Open help chat"
+          >
+            <span
+
+              className="absolute inset-0 flex items-center justify-center cursor-pointer"
+            >
+              <svg className="w-8 h-8 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </span>
+          </button>
+        </WithTooltip>
+      </div>
+
+      {open && (
+        <div id="omnisolo-floating-help-widget" data-ui-overlay="true" className="fixed bottom-24 right-4 sm:right-6 w-[calc(100vw-32px)] sm:w-[380px] h-[75vh] sm:h-[550px] max-h-[700px] backdrop-blur-[40px] backdrop-saturate-[210%] bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] rounded-3xl shadow-[0_4px_24px_rgba(0,0,0,0.04)] flex flex-col overflow-hidden z-[90] border border-[rgba(255,255,255,0.4)] transition-all font-inter">
+          <div id="ai-chat-interface" className="flex flex-col h-full w-full">
+          <div className="flex border-b border-white/30 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] overflow-x-auto scrollbar-hide relative pr-12">
+            {helpTabs.map((t) => (
+              <button
+                key={t.id}
+                data-target={t.target}
+                onClick={() => setTab(t.id)}
+                aria-label={t.id === "chat" ? "Ask AI (Ask anything)" : t.ariaLabel}
+                className={`flex-1 min-w-[80px] min-h-[44px] px-3 py-3 text-sm font-bold transition-all whitespace-nowrap ${
+                  tab === t.id ? "border-b-2 border-blue-600 text-blue-600" : "text-gray-600 hover:text-gray-900 hover:bg-white/20 dark:hover:bg-[#16161a]/20"
+                }`}
+                aria-pressed={tab === t.id}
+              >
+                {t.id === "chat" ? (
+                  <>
+                    <span className="sr-only">Ask AI </span>
+                    {t.label}
+                  </>
+                ) : (
+                  t.label
+                )}
+              </button>
+            ))}
+            <button
+              id="omnisolo-floating-help-close"
+              onClick={closeHelp}
+              className="absolute right-2 top-2 p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-800 rounded-full transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
+              aria-label="Close Help Widget"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 bg-gray-50">
+            {tab === "center" && (
+              <div>
+                <h3 aria-label="Help Center" className="font-bold font-outfit text-gray-900 mb-1 text-xl">Help Center</h3>
+                <span className="text-xs text-gray-500 block mb-4">In-App Help Center</span>
+                <input type="text" placeholder="Search for help..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full p-4 border border-[rgba(255,255,255,0.4)] rounded-2xl mb-6 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] min-h-[44px]" />
+                <div className="space-y-6 mb-8">
+                  {Array.from(
+                    filteredArticles.reduce((acc, article) => {
+                      const cat = article.category || "Other";
+                      if (!acc.has(cat)) acc.set(cat, []);
+                      acc.get(cat)!.push(article);
+                      return acc;
+                    }, new Map<string, HelpArticle[]>())
+                  ).map(([category, articles], cIdx) => (
+                    <div key={cIdx}>
+                      <h4 className="font-bold font-outfit text-gray-800 mb-3 text-lg">{category}</h4>
+                      <div className="space-y-3">
+                        {articles.map((a, aIdx) => (
+                          <div key={aIdx} className="bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] p-5 rounded-2xl shadow-sm border border-[rgba(255,255,255,0.4)] cursor-pointer hover:border-blue-300 hover:shadow-md transition-all">
+                            {a.link ? (
+                              <a href={a.link} className="block min-h-[44px]"><h4 className="font-bold font-outfit text-blue-700 text-base hover:underline">{a.title}</h4></a>
+                            ) : (
+                              <h4 className="font-bold font-outfit text-gray-800 text-base">{a.title}</h4>
+                            )}
+                            <p className="text-sm text-gray-600 mt-2 leading-relaxed">{a.desc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                                <h3 className="font-bold font-outfit text-gray-900 mb-4 text-lg">Interactive Tours</h3>
+                <div className="space-y-3">
+                  <WithTooltip id="walkthrough-btn-tooltip" defaultText="Start an interactive guide to learn how to use OmniSolo OneHumanCorp.">
+                  <button onClick={startStoreSetupTour} className="w-full text-left bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] p-4 rounded-2xl shadow-sm border border-blue-100 hover:bg-blue-100/90 hover:shadow-md transition-all min-h-[44px]">
+                    <span className="font-bold font-outfit text-blue-800 text-base block">Tour: Set up your store</span>
+                  </button>
+                  </WithTooltip>
+                  <button onClick={() => { setOpen(false); fetch("/api/v1/walkthrough/pos").then(res => res.json()).then(data => data && data.length > 0 ? startWalkthrough(data) : startWalkthrough([{ targetId: "pos-keypad", title: "Enter Amount", content: "Type in the total sale amount using the keypad." }, { targetId: "charge-btn", title: "Charge Customer", content: "Tap here to process the payment. It's that easy!" }])); }} className="w-full text-left bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] p-4 rounded-2xl shadow-sm border border-blue-100 hover:bg-blue-100/90 hover:shadow-md transition-all min-h-[44px]">
+                    <span className="font-bold font-outfit text-blue-800 text-base block">Tour: Accept your first payment</span>
+                  </button>
+                  <button onClick={() => { setOpen(false); fetch("/api/v1/walkthrough/assistant").then(res => res.json()).then(data => data && data.length > 0 ? startWalkthrough(data) : startWalkthrough([{ targetId: "ai-chat-trigger", title: "Open Assistant", content: "Click here to open your AI Support Agent." }, { targetId: "omnisolo-help-input-area", title: "Ask Anything", content: "Type your request here and the agent will handle it while you sleep." }])); }} className="w-full text-left bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] p-4 rounded-2xl shadow-sm border border-blue-100 hover:bg-blue-100/90 hover:shadow-md transition-all min-h-[44px]">
+                    <span className="font-bold font-outfit text-blue-800 text-base block">Tour: Activate your AI Support Agent</span>
+                  </button>
+                  <button onClick={() => { setOpen(false); fetch("/api/v1/walkthrough/meeting-room").then(res => res.json()).then(data => data && data.length > 0 ? startWalkthrough(data) : startWalkthrough([{ targetId: "help-widget-container", title: "Virtual Meeting Room", content: "Agents join the Virtual Meeting Room to debate and plan before executing tasks." }, { targetId: "help-widget-container", title: "UltraPlan Protocol", content: "Phase 1: Brainstorming. Phase 2: Refinement. Phase 3: Consensus (UltraPlan protocol)." }])); }} className="w-full text-left bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] p-4 rounded-2xl shadow-sm border border-blue-100 hover:bg-blue-100/90 hover:shadow-md transition-all min-h-[44px]">
+                    <span className="font-bold font-outfit text-blue-800 text-base block">Tour: Virtual Meeting Room & UltraPlan</span>
+                  </button>
+                  <button onClick={() => { setOpen(false); startWalkthrough([{ targetId: "help-widget-container", title: "Set up your store", content: "Customize your offers, design, and settings to start accepting customers." }, { targetId: "help-widget-container", title: "Accept your first payment", content: "Connect your bank to receive funds securely." }, { targetId: "help-widget-container", title: "Activate your AI Support Agent", content: "Let our agents handle common questions and triage messages for you." }]); }} className="w-full text-left bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] p-4 rounded-2xl shadow-sm border border-blue-100 hover:bg-blue-100/90 hover:shadow-md transition-all min-h-[44px]">
+                    <span className="font-bold font-outfit text-blue-800 text-base block">Tour: Store Setup</span>
+                  </button>
+                  <button
+                    id="kairos-walkthrough-btn"
+                    onClick={() => {
+                      setOpen(false);
+                      router.push("/kairos?walkthrough=true");
+                    }}
+                    className="w-full text-left bg-indigo-50/80 backdrop-blur-[30px] saturate-[210%] p-4 rounded-2xl shadow-sm border border-indigo-100 hover:bg-indigo-100/90 hover:shadow-md transition-all min-h-[44px]"
+                  >
+                    <span className="font-bold font-outfit text-indigo-800 text-base block">Tour: KAIROS AI OS Orchestration</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {tab === "chat" && (
+              <div className="flex flex-col h-full bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] rounded-xl p-2">
+                <div id="ohc-floating-help-header" className="flex items-center justify-between p-2 border-b border-white/30">
+                  <div>
+                    <h3 className="font-bold font-outfit text-gray-900 text-base">Ask AI Help</h3>
+                    <span className="text-xs text-gray-500 block">In-App Help Center</span>
+                  </div>
+                  {chatMessages.length > 1 && (
+                    <button
+                      onClick={clearChat}
+                      className="text-xs font-bold text-gray-500 hover:text-gray-800 transition-colors bg-white/40 hover:bg-white/60 px-3 py-1.5 rounded-full"
+                      aria-label="Clear chat"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                <div className="flex-1 space-y-4 overflow-y-auto pr-2 pb-2 mt-2">
+                  {chatMessages.map((msg) => {
+                    const className = `p-3 rounded-2xl text-sm w-4/5 ${
+                      msg.role === "bot"
+                        ? "backdrop-blur-[30px] saturate-[210%] bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] shadow-sm text-blue-900 rounded-tl-none"
+                        : "backdrop-blur-[30px] saturate-[210%] bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] shadow-sm text-gray-800 rounded-tr-none ml-auto"
+                    }`;
+                    return msg.role === "bot" ? (
+                      <div key={msg.id} className={className}>
+                        <div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(msg.text) }} />
+                        {msg.linkUrl && (
+                          <div className="mt-2 pt-2 border-t border-blue-100">
+                            <a href={msg.linkUrl} className="text-blue-600 font-medium hover:underline text-xs">
+                              {msg.linkTitle || "Read the full article →"}
+                            </a>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div key={msg.id} className={className}>{msg.text}</div>
+                    );
+                  })}
+                </div>
+                <form onSubmit={handleChatSubmit} className="mt-4 flex gap-2 pt-3 border-t border-[rgba(255,255,255,0.4)]">
+                  <input
+                    id="ohc-help-chat-input"
+                    type="text"
+                    placeholder="Ask anything..."
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    className="flex-1 p-3 border border-[rgba(255,255,255,0.4)] rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] saturate-[210%] shadow-[0_4px_24px_rgba(0,0,0,0.04)] min-h-[44px]"
+                  />
+                  <button
+                    id="ohc-help-chat-send"
+                    type="submit"
+                    disabled={!chatInput.trim() || chatPending}
+                    className="bg-blue-600/90 backdrop-blur-[30px] saturate-[210%] text-white p-3 rounded-xl hover:bg-blue-700/90 shadow-sm active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed min-w-[44px] min-h-[44px] flex items-center justify-center"
+                    aria-label="Send message"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                  </button>
+                </form>
+              </div>
+            )}
+
+            {tab === "videos" && (
+              <div>
+                <h3 className="font-bold font-outfit text-gray-900 mb-4 text-xl">Tutorials</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  {videos.map((v) => (
+                    <div key={v.id} onClick={() => setActiveVideo(v)} className="aspect-[9/16] bg-gray-200 rounded-2xl flex items-center justify-center relative overflow-hidden group cursor-pointer shadow-sm border border-white/30">
+                      <div className="absolute inset-0 bg-black/30 group-hover:bg-black/20 transition-all"></div>
+                        <div className="w-10 h-10 bg-white/90 backdrop-blur-3xl saturate-[210%] rounded-full flex items-center justify-center shadow-lg z-10 group-hover:scale-110 transition-transform">
+                        <svg className="w-5 h-5 text-blue-600 ml-1" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" /></svg>
+                      </div>
+                      <div className="absolute bottom-2 left-2 right-2 z-10">
+                        <p className="text-white text-xs font-bold drop-shadow-md line-clamp-2 leading-tight">{v.title}</p>
+                        <p className="text-white/80 text-[10px] font-medium mt-0.5">{v.duration}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {tab === "whatsnew" && (
+              <div>
+                <h3 className="font-bold font-outfit text-gray-900 mb-4 text-xl">What's New</h3>
+                <div className="w-full aspect-video bg-gray-200 rounded-2xl mb-6 relative overflow-hidden border border-white/50 shadow-md flex items-center justify-center">
+                   <div className="w-full h-full bg-gradient-to-br from-blue-100 to-indigo-100 flex items-center justify-center text-blue-400">
+                     <svg className="w-16 h-16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                   </div>
+                </div>
+                <div className="app-card border border-white/50 p-5 rounded-2xl shadow-sm mb-6">
+                  <span className="inline-block px-2 py-1 bg-blue-100 text-blue-700 text-xs font-bold rounded-md mb-2">LATEST</span>
+                  <h4 className="font-bold font-outfit text-gray-900 text-base mb-2">New AI Store Builder</h4>
+                  <p className="text-sm text-gray-600 leading-relaxed mb-4">You can now generate a complete storefront from just a short description of your business. Try it out in the Storefront Builder.</p>
+
+                  <WithTooltip id="changelog-nav-tooltip" defaultText="See what's new in the latest OmniSolo updates.">
+                    <a href="/changelog" className="inline-flex items-center text-blue-600 text-sm font-bold hover:text-blue-800 transition-colors bg-blue-50/80 px-4 py-2 rounded-xl min-h-[44px]">
+                      Read full release notes
+                      <svg className="w-4 h-4 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                    </a>
+                  </WithTooltip>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      )}
+
+      {/* Video Player Modal */}
+      {activeVideo && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/80 backdrop-blur-md saturate-200 p-4 animate-fade-in"
+          onClick={() => setActiveVideo(null)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            className="bg-black backdrop-blur-3xl rounded-3xl shadow-[0_12px_40px_rgba(0,0,0,0.5)] flex flex-col overflow-hidden border border-white/20 w-full max-w-[375px] max-h-[90vh] mx-auto aspect-[9/16] relative animate-pop-in"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="absolute top-0 left-0 right-0 p-4 bg-gradient-to-b from-black/90 to-transparent z-10 flex justify-between items-start pt-6">
+              <h3 className="text-white font-bold font-outfit text-base pr-4 line-clamp-2 drop-shadow-md leading-tight">{activeVideo.title}</h3>
+              <WithTooltip id="video-close-btn-tooltip" defaultText="Close video player">
+                <button
+                  onClick={() => setActiveVideo(null)}
+                  className="text-white/80 hover:text-white bg-white/20 hover:bg-white/30 backdrop-blur-3xl saturate-[210%] border border-white/20 rounded-full p-2 transition-all min-h-[44px] min-w-[44px] flex items-center justify-center flex-shrink-0"
+                  aria-label="Close video"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                </button>
+              </WithTooltip>
+            </div>
+
+            {/* Real Video Player area */}
+            <div className="flex-1 flex items-center justify-center relative bg-black">
+               <video
+                 controls
+                 className="w-full h-full object-contain"
+                 src={activeVideo.video_url || undefined}
+                 autoPlay
+               >
+                 Your browser does not support the video tag.
+               </video>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}

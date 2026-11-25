@@ -1,0 +1,925 @@
+use crate::hub::Hub;
+use crate::persistence::{
+    DatabaseBackend,
+    catalog::{CatalogRepository, NewProduct},
+};
+use axum::http::StatusCode;
+use axum::{
+    Router,
+    extract::{Extension, Json, Path},
+    response::IntoResponse,
+    routing::{get, post, put},
+};
+
+use crate::utils::cache::HybridCache;
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+#[path = "catalog_edit.rs"]
+mod catalog_edit;
+
+pub static CATALOG_CACHE: OnceLock<HybridCache<i64>> = OnceLock::new();
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerateOfferingRequest {
+    pub prompt: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GenerateOfferingResponse {
+    pub title: String,
+    pub description: String,
+    pub price: String,
+    pub item_type: String,
+    pub is_subscription: bool,
+    pub variants: Option<Vec<ProductVariantRequest>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ProductVariantRequest {
+    pub name: String,
+    pub price_modifier: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateProductRequest {
+    pub name: String,
+    pub price: String,
+    pub duration: Option<i32>,
+    pub description: String,
+    pub item_type: String,
+    pub is_subscribable: Option<bool>,
+    pub subscription_frequency: Option<String>,
+    pub subscription_discount_percent: Option<i32>,
+    pub variants: Option<Vec<ProductVariantRequest>>,
+    pub smart_pricing_enabled: Option<bool>,
+    pub base_price: Option<String>,
+    pub min_price: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CreateProductResponse {
+    pub success: bool,
+    pub product_id: String,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct Product {
+    pub id: String,
+    pub name: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub item_type: Option<String>,
+    pub price_cents: Option<i64>,
+    pub price: f64,
+    pub inventory_count: Option<i32>,
+    pub image_url: Option<String>,
+    pub variants: Option<Vec<ProductVariantRequest>>,
+}
+
+fn bounded_product_image_url(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let image_url = metadata?.get("image_url")?.as_str()?.trim();
+    let is_safe_path = image_url.starts_with('/')
+        && !image_url.starts_with("//")
+        && image_url.len() <= 2_048
+        && !image_url.contains(['\\', '\r', '\n', '\0'])
+        && !image_url
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."));
+
+    is_safe_path.then(|| image_url.to_string())
+}
+
+async fn handle_get_products(
+    Extension(repository): Extension<Option<Arc<CatalogRepository>>>,
+    Extension(claims): Extension<::server_common::Claims>,
+) -> impl IntoResponse {
+    let Some(tenant_id) = claims
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant_id| !tenant_id.is_empty() && !tenant_id.eq_ignore_ascii_case("system"))
+        .map(str::to_string)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(repository) = repository else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(vec![] as Vec<Product>),
+        )
+            .into_response();
+    };
+    match repository.list_products(&tenant_id).await {
+        Ok(rows) => {
+            let products: Vec<Product> = rows
+                .into_iter()
+                .map(|row| {
+                    let image_url = bounded_product_image_url(row.metadata.as_ref());
+                    Product {
+                        id: row.id,
+                        name: row.title.clone(),
+                        title: row.title,
+                        description: row.description,
+                        item_type: row.item_type,
+                        price_cents: Some(row.price_cents),
+                        price: row.price_cents as f64 / 100.0,
+                        inventory_count: Some(row.inventory_count),
+                        image_url,
+                        variants: None,
+                    }
+                })
+                .collect();
+            (StatusCode::OK, Json(products)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to fetch products: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(vec![] as Vec<Product>),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn validated_product_price(payload: &CreateProductRequest) -> Option<f64> {
+    let invalid_smart_pricing = payload.smart_pricing_enabled.unwrap_or(false) && {
+        let base_price = payload
+            .base_price
+            .as_deref()
+            .map(|price| parse_bounded_price(price, false))
+            .unwrap_or_else(|| parse_bounded_price(&payload.price, false));
+        let min_price = payload
+            .min_price
+            .as_deref()
+            .map(|price| parse_bounded_price(price, false))
+            .unwrap_or(Some(0.0));
+
+        base_price
+            .zip(min_price)
+            .is_none_or(|(base_price, min_price)| min_price > base_price)
+    };
+    let invalid_text = payload.name.trim().is_empty()
+        || payload.name.chars().count() > 200
+        || payload.description.chars().count() > 10_000
+        || !matches!(payload.item_type.as_str(), "Product" | "Service")
+        || payload.duration.is_some_and(|duration| duration < 0)
+        || payload
+            .subscription_discount_percent
+            .is_some_and(|discount| !(0..=100).contains(&discount))
+        || payload
+            .subscription_frequency
+            .as_deref()
+            .is_some_and(|frequency| {
+                !matches!(
+                    frequency.to_ascii_lowercase().as_str(),
+                    "daily" | "weekly" | "monthly" | "yearly"
+                )
+            })
+        || payload.variants.as_ref().is_some_and(|variants| {
+            variants.len() > 50
+                || variants.iter().any(|variant| {
+                    variant.name.trim().is_empty()
+                        || variant.name.chars().count() > 200
+                        || parse_bounded_price(&variant.price_modifier, true).is_none()
+                })
+        })
+        || invalid_smart_pricing;
+
+    (!invalid_text)
+        .then(|| parse_bounded_price(&payload.price, false))
+        .flatten()
+}
+
+fn parse_bounded_price(price: &str, allow_negative: bool) -> Option<f64> {
+    let price = price.parse::<f64>().ok()?;
+    (price.is_finite()
+        && price <= 10_000_000.0
+        && (allow_negative || price >= 0.0)
+        && (!allow_negative || price >= -10_000_000.0))
+        .then_some(price)
+}
+
+async fn count_tenant_products(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query("SELECT COUNT(*)::BIGINT AS count FROM products WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_one(&mut **tx)
+        .await?;
+
+    Ok(row.try_get::<i64, _>("count").unwrap_or(0))
+}
+
+async fn handle_create_product(
+    Extension(hub): Extension<Arc<Hub>>,
+    Extension(repository): Extension<Option<Arc<CatalogRepository>>>,
+    Extension(claims): Extension<::server_common::Claims>,
+    Json(payload): Json<CreateProductRequest>,
+) -> impl IntoResponse {
+    let Some(tenant_id) = claims
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant_id| !tenant_id.is_empty() && !tenant_id.eq_ignore_ascii_case("system"))
+        .map(str::to_string)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(price) = validated_product_price(&payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "INVALID_PRODUCT".to_string(),
+                message: "Product fields are invalid".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if repository
+        .as_ref()
+        .is_some_and(|repository| repository.backend() != DatabaseBackend::Postgres)
+    {
+        let advanced_features_requested = payload.is_subscribable.unwrap_or(false)
+            || payload
+                .variants
+                .as_ref()
+                .is_some_and(|items| !items.is_empty())
+            || payload.smart_pricing_enabled.unwrap_or(false)
+            || payload.subscription_frequency.is_some()
+            || payload.subscription_discount_percent.is_some();
+        if advanced_features_requested {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResponse {
+                    error: "FEATURE_UNAVAILABLE".to_string(),
+                    message: "Variants, subscriptions, and smart pricing require the PostgreSQL catalog implementation"
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        let Some(repository) = repository else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "DATABASE_UNAVAILABLE".to_string(),
+                    message: "Catalog database is unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        };
+        return match repository
+            .create_product(NewProduct {
+                tenant_id,
+                title: payload.name.clone(),
+                description: Some(payload.description),
+                item_type: Some(payload.item_type),
+                price_cents: (price * 100.0).round() as i64,
+                inventory_count: 100,
+                metadata: None,
+            })
+            .await
+        {
+            Ok(product) => (
+                StatusCode::OK,
+                Json(CreateProductResponse {
+                    success: true,
+                    product_id: product.id,
+                    message: Some(format!("Created {}", payload.name)),
+                }),
+            )
+                .into_response(),
+            Err(error) => {
+                tracing::error!("Failed to persist catalog product: {error}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "DATABASE_ERROR".to_string(),
+                        message: "Failed to create product".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        };
+    }
+
+    let mut tx = match hub.pool.begin().await {
+        Ok(c) => c,
+        Err(e) => {
+            ::server_telemetry::record_error_signal("[bug] Failed to acquire DB connection");
+            tracing::error!("Failed to acquire DB connection: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "DATABASE_ERROR".to_string(),
+                    message: "Failed to connect to database".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id).await {
+        tracing::error!("Failed to bind catalog tenant context: {error:?}"); // pii-safe
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "DATABASE_ERROR".to_string(),
+                message: "Failed to create product".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let quota_scope = ::ohc_core::extensions::WorkspaceScope {
+        workspace_id: tenant_id.clone(),
+        actor_id: claims.sub.clone(),
+        roles: claims.roles.clone(),
+    };
+    if let Ok(decision) = hub
+        .billing_platform()
+        .check_platform_quota(&quota_scope, "catalog.products.create")
+        .await
+        && !decision.allowed
+    {
+        let _ = count_tenant_products(&mut tx, &tenant_id).await;
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(ErrorResponse {
+                error: "LIMIT_EXCEEDED".to_string(),
+                message: decision.warning_message.unwrap_or_else(|| {
+                    "Product limit reached for current workspace plan.".to_string()
+                }),
+            }),
+        )
+            .into_response();
+    }
+    let total_products: Option<i64> = None;
+
+    let product_id = uuid::Uuid::new_v4().to_string();
+
+    let price_cents = (price * 100.0).round() as i64;
+    let insert_product = sqlx::query(
+        "INSERT INTO products (id, tenant_id, title, description, type, price_cents, inventory_count, is_subscribable, subscription_frequency, subscription_discount_percent) VALUES ($1, $2, $3, $4, $5, $6, 100, $7, $8, $9)"
+    )
+    .bind(&product_id)
+    .bind(&tenant_id)
+    .bind(&payload.name)
+    .bind(&payload.description)
+    .bind(&payload.item_type)
+    .bind(price_cents)
+    .bind(payload.is_subscribable.unwrap_or(false))
+    .bind(payload.subscription_frequency.clone())
+    .bind(payload.subscription_discount_percent.unwrap_or(0))
+    .execute(&mut *tx)
+    .await;
+
+    if let Err(e) = insert_product {
+        ::server_telemetry::record_error_signal("[bug] Failed to insert product");
+        tracing::error!("Failed to insert product: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "DATABASE_ERROR".to_string(),
+                message: "Failed to create product".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(variants) = payload.variants {
+        for variant in variants {
+            let variant_id = format!("var-{}", uuid::Uuid::new_v4());
+            let v_price_mod =
+                (parse_bounded_price(&variant.price_modifier, true).unwrap_or_default() * 100.0)
+                    .round() as i64;
+            let insert_variant = sqlx::query("INSERT INTO product_variants (id, tenant_id, product_id, name, price_modifier, inventory_count) VALUES ($1, $2, $3, $4, $5, 100)")
+                .bind(&variant_id)
+                .bind(&tenant_id)
+                .bind(&product_id)
+                .bind(&variant.name)
+                .bind(v_price_mod)
+                .execute(&mut *tx)
+                .await;
+            if let Err(e) = insert_variant {
+                ::server_telemetry::record_error_signal("[bug] Failed to insert product variant");
+                tracing::error!("Failed to insert product variant: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "DATABASE_ERROR".to_string(),
+                        message: "Failed to create product".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if payload.is_subscribable.unwrap_or(false) {
+        let plan_id = uuid::Uuid::new_v4().to_string();
+        let frequency = payload
+            .subscription_frequency
+            .clone()
+            .unwrap_or_else(|| "Monthly".to_string())
+            .to_lowercase();
+        let discount = payload.subscription_discount_percent.unwrap_or(0);
+
+        let insert_plan = sqlx::query(
+            "INSERT INTO subscription_plans (id, tenant_id, product_id, name, price_cents, frequency, interval, discount_percentage) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        )
+        .bind(&plan_id)
+        .bind(&tenant_id)
+        .bind(&product_id)
+        .bind(&payload.name)
+        .bind(price_cents)
+        .bind(&frequency)
+        .bind(&frequency)
+        .bind(discount)
+        .execute(&mut *tx)
+        .await;
+
+        if let Err(e) = insert_plan {
+            ::server_telemetry::record_error_signal("[bug] Failed to insert subscription plan");
+            tracing::error!("Failed to insert subscription plan: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "DATABASE_ERROR".to_string(),
+                    message: "Failed to create product".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    if payload.smart_pricing_enabled.unwrap_or(false) {
+        let base_price_cents = (payload
+            .base_price
+            .as_deref()
+            .and_then(|price| parse_bounded_price(price, false))
+            .unwrap_or(price)
+            * 100.0)
+            .round() as i64;
+        let rules_id = uuid::Uuid::new_v4().to_string();
+
+        let insert_pricing_rule = sqlx::query("INSERT INTO pricing_rules (id, tenant_id, target_id, name, base_price_cents, is_active, rules_json) VALUES ($1, $2, $3, $4, $5, TRUE, $6)")
+            .bind(&rules_id)
+            .bind(&tenant_id)
+            .bind(&product_id)
+            .bind(format!("Smart Pricing: {}", payload.name))
+            .bind(base_price_cents)
+            .bind(serde_json::json!([{
+                "type": "InventoryThreshold",
+                "config": { "threshold": 10, "adjustment_percent": -10.0 }
+            }]))
+            .execute(&mut *tx)
+            .await;
+        if let Err(e) = insert_pricing_rule {
+            ::server_telemetry::record_error_signal("[bug] Failed to insert pricing rule");
+            tracing::error!("Failed to insert pricing rule: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "DATABASE_ERROR".to_string(),
+                    message: "Failed to create product".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    if let Err(error) = tx.commit().await {
+        ::server_telemetry::record_error_signal("[bug] Failed to commit product creation");
+        tracing::error!("Failed to commit product creation: {error}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "DATABASE_ERROR".to_string(),
+                message: "Failed to create product".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let cache = CATALOG_CACHE.get_or_init(|| HybridCache::new(None));
+    if let Some(total_products) = total_products {
+        cache
+            .set(
+                &tenant_id,
+                total_products + 1,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+    } else {
+        cache.invalidate(&tenant_id).await;
+    }
+
+    let edge_cache = crate::builder::edge::get_edge_cache();
+    edge_cache
+        .invalidate_by_tag(&format!("tenant-id:{}", tenant_id))
+        .await;
+    edge_cache
+        .invalidate_by_tag(&format!("entity:product:{}", product_id))
+        .await;
+
+    let event_payload = catalog_edit::product_event_payload(
+        &tenant_id,
+        &product_id,
+        &payload.name,
+        &payload.description,
+        &payload.item_type,
+        price_cents,
+    );
+
+    let event = ::server_omnisolo::orchestration::TeammateMeshEvent {
+        agent_id: "system".to_string(),
+        action: "ProductCreated".to_string(),
+        status: "success".to_string(),
+        payload: serde_json::to_vec(&event_payload).unwrap_or_default(),
+        msg_id: uuid::Uuid::new_v4().to_string(),
+    };
+
+    let _ = hub
+        .publish_teammate_event("products_inbox".to_string(), event)
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(CreateProductResponse {
+            success: true,
+            product_id,
+            message: Some(format!("Created {}", payload.name)),
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_update_product(
+    Extension(hub): Extension<Arc<Hub>>,
+    Extension(repository): Extension<Option<Arc<CatalogRepository>>>,
+    Extension(claims): Extension<::server_common::Claims>,
+    Path(id): Path<String>,
+    Json(payload): Json<catalog_edit::ProductEdit>,
+) -> axum::response::Response {
+    let tenant = match catalog_edit::authorized_tenant(&claims) {
+        Ok(tenant) => tenant,
+        Err(status) => return status.into_response(),
+    };
+    let Some(cents) = catalog_edit::price_cents(&payload) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"success":false,"message":"Invalid product fields"})),
+        )
+            .into_response();
+    };
+    let Some(repository) = repository else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if repository.backend() != DatabaseBackend::Postgres {
+        return match repository
+            .update_product(
+                tenant,
+                &id,
+                payload.name.trim(),
+                &payload.description,
+                cents,
+            )
+            .await
+        {
+            Ok(true) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"success":true,"product_id":id})),
+            )
+                .into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                tracing::error!(%error,"Catalog edit did not persist");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
+    let item_type =
+        match catalog_edit::update_postgres(&hub.pool, tenant, &id, &payload, cents).await {
+            Ok(Some(kind)) => kind,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => {
+                tracing::error!(%error,"Catalog edit did not persist");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    let edge = crate::builder::edge::get_edge_cache();
+    for tag in [
+        format!("tenant-id:{tenant}"),
+        format!("entity:product:{id}"),
+    ] {
+        edge.invalidate_by_tag(&tag).await;
+    }
+    let event_payload = catalog_edit::product_event_payload(
+        tenant,
+        &id,
+        payload.name.trim(),
+        &payload.description,
+        &item_type,
+        cents,
+    );
+    let event = ::server_omnisolo::orchestration::TeammateMeshEvent {
+        agent_id: "system".into(),
+        action: "ProductUpdated".into(),
+        status: "success".into(),
+        payload: serde_json::to_vec(&event_payload).unwrap_or_default(),
+        msg_id: uuid::Uuid::new_v4().to_string(),
+    };
+    if let Err(error) = hub
+        .publish_teammate_event("products_inbox".into(), event)
+        .await
+    {
+        tracing::warn!(%error,"Product saved but SEO refresh could not be published");
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"success":true,"product_id":id})),
+    )
+        .into_response()
+}
+
+async fn handle_generate_offering(
+    Json(payload): Json<GenerateOfferingRequest>,
+) -> axum::response::Response {
+    let prompt_input = payload.prompt.trim();
+    if prompt_input.is_empty() || prompt_input.chars().count() > 4_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid prompt"})),
+        )
+            .into_response();
+    }
+    let api_key = match std::env::var("MINIMAX_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "offering generation unavailable",
+                    "message": "The AI provider is not configured.",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let optimized_prompt = ::ohc_core::prompt::compression::reduce_tokens(prompt_input);
+    let prompt = format!(
+        "Extract the product or service offering details from the following text:\n\n'{}'\n\nOutput ONLY a raw JSON object (do not wrap in markdown or backticks) matching this exact schema: {{\"title\": \"string\", \"description\": \"string\", \"price\": \"string\", \"item_type\": \"string (either Product or Service)\", \"is_subscription\": \"boolean\"}}. Suggest an appropriate market price if none is provided.",
+        optimized_prompt
+    );
+
+    let client = crate::minimax::MinimaxClient::new(api_key);
+    let reasoned = match client.reason(&prompt).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("catalog offering provider failed: {error}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "offering generation unavailable",
+                    "message": "The AI provider could not generate an offering.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let response_json = match parse_generated_offering(&reasoned) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("catalog offering provider returned invalid output: {error}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "invalid offering response",
+                    "message": "The AI provider returned an invalid offering.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    (StatusCode::OK, Json(response_json)).into_response()
+}
+
+fn parse_generated_offering(raw: &str) -> Result<GenerateOfferingResponse, &'static str> {
+    let cleaned = raw
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| raw.trim().strip_prefix("```"))
+        .unwrap_or(raw.trim())
+        .strip_suffix("```")
+        .unwrap_or_else(|| {
+            raw.trim()
+                .strip_prefix("```json")
+                .or_else(|| raw.trim().strip_prefix("```"))
+                .unwrap_or(raw.trim())
+        })
+        .trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(cleaned)
+        .map_err(|_| "provider output was not valid JSON")?;
+    let title = parsed
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 200)
+        .ok_or("provider output did not contain a valid title")?
+        .to_string();
+    let description = parsed
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 10_000)
+        .ok_or("provider output did not contain a valid description")?
+        .to_string();
+
+    let price = match parsed.get("price") {
+        Some(serde_json::Value::String(value)) => value.trim().to_string(),
+        Some(value) if value.is_number() => value.to_string(),
+        _ => return Err("provider output did not contain a price"),
+    };
+    let price_number =
+        parse_bounded_price(&price, false).ok_or("provider output contained an invalid price")?;
+    let item_type = parsed
+        .get("item_type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "Product" | "Service"))
+        .ok_or("provider output contained an invalid item type")?
+        .to_string();
+    let is_subscription = parsed
+        .get("is_subscription")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("provider output did not contain subscription state")?;
+
+    let variants = match parsed.get("variants") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Array(values)) if values.len() <= 20 => {
+            let mut variants = Vec::with_capacity(values.len());
+            for value in values {
+                let name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty() && name.chars().count() <= 200)
+                    .ok_or("provider output contained an invalid variant name")?;
+                let modifier = match value.get("price_modifier") {
+                    Some(serde_json::Value::String(value)) => value.trim().to_string(),
+                    Some(value) if value.is_number() => value.to_string(),
+                    _ => return Err("provider output contained an invalid variant price"),
+                };
+                parse_bounded_price(&modifier, true)
+                    .ok_or("provider output contained an invalid variant price")?;
+                variants.push(ProductVariantRequest {
+                    name: name.to_string(),
+                    price_modifier: modifier,
+                });
+            }
+            Some(variants)
+        }
+        Some(serde_json::Value::Array(_)) => {
+            return Err("provider output contained too many variants");
+        }
+        _ => return Err("provider output contained invalid variants"),
+    };
+
+    Ok(GenerateOfferingResponse {
+        title,
+        description,
+        price: format!("{price_number:.2}"),
+        item_type,
+        is_subscription,
+        variants,
+    })
+}
+
+pub fn router<S: Clone + Send + Sync + 'static>(
+    hub: Arc<Hub>,
+    repository: Option<Arc<CatalogRepository>>,
+) -> Router<S> {
+    Router::new()
+        .route("/products", get(handle_get_products))
+        .route(
+            "/product",
+            get(handle_get_products).post(handle_create_product),
+        )
+        .route("/product/{id}", put(handle_update_product))
+        .route("/generate", post(handle_generate_offering))
+        .layer(Extension(repository))
+        .layer(Extension(hub))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_offering_requires_complete_provider_output() {
+        let incomplete = r#"{"title":"Window cleaning","description":"Exterior service"}"#;
+        assert!(parse_generated_offering(incomplete).is_err());
+
+        let valid = r#"{"title":"Window cleaning","description":"Exterior service","price":"125.00","item_type":"Service","is_subscription":false}"#;
+        let offering = parse_generated_offering(valid).expect("complete provider output");
+        assert_eq!(offering.title, "Window cleaning");
+        assert_eq!(offering.price, "125.00");
+        assert_eq!(offering.item_type, "Service");
+    }
+
+    #[test]
+    fn test_token_reduction_integration() {
+        let input = "This is a long sentence with many unnecessary words that should be reduced.";
+        let optimized = ::ohc_core::prompt::compression::reduce_tokens(input);
+
+        assert!(optimized.len() < input.len());
+        assert!(!optimized.contains(" is "));
+        assert!(!optimized.contains(" a "));
+        assert!(!optimized.contains(" with "));
+    }
+
+    #[test]
+    fn product_validation_rejects_non_finite_and_out_of_range_prices() {
+        let request = |price: &str| CreateProductRequest {
+            name: "Window cleaning".to_string(),
+            price: price.to_string(),
+            duration: Some(30),
+            description: "Exterior window cleaning".to_string(),
+            item_type: "Service".to_string(),
+            is_subscribable: None,
+            subscription_frequency: None,
+            subscription_discount_percent: None,
+            variants: None,
+            smart_pricing_enabled: None,
+            base_price: None,
+            min_price: None,
+        };
+        let base = request("25.00");
+
+        assert_eq!(validated_product_price(&base), Some(25.0));
+
+        for price in ["NaN", "inf", "-0.01", "10000000.01"] {
+            let payload = request(price);
+            assert_eq!(
+                validated_product_price(&payload),
+                None,
+                "{price} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn product_validation_rejects_smart_pricing_floor_above_base_price() {
+        let payload = CreateProductRequest {
+            name: "Window cleaning".to_string(),
+            price: "25.00".to_string(),
+            duration: Some(30),
+            description: "Exterior window cleaning".to_string(),
+            item_type: "Service".to_string(),
+            is_subscribable: None,
+            subscription_frequency: None,
+            subscription_discount_percent: None,
+            variants: None,
+            smart_pricing_enabled: Some(true),
+            base_price: Some("25.00".to_string()),
+            min_price: Some("30.00".to_string()),
+        };
+
+        assert_eq!(validated_product_price(&payload), None);
+    }
+
+    #[test]
+    fn product_image_url_accepts_only_bounded_same_origin_paths() {
+        let valid = serde_json::json!({"image_url": "/dashboard_with_charts.png"});
+        assert_eq!(
+            bounded_product_image_url(Some(&valid)).as_deref(),
+            Some("/dashboard_with_charts.png")
+        );
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"image_url": "https://example.com/product.png"}),
+            serde_json::json!({"image_url": "//example.com/product.png"}),
+            serde_json::json!({"image_url": "/../secret"}),
+            serde_json::json!({"image_url": format!("/{}", "x".repeat(2_048))}),
+        ] {
+            assert_eq!(bounded_product_image_url(Some(&invalid)), None);
+        }
+    }
+}

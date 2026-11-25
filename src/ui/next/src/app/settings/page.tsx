@@ -1,0 +1,798 @@
+"use client";
+
+import { useState,useEffect,useRef } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { SmsSettingsPanel } from "./SmsSettingsPanel";
+import { QUEUE_IDENTITY_EPOCH_KEY } from "../../lib/sync/queueIdentity";
+import { AppShell } from "../components/AppShell";
+import { WithTooltip } from "../../components/TooltipRegistry";
+import {
+  AuthenticationSettingsPanel,
+  type AdminOidcProvider,
+  type RegistrationMode,
+} from "./AuthenticationSettingsPanel";
+
+export default function SettingsPage() {
+  const router = useRouter();
+  const [preferences, setPreferences] = useState({
+    email_notifications: false,
+    push_notifications: false,
+    urgent_booking: false,
+    failed_payment: false,
+    new_order: false,
+  });
+
+  const [deliverySettings, setDeliverySettings] = useState({
+    delivery_enabled: false,
+    delivery_radius: 5.0,
+    delivery_fee: 8.50,
+  });
+
+  const [voiceSettings, setVoiceSettings] = useState({
+    voice_receptionist_enabled: false,
+    voice_receptionist_number: "",
+    voice_receptionist_persona: "Friendly",
+    voice_receptionist_instructions: "",
+  });
+  const voiceEpoch = useRef(0);
+  const voiceProvisionBusy = useRef(false);
+  const [voiceProvisionState, setVoiceProvisionState] = useState<'idle' | 'pending' | 'unconfirmed'>('idle');
+  const [voiceProvisionMessage, setVoiceProvisionMessage] = useState('');
+  const [voiceSettingsReady, setVoiceSettingsReady] = useState(false);
+  const [voiceProvisionAllowed, setVoiceProvisionAllowed] = useState(false);
+  const [voiceAvailabilityMessage, setVoiceAvailabilityMessage] = useState('Verifying voice settings…');
+  const voiceSettingBusy = useRef(false);
+  const [voiceSettingSaving, setVoiceSettingSaving] = useState(false);
+  const [voiceSettingMessage, setVoiceSettingMessage] = useState('');
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [agentName, setAgentName] = useState("Agent One");
+  const [seoReports, setSeoReports] = useState<{ plain_language_summary: string }[]>([]);
+  const [hitRate, setHitRate] = useState<string>("");
+  const [enableLazyToolLoading, setEnableLazyToolLoading] = useState(false);
+  const [twilioAccountSid, setTwilioAccountSid] = useState("");
+  const [twilioAuthToken, setTwilioAuthToken] = useState("");
+  const [twilioPhoneNumber, setTwilioPhoneNumber] = useState("");
+  const [twilioStatus, setTwilioStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
+  const [usageLogs, setUsageLogs] = useState<{ username: string; feature: string; tokens_used: number; computed_cost: number }[]>([]);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [registrationMode, setRegistrationMode] = useState<RegistrationMode>("closed");
+  const [registrationStatus, setRegistrationStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [oidcProviders, setOidcProviders] = useState<AdminOidcProvider[]>([]);
+  const [providerStatus, setProviderStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+
+  const handleConnectWhatsApp = async () => {
+    try {
+      setTwilioStatus("loading");
+      const res = await fetch("/api/v1/settings/integrations/whatsapp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_token: twilioAccountSid,
+          bot_token: twilioAuthToken,
+          from_phone: twilioPhoneNumber,
+        }),
+      });
+      if (res.ok) {
+        setTwilioStatus("success");
+      } else {
+        setTwilioStatus("error");
+      }
+    } catch  {
+      setTwilioStatus("error");
+    }
+  };
+
+
+
+  const isAbortError = (e: unknown) => {
+    if (!e) return false;
+    const msg = String((e as { message?: string })?.message || e);
+    return (e as { name?: string })?.name === "AbortError" || msg.includes("Failed to fetch") || msg.includes("aborted");
+  };
+
+  useEffect(() => {
+    document.title = "Settings | OmniSolo OneHumanCorp";
+    const voiceGeneration = ++voiceEpoch.current;
+    const voiceActive = () => voiceEpoch.current === voiceGeneration;
+    const invalidateVoice = () => {
+      voiceEpoch.current += 1;
+      voiceProvisionBusy.current = true; voiceSettingBusy.current = true;
+      setVoiceSettings({ voice_receptionist_enabled: false, voice_receptionist_number: '', voice_receptionist_persona: 'Friendly', voice_receptionist_instructions: '' });
+      setVoiceSettingsReady(false); setVoiceProvisionAllowed(false);
+      setVoiceSettingSaving(false); setVoiceSettingMessage('');
+      setVoiceProvisionState('unconfirmed'); setVoiceProvisionMessage('');
+      setVoiceAvailabilityMessage('Your session changed. Reload to verify voice settings before continuing.');
+    };
+    const invalidateVoiceStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === QUEUE_IDENTITY_EPOCH_KEY) invalidateVoice();
+    };
+    window.addEventListener('omnisolo_auth_changed', invalidateVoice);
+    window.addEventListener('storage', invalidateVoiceStorage);
+    Promise.all([
+      fetch("/api/v1/settings/delivery")
+        .then(res => res.ok ? res.json() : null)
+        .then(data => {
+           if (!data) return;
+           setDeliverySettings({
+             delivery_enabled: data.delivery_enabled || false,
+             delivery_radius: data.delivery_radius || 5.0,
+             delivery_fee: data.delivery_fee || 8.50,
+           });
+        })
+        .catch(e => {
+          if (isAbortError(e)) return;
+          console.error("Failed to load delivery settings", e);
+        }),
+
+      fetch("/api/v1/assistant/settings")
+        .then(res => res.ok ? res.json() : null)
+        .then(data => {
+          if (data?.settings?.agentName) {
+            setAgentName(data.settings.agentName);
+          }
+        })
+        .catch(e => {
+          if (isAbortError(e)) return;
+          console.error("Failed to load assistant settings", e);
+        }),
+
+      fetch("/api/v1/settings/voice")
+        .then(async res => {
+          const data = await res.json();
+          if (!voiceActive()) return;
+          if (res.status === 200 && data?.success !== false && data.error == null && typeof data.voice_receptionist_enabled === 'boolean' && typeof data.provisioning_available === 'boolean') {
+            setVoiceSettings({
+              voice_receptionist_enabled: data.voice_receptionist_enabled,
+              voice_receptionist_number: typeof data.voice_receptionist_number === 'string' ? data.voice_receptionist_number : "",
+              voice_receptionist_persona: typeof data.voice_receptionist_persona === 'string' ? data.voice_receptionist_persona : "Friendly",
+              voice_receptionist_instructions: typeof data.voice_receptionist_instructions === 'string' ? data.voice_receptionist_instructions : "",
+            });
+            setVoiceSettingsReady(true);
+            setVoiceProvisionAllowed(data.provisioning_available);
+            setVoiceAvailabilityMessage(data.provisioning_available ? '' : data.provisioning_block_reason === 'provider_not_configured'
+              ? 'Voice number provisioning is unavailable because a provider is not configured.'
+              : 'Voice provisioning requires reconciliation. Review the provider before requesting another number.');
+          } else {
+            setVoiceSettingsReady(false); setVoiceProvisionAllowed(false);
+            setVoiceAvailabilityMessage(data?.error === 'hosted_global_provisioning_unavailable'
+              ? 'Voice settings are unavailable in this deployment. No provider action can be started.'
+              : 'Voice settings could not be verified. No provider action can be started.');
+          }
+        })
+        .catch(e => {
+          if (!voiceActive()) return;
+          setVoiceSettingsReady(false); setVoiceProvisionAllowed(false);
+          setVoiceAvailabilityMessage('Voice settings could not be verified. No provider action can be started.');
+          if (isAbortError(e)) return;
+          console.error("Failed to load voice settings", e);
+        }),
+
+      fetch("/api/v1/local_seo/discovery_report")
+        .then(res => res.ok ? res.json() : null)
+        .then(data => {
+          if (Array.isArray(data)) {
+            setSeoReports(data);
+            if (data.length > 0 && data[0].metrics && data[0].metrics.edge_cache_hit_rate !== undefined) {
+              setHitRate(`${(data[0].metrics.edge_cache_hit_rate * 100).toFixed(1)}% Hit Rate`);
+            } else {
+              setHitRate(""); // No data available
+            }
+          }
+        })
+        .catch(e => {
+          if (isAbortError(e)) return;
+          console.error("Failed to load seo reports", e);
+        })
+    ]).finally(() => {
+      setIsLoading(false);
+    });
+
+    fetch("/api/v1/ui/admin/usage")
+      .then(res => {
+        if (res.ok) {
+          setIsAdmin(true);
+          return res.json();
+        }
+        return [];
+      })
+      .then(data => {
+        if (Array.isArray(data)) {
+          setUsageLogs(data);
+        }
+      })
+      .catch(e => {
+        if (isAbortError(e)) return;
+        console.error("Failed to load usage logs", e);
+      });
+
+    fetch("/api/v1/settings/authentication", { cache: "no-store" })
+      .then(async res => {
+        if (!res.ok) throw new Error("not authorized");
+        const data = await res.json();
+        if (["closed", "open", "invite_only"].includes(data.registration_mode)) {
+          setRegistrationMode(data.registration_mode);
+          if (Array.isArray(data.providers)) {
+            setOidcProviders(data.providers.filter((provider: unknown): provider is AdminOidcProvider => {
+              if (provider === null || typeof provider !== "object") return false;
+              const candidate = provider as Record<string, unknown>;
+              return typeof candidate.key === "string"
+                && typeof candidate.display_name === "string"
+                && typeof candidate.provider_kind === "string"
+                && typeof candidate.issuer === "string"
+                && typeof candidate.configured === "boolean"
+                && typeof candidate.enabled === "boolean";
+            }));
+          }
+          setIsAdmin(true);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      voiceEpoch.current += 1;
+      window.removeEventListener('omnisolo_auth_changed', invalidateVoice);
+      window.removeEventListener('storage', invalidateVoiceStorage);
+    };
+  }, []);
+
+  const handleRegistrationModeChange = async (mode: RegistrationMode) => {
+    setRegistrationStatus("saving");
+    try {
+      const response = await fetch("/api/v1/settings/authentication", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ registration_mode: mode }),
+      });
+      if (!response.ok) throw new Error("setting rejected");
+      setRegistrationMode(mode);
+      setRegistrationStatus("saved");
+    } catch {
+      setRegistrationStatus("error");
+    }
+  };
+
+  const handleProviderChange = async (provider: string, enabled: boolean) => {
+    setProviderStatus("saving");
+    try {
+      const response = await fetch(`/api/v1/settings/authentication/providers/${encodeURIComponent(provider)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!response.ok) throw new Error("setting rejected");
+      setOidcProviders((current) => current.map((item) => item.key === provider ? { ...item, enabled } : item));
+      setProviderStatus("saved");
+    } catch {
+      setProviderStatus("error");
+    }
+  };
+
+  const handleDeliverySettingChange = async (key: string, value: string | number | boolean) => {
+    const newSettings = { ...deliverySettings, [key]: value };
+    setDeliverySettings(newSettings);
+    try {
+      await fetch("/api/v1/settings/delivery", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newSettings),
+      });
+    } catch (e) {
+      console.error("Failed to save delivery settings", e);
+    }
+  };
+
+  const handlePreferenceChange = (key: string, checked: boolean) => {
+    setPreferences(current => ({ ...current, [key]: checked }));
+  };
+
+  const handleVoiceSettingChange = async (key: string, value: string | boolean) => {
+    if (!voiceSettingsReady || voiceSettingBusy.current) return;
+    const generation = voiceEpoch.current;
+    voiceSettingBusy.current = true; setVoiceSettingSaving(true); setVoiceSettingMessage('Saving voice preference…');
+    const change = { [key]: value };
+
+    try {
+      const response = await fetch("/api/v1/settings/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(change),
+      });
+      const result = await response.json();
+      if (generation !== voiceEpoch.current) return;
+      if (response.status !== 200 || result?.success !== true || result.error != null) throw new Error('Voice preference change could not be confirmed');
+      setVoiceSettings(previous => ({ ...previous, [key]: value }));
+      setVoiceSettingMessage('Voice preference saved.');
+    } catch (e) {
+      if (generation !== voiceEpoch.current) return;
+      console.error("Failed to save voice settings", e);
+      setVoiceSettingMessage('Voice preference change could not be confirmed. Reload to check the saved value.');
+    } finally {
+      if (generation === voiceEpoch.current) { voiceSettingBusy.current = false; setVoiceSettingSaving(false); }
+    }
+  };
+
+  const handleAgentNameChange = async (value: string) => {
+    setAgentName(value);
+    try {
+      await fetch("/api/v1/assistant/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentName: value }),
+      });
+    } catch (e) {
+      console.error("Failed to save agent settings", e);
+    }
+  };
+
+  const handleProvisionVoiceNumber = async () => {
+    if (!voiceProvisionAllowed || voiceProvisionBusy.current) return;
+    const generation = voiceEpoch.current;
+    voiceProvisionBusy.current = true;
+    setVoiceProvisionState('pending');
+    setVoiceProvisionMessage('Requesting a phone number…');
+    try {
+      const res = await fetch("/api/v1/settings/voice/provision", {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (generation !== voiceEpoch.current) return;
+      if (res.status === 200 && data?.success === true && data.error == null && typeof data.number === 'string' && /^\+[1-9]\d{1,14}$/.test(data.number)) {
+        // The provisioning endpoint already persists its acknowledged number.
+        setVoiceSettings(previous => ({ ...previous, voice_receptionist_number: data.number }));
+        setVoiceProvisionMessage('Phone number provisioning was acknowledged.');
+        voiceProvisionBusy.current = false;
+        setVoiceProvisionState('idle');
+      } else {
+        setVoiceProvisionMessage('The phone number could not be provisioned or confirmed. Check the provider before trying again.');
+        setVoiceProvisionState('unconfirmed');
+      }
+    } catch (e) {
+      if (generation !== voiceEpoch.current) return;
+      console.error("Failed to provision voice number", e);
+      setVoiceProvisionMessage('The phone number could not be provisioned or confirmed. Check the provider before trying again.');
+      setVoiceProvisionState('unconfirmed');
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <AppShell title="Workspace Settings">
+        <div className="flex h-64 items-center justify-center">
+          <div className="w-8 h-8 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
+        </div>
+      </AppShell>
+    );
+  }
+
+  return (
+    <AppShell title="Workspace Settings">
+      <div id="settings-screen" className="mx-auto max-w-4xl space-y-8 font-inter">
+        <header className="mb-8 p-6 glassmorphism border border-white/40 dark:border-white/10 shadow-sm">
+          <div className="text-3xl font-extrabold font-outfit text-[#1D1D1F] dark:text-[#F5F5F7] tracking-tight">Settings</div>
+          <p className="mt-2 text-sm text-gray-650 dark:text-gray-400">Manage integrations, local routing, communication rules, and advanced system security.</p>
+        </header>
+
+        {/* General Notifications Card */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <h2 className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">General Preferences</h2>
+          </div>
+          <div className="app-panel-body p-6 space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <label className="block">
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Timezone</span>
+                <select className="mt-1 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800" defaultValue="UTC">
+                  <option value="UTC">UTC</option>
+                  <option value="EST">EST</option>
+                  <option value="PST">PST</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Language</span>
+                <select className="mt-1 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800" defaultValue="en">
+                  <option value="en">English</option>
+                  <option value="es">Spanish</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden mt-8">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Global Sales</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Multi-currency handling for international orders.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-gray-900 dark:text-white">Automatically handle multi-currency payments and localize invoices.</h3>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" aria-label="Automatically handle multi-currency payments and localize invoices" className="sr-only peer" defaultChecked />
+                <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-300 dark:peer-focus:ring-indigo-800 rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-indigo-600"></div>
+              </label>
+            </div>
+          </div>
+        </section>
+
+
+        <SmsSettingsPanel />
+
+        <section className="app-panel p-6 grid gap-4 sm:grid-cols-2" aria-label="Other notification preferences">
+                <label className="flex items-center gap-3 p-3 rounded-xl border border-gray-100 hover:border-teal-200 bg-gray-50/30 cursor-pointer">
+                  <input
+                    aria-label="Enable Email Notifications"
+                    type="checkbox"
+                    checked={preferences.email_notifications || false}
+                    onChange={(e) => handlePreferenceChange("email_notifications", e.target.checked)}
+                    className="rounded border-gray-300 text-[#0f766e] focus:ring-[#0f766e] w-4 h-4 cursor-pointer"
+                  />
+                  <span className="text-sm font-medium text-gray-800">Enable Email Notifications</span>
+                </label>
+                <label className="flex items-center gap-3 p-3 rounded-xl border border-gray-100 hover:border-teal-200 bg-gray-50/30 cursor-pointer">
+                  <input
+                    aria-label="Enable Push Notifications"
+                    type="checkbox"
+                    checked={preferences.push_notifications || false}
+                    onChange={(e) => handlePreferenceChange("push_notifications", e.target.checked)}
+                    className="rounded border-gray-300 text-[#0f766e] focus:ring-[#0f766e] w-4 h-4 cursor-pointer"
+                  />
+                  <span className="text-sm font-medium text-gray-800">Enable Push Notifications</span>
+                </label>
+        </section>
+
+        {/* Local Delivery and Voice Receptionist side-by-side */}
+        <section className="app-grid two gap-6">
+          <div className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden flex flex-col justify-between">
+            <div>
+              <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+                <div>
+                  <h3 className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Local Delivery (DoorDash Drive)</h3>
+                  <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Configure delivery radius and rates.</div>
+                </div>
+              </div>
+              <div className="app-panel-body p-6 space-y-4">
+                <WithTooltip id="settings-delivery-tooltip" className="block w-full" defaultText="Turn this on to offer local delivery to your customers.">
+                  <label className="flex items-center justify-between rounded-xl border border-teal-55/60 p-4 text-sm font-medium text-gray-900 dark:text-white cursor-pointer bg-teal-50/10 hover:bg-teal-50/20 transition-colors">
+                    <span>Enable Local Delivery</span>
+                    <input
+                      aria-label="Enable Local Delivery"
+                      type="checkbox"
+                      checked={deliverySettings.delivery_enabled}
+                      onChange={(e) => handleDeliverySettingChange('delivery_enabled', e.target.checked)}
+                      className="rounded border-gray-300 text-[#0f766e] focus:ring-[#0f766e] w-5 h-5 cursor-pointer"
+                    />
+                  </label>
+                </WithTooltip>
+
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <label className="block">
+                    <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Delivery Radius (miles)</span>
+                    <input
+                      aria-label="Delivery Radius (miles)"
+                      type="number"
+                      step="0.1"
+                      value={deliverySettings.delivery_radius}
+                      onChange={(e) => handleDeliverySettingChange('delivery_radius', parseFloat(e.target.value))}
+                      disabled={!deliverySettings.delivery_enabled}
+                      className="mt-2 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800 disabled:bg-gray-50 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Flat Delivery Fee ($)</span>
+                    <input
+                      aria-label="Flat Delivery Fee ($)"
+                      type="number"
+                      step="0.01"
+                      value={deliverySettings.delivery_fee}
+                      onChange={(e) => handleDeliverySettingChange('delivery_fee', parseFloat(e.target.value))}
+                      disabled={!deliverySettings.delivery_enabled}
+                      className="mt-2 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800 disabled:bg-gray-50 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none"
+                    />
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden flex flex-col justify-between">
+            <div>
+              <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+                <div>
+                  <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Autonomous Voice Receptionist</div>
+                  <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Let OmniSolo handle your business calls.</div>
+                </div>
+              </div>
+              <div className="app-panel-body p-6 space-y-4">
+                {voiceAvailabilityMessage && <p aria-live="polite">{voiceAvailabilityMessage}</p>}
+                {voiceSettingMessage && <p aria-live="polite">{voiceSettingMessage}</p>}
+                <label className="flex items-center justify-between rounded-xl border border-teal-55/60 p-4 text-sm font-medium text-gray-900 dark:text-white cursor-pointer bg-teal-50/10 hover:bg-teal-50/20 transition-colors">
+                  <span>Enable AI Voice Receptionist</span>
+                  <input
+                    type="checkbox"
+                    aria-label="Enable AI Voice Receptionist"
+                    disabled={!voiceSettingsReady || voiceSettingSaving}
+                    checked={voiceSettings.voice_receptionist_enabled}
+                    onChange={(e) => handleVoiceSettingChange('voice_receptionist_enabled', e.target.checked)}
+                    className="rounded border-gray-300 text-[#0f766e] focus:ring-[#0f766e] w-5 h-5 cursor-pointer"
+                  />
+                </label>
+
+                {voiceSettings.voice_receptionist_enabled && (
+                  <div className="space-y-4 border-t border-gray-100 pt-4 animate-fade-in">
+                    <div className="grid grid-cols-1 gap-4">
+                                            <label className="block">
+                        <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Voice Persona</span>
+                        <select
+                          disabled={!voiceSettingsReady || voiceSettingSaving}
+                          value={voiceSettings.voice_receptionist_persona}
+                          onChange={(e) => handleVoiceSettingChange('voice_receptionist_persona', e.target.value)}
+                          className="mt-2 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none"
+                        >
+                          <option value="Friendly">Friendly & Casual</option>
+                          <option value="Professional">Professional & Crisp</option>
+                          <option value="Efficient">Fast & Efficient</option>
+                        </select>
+                      </label>
+
+                      <label className="block">
+                        <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Custom Instructions</span>
+                        <textarea
+                          disabled={!voiceSettingsReady || voiceSettingSaving}
+                          value={voiceSettings.voice_receptionist_instructions || ""}
+                          onChange={(e) => handleVoiceSettingChange('voice_receptionist_instructions', e.target.value)}
+                          placeholder="e.g. Always mention today's special: Vegan Chocolate Cake"
+                          rows={3}
+                          className="mt-2 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none resize-none"
+                        />
+                      </label>
+
+                      <div className="block">
+                        <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Phone number</span>
+                        <div className="mt-2 flex gap-2">
+                          <input
+                            aria-label="Phone number"
+                            type="text"
+                            readOnly
+                            value={voiceSettings.voice_receptionist_number || "Not assigned"}
+                            className="w-full rounded-xl border border-gray-200 bg-gray-55 px-4 py-2.5 text-sm text-gray-500 outline-none"
+                          />
+                          {!voiceSettings.voice_receptionist_number && (
+                            <button disabled={!voiceProvisionAllowed || voiceProvisionState !== 'idle'} onClick={handleProvisionVoiceNumber} className="px-4 py-2.5 bg-[#0f766e] hover:bg-[#0d645d] text-white font-bold rounded-xl shadow-md transition-all active:scale-95 text-xs whitespace-nowrap" type="button">
+                              Get Number
+                            </button>
+                          )}
+                        </div>
+                        {voiceProvisionMessage && <p role={voiceProvisionState === 'unconfirmed' ? 'alert' : 'status'}>{voiceProvisionMessage}</p>}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Agent Settings Card */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Agent Settings</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Configure your AI agent's identity.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6">
+            <label className="block max-w-md">
+              <span className="text-xs font-bold uppercase tracking-wider text-gray-400">Agent Name</span>
+              <input
+                type="text"
+                value={agentName}
+                onChange={(e) => handleAgentNameChange(e.target.value)}
+                className="mt-2 w-full rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm text-gray-800 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none"
+                placeholder="Agent One"
+              />
+            </label>
+          </div>
+        </section>
+
+        {/* Change Password Card */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Security & Credentials</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Update your account credentials regularly to keep data safe.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6 grid gap-4 max-w-md">
+            <input aria-label="Current Password" type="password" placeholder="Current Password" className="rounded-xl border border-gray-200 px-4 py-3 text-sm text-gray-800 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none" />
+            <input aria-label="New Password" type="password" placeholder="New Password" className="rounded-xl border border-gray-200 px-4 py-3 text-sm text-gray-800 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none" />
+            <input aria-label="Confirm Password" type="password" placeholder="Confirm Password" className="rounded-xl border border-gray-200 px-4 py-3 text-sm text-gray-800 focus:border-[#0f766e] focus:ring-2 focus:ring-teal-100 transition-all outline-none" />
+            <button onClick={() => router.push("/dashboard")} className="px-6 py-3 bg-[#0f766e] hover:bg-[#0d645d] text-white font-bold rounded-xl shadow-md transition-all active:scale-95 text-xs w-fit" type="button">
+              Save New Password
+            </button>
+          </div>
+        </section>
+
+
+        {/* Agent Harness Settings Section */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden mt-8">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Agent Harness Settings</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Configure advanced agent harness mechanics like lazy tool loading.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6 space-y-4">
+            <label className="flex items-center justify-between rounded-xl border border-gray-200 dark:border-gray-800 p-4 text-sm font-medium text-gray-900 dark:text-white cursor-pointer bg-white dark:bg-gray-900 transition-colors">
+              <div>
+                <span>Enable Lazy Tool Loading (Harness Thickness)</span>
+                <p className="text-xs text-gray-500 font-normal mt-1">Reduces initial context size by lazy-loading tools only when needed. Achieves up to 95% context reduction.</p>
+              </div>
+              <input
+                type="checkbox"
+                aria-label="Enable Lazy Tool Loading"
+                checked={enableLazyToolLoading}
+                  onChange={(e) => setEnableLazyToolLoading(e.target.checked)}
+                className="rounded border-gray-300 text-[#0f766e] focus:ring-[#0f766e] w-5 h-5 cursor-pointer"
+              />
+            </label>
+          </div>
+        </section>
+
+        {/* Local Sovereignty Section */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden mt-8">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Local Sovereignty &amp; Privacy</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Standalone workspaces keep operational data local with cloud telemetry disabled.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6 space-y-2">
+            <p className="text-sm text-gray-700 dark:text-gray-300">
+              Product telemetry is disabled in self-hosted single-tenant Community Edition workspaces.
+            </p>
+          </div>
+        </section>
+
+                {/* Integrations Section */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden mt-8">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Integrations</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Connect third-party tools and channels.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6 space-y-4">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">WhatsApp Setup (Twilio)</h3>
+              <p className="text-xs text-gray-500 mb-4">Connect your Twilio WhatsApp Business API to receive orders and inquiries directly in your Work Triage feed.</p>
+
+              <div className="space-y-3">
+                <input
+                  type="text"
+                  placeholder="Twilio Account SID"
+                  value={twilioAccountSid}
+                  onChange={(e) => setTwilioAccountSid(e.target.value)}
+                  className="w-full text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#0f766e]/50 transition-all placeholder-gray-400"
+                />
+                <input
+                  type="password"
+                  placeholder="Twilio Auth Token"
+                  value={twilioAuthToken}
+                  onChange={(e) => setTwilioAuthToken(e.target.value)}
+                  className="w-full text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#0f766e]/50 transition-all placeholder-gray-400"
+                />
+                <input
+                  type="text"
+                  placeholder="WhatsApp Phone Number (e.g., +1234567890)"
+                  value={twilioPhoneNumber}
+                  onChange={(e) => setTwilioPhoneNumber(e.target.value)}
+                  className="w-full text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-[#0f766e]/50 transition-all placeholder-gray-400"
+                />
+
+                <button
+                  onClick={handleConnectWhatsApp}
+                  disabled={twilioStatus === 'loading'}
+                  className="px-4 py-2 bg-[#0f766e] hover:bg-[#0f766e]/90 text-white font-bold rounded-lg shadow-sm transition-all active:scale-95 text-sm disabled:opacity-50"
+                >
+                  {twilioStatus === 'loading' ? 'Connecting...' : 'Connect WhatsApp'}
+                </button>
+                {twilioStatus === 'success' && <p className="text-xs text-green-600 mt-2">Connected successfully!</p>}
+                {twilioStatus === 'error' && <p className="text-xs text-red-600 mt-2">Failed to connect. Please check credentials.</p>}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {isAdmin && (
+          <AuthenticationSettingsPanel
+            onProviderChange={(provider, enabled) => void handleProviderChange(provider, enabled)}
+            onRegistrationModeChange={(mode) => void handleRegistrationModeChange(mode)}
+            providers={oidcProviders}
+            providerStatus={providerStatus}
+            registrationMode={registrationMode}
+            registrationStatus={registrationStatus}
+          />
+        )}
+
+        {/* Member Analytics Section */}
+        {isAdmin && (
+          <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden mt-8">
+            <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+              <div>
+                <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Member Analytics</div>
+                <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">Expose corporate and token usage costs across your workspace members.</div>
+              </div>
+            </div>
+            <div className="app-panel-body p-6">
+              {usageLogs.length === 0 ? (
+                <p className="text-sm text-gray-500 text-center py-4 font-outfit">No workspace member usage logged yet.</p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-800 text-sm font-outfit">
+                    <thead>
+                      <tr className="text-xs font-bold uppercase tracking-wider text-gray-400 text-left">
+                        <th className="pb-3 pr-4">Username</th>
+                        <th className="pb-3 px-4">Feature</th>
+                        <th className="pb-3 px-4 text-right">Tokens Used</th>
+                        <th className="pb-3 pl-4 text-right">Computed Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 dark:divide-gray-800/50">
+                      {usageLogs.map((log, index) => (
+                        <tr key={index} className="text-gray-700 dark:text-gray-300">
+                          <td className="py-3 pr-4 font-semibold">{log.username}</td>
+                          <td className="py-3 px-4 text-xs font-mono bg-gray-50 dark:bg-gray-800/30 rounded inline-block my-1">{log.feature}</td>
+                          <td className="py-3 px-4 text-right font-mono">{log.tokens_used.toLocaleString()}</td>
+                          <td className="py-3 pl-4 text-right font-mono text-green-600 dark:text-green-400">${log.computed_cost.toFixed(4)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* Advanced Section */}
+        <section className="app-panel glassmorphism border border-white/40 dark:border-white/10 hover:shadow-md transition-all duration-300 overflow-hidden mt-8">
+          <div className="app-panel-header border-b border-gray-100/50 bg-white/30 px-6 py-4">
+            <div>
+              <div className="app-panel-title text-base font-bold font-outfit text-gray-900 dark:text-white">Advanced Settings</div>
+              <div className="text-xs text-[#0f766e] dark:text-[#6ac5bd] mt-1">For custom integrations and developers.</div>
+            </div>
+          </div>
+          <div className="app-panel-body p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">API Documentation</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Interactive API reference for connecting external services to your workspace.</p>
+              </div>
+              <Link href="/api-docs" className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 dark:bg-gray-800 dark:hover:bg-gray-700 dark:text-gray-300 font-bold rounded-lg shadow-sm transition-all active:scale-95 text-xs">
+                View API Docs
+              </Link>
+            </div>
+
+            <div className="flex items-center justify-between pt-4 border-t border-gray-100 dark:border-gray-800">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Edge Cache & SEO Optimization</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Autonomous edge caching and agentic SEO pre-rendering are actively managing your storefront.</p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1" id="seo-recent-updates">{seoReports.length > 0 ? seoReports[0].plain_language_summary : ""}</p>
+              </div>
+              {hitRate && (
+                <div className="flex items-center space-x-2">
+                  <span className="text-xs font-mono text-green-600 bg-green-50 dark:bg-green-900/30 px-2 py-1 rounded" id="edge-cache-hit-rate">{hitRate}</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      </div>
+    </AppShell>
+  );
+}

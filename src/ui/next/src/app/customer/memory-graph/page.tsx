@@ -1,0 +1,210 @@
+"use client";
+import { Suspense } from "react";
+import { parseMemorySummary, type CustomerMemorySummary } from './memorySummary';
+import React, { useState, useEffect, useRef, useSyncExternalStore } from 'react';
+import { hasVerifiedOfflineQueueOwner, QUEUE_IDENTITY_EPOCH_KEY, readQueueOwner, subscribeQueueIdentityReadiness, type QueueOwner } from '@/lib/sync/queueIdentity';
+import { useSearchParams } from 'next/navigation';
+import { PoweredByOmniSolo } from '../../components/PoweredByOmniSolo';
+import { FaInstagram, FaRegEnvelope, FaStore, FaCalendarCheck, FaGlobe, FaRobot } from 'react-icons/fa';
+
+function CustomerMemoryGraphContent() {
+  const searchParams = useSearchParams();
+  const customerId = searchParams.get('customerId')?.trim() || null;
+  if (!customerId) {
+    return (
+      <div className="flex min-h-screen w-full items-center justify-center bg-gray-50 dark:bg-gray-900 p-4">
+        <section className="max-w-md space-y-4 text-center">
+          <h1 className="text-2xl font-bold">Choose a customer</h1>
+          <p>Open a customer conversation in your inbox to view the available customer context.</p>
+          <a href="/inbox" className="inline-block rounded-md bg-blue-600 px-4 py-2 text-white">Open inbox</a>
+        </section>
+      </div>
+    );
+  }
+  // A different selection must never commit the previous customer's state,
+  // including the render before passive effect cleanup/reset runs.
+  return <SelectedCustomerMemoryGraph key={customerId} customerId={customerId} />;
+}
+
+function SelectedCustomerMemoryGraph({ customerId }: { customerId: string }) {
+  const [owner, setOwner] = useState<QueueOwner | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<CustomerMemorySummary | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const identityReady = useSyncExternalStore(subscribeQueueIdentityReadiness,
+    () => owner !== null && hasVerifiedOfflineQueueOwner(owner), () => false);
+
+  useEffect(() => {
+    let active = true;
+    const retire = () => {
+      active = false;
+      request.current?.abort();
+      setOwner(null); setData(null);
+      setSessionError('Your session changed. Refresh to view customer history.');
+    };
+    const storage = (event: StorageEvent) => {
+      if (event.key === null || event.key === QUEUE_IDENTITY_EPOCH_KEY) retire();
+    };
+    window.addEventListener('omnisolo_auth_changed', retire);
+    window.addEventListener('pagehide', retire);
+    window.addEventListener('storage', storage);
+    void readQueueOwner().then(verified => {
+      if (active) setOwner(verified);
+    }).catch(() => {
+      if (active) setSessionError('Customer access could not be verified. Refresh to try again.');
+    });
+    return () => {
+      active = false; request.current?.abort();
+      window.removeEventListener('omnisolo_auth_changed', retire);
+      window.removeEventListener('pagehide', retire);
+      window.removeEventListener('storage', storage);
+    };
+  }, []);
+
+  useEffect(() => {
+    setData(null); setError(null); setLoading(true);
+    if (!owner || !identityReady) return;
+    const controller = new AbortController();
+    request.current = controller;
+    const current = () => !controller.signal.aborted && hasVerifiedOfflineQueueOwner(owner);
+    const fetchMemoryGraph = async () => {
+      try {
+        const headers = new Headers({ 'x-ohc-expected-user': owner.userId, 'x-ohc-expected-tenant': owner.tenantId });
+        const res = await fetch(`/api/v1/memory/summary/${encodeURIComponent(customerId)}`, {
+          headers, credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
+        });
+        if (res.status !== 200) throw new Error('Customer history unavailable');
+        const summary = parseMemorySummary(await res.json());
+        if (current()) setData(summary);
+      } catch {
+        if (current()) setError('Failed to fetch customer history.');
+      } finally {
+        if (current()) setLoading(false);
+      }
+    };
+    void fetchMemoryGraph();
+    return () => controller.abort();
+  }, [customerId, owner, identityReady]);
+
+  if (sessionError || (owner && !identityReady && hasVerifiedOfflineQueueOwner())) {
+    return <p role="status" className="p-6">{sessionError || 'Your session changed. Refresh to view customer history.'}</p>;
+  }
+
+  if (loading || !identityReady || !owner) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-gray-50 dark:bg-gray-900 p-4">
+        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-[#0066FF]"></div>
+        <span className="sr-only">Loading customer history...</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-gray-50 dark:bg-gray-900 p-4">
+        <div className="text-[#FF3B30]">{error}</div>
+      </div>
+    );
+  }
+
+  const interactions = data?.events ? data.events : (data?.interactions ? data.interactions : []);
+
+  const summary = data?.summary || "No summary available.";
+  const customerName = data?.customer_name || "Unknown Customer";
+
+  // Use context_graph if available
+  const contextGraph = data?.context_graph || null;
+
+  const getIcon = (type: string) => {
+    switch (type) {
+      case 'ig_dm': return <FaInstagram className="text-pink-500" />;
+      case 'email': return <FaRegEnvelope className="text-blue-500" />;
+      case 'store_visit': return <FaStore className="text-green-500" />;
+      case 'booking': return <FaCalendarCheck className="text-indigo-500" />;
+      case 'agent_reply': return <FaRobot className="text-[#0066FF]" />;
+      default: return <FaGlobe className="text-gray-500" />;
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen w-full bg-gray-50 dark:bg-gray-900 text-[#1D1D1F] dark:text-[#F5F5F7]">
+      <div className="flex-1 overflow-y-auto p-4 max-w-2xl mx-auto w-full space-y-6 pt-8 pb-20">
+
+        <div className="bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] p-6 shadow-sm rounded-xl">
+          <div className="flex items-center gap-4 mb-4">
+             <div className="w-16 h-16 rounded-full bg-indigo-100 dark:bg-indigo-900/50 flex items-center justify-center text-2xl font-bold text-[#0066FF]">
+               {customerName.charAt(0)}
+             </div>
+             <div>
+               <h1 className="text-2xl font-bold">Customer Context</h1>
+               {data?.segments && data.segments.map((s: string) => <span key={s} className="ml-1 inline-flex items-center rounded-md bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20">{s}</span>)}
+             </div>
+          </div>
+          <div className="mt-4 border-t border-gray-200 dark:border-gray-700 pt-4">
+            <h3 className="text-sm font-semibold mb-2">Agent Summary</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-300 leading-relaxed">
+              {summary}
+            </p>
+            <p className="text-xs text-gray-500 mt-2">{data?.total_interactions ?? interactions.length} total interactions recorded.</p>
+          </div>
+
+          {contextGraph && (
+            <div className="mt-4 border-t border-gray-200 dark:border-gray-700 pt-4">
+              <h3 className="text-sm font-semibold mb-2">Agentic Memory Graph</h3>
+              <pre className="text-xs bg-gray-100 dark:bg-gray-800 p-2 rounded-md overflow-x-auto text-gray-700 dark:text-gray-300">
+                {JSON.stringify(contextGraph, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
+
+        <div>
+           <h2 className="text-lg font-bold mb-4 ml-1">Timeline</h2>
+           <div className="space-y-4 relative before:absolute before:inset-0 before:ml-5 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-gray-300 dark:before:via-gray-700 before:to-transparent">
+
+             {interactions.length === 0 ? <div className="text-center p-4">No interaction history found.</div> : interactions.map((interaction, idx) => (
+               <div key={idx} className="relative flex items-center justify-between md:justify-normal md:odd:flex-row-reverse group is-active">
+                  <div className="flex items-center justify-center w-10 h-10 rounded-full border-2 border-white dark:border-gray-900 bg-white dark:bg-gray-800 text-gray-500 shadow shrink-0 md:order-1 md:group-odd:-translate-x-1/2 md:group-even:translate-x-1/2 z-10">
+                     {getIcon(interaction.channel || interaction.type || '')}
+                  </div>
+                  <div className="w-[calc(100%-4rem)] md:w-[calc(50%-2.5rem)] bg-[rgba(255,255,255,0.65)] dark:bg-[rgba(22,22,26,0.7)] backdrop-blur-[30px] backdrop-saturate-[210%] border border-[rgba(255,255,255,0.4)] dark:border-[rgba(255,255,255,0.1)] p-4 shadow-sm rounded-xl">
+                     <div className="flex items-center justify-between mb-1">
+                        <span className="font-bold text-sm">{interaction.channel || (interaction.type === 'agent_reply' ? 'OmniSolo Agent' : 'Customer')}</span>
+                        <time className="text-xs text-gray-500">{interaction.date || (interaction.created_at ? new Date(interaction.created_at).toLocaleString() : '')}</time>
+                     </div>
+                     <p className="text-sm text-gray-600 dark:text-gray-300">{interaction.description || interaction.raw_content}</p>
+                  </div>
+               </div>
+             ))}
+
+           </div>
+
+           <div className="mt-8 flex justify-center gap-4">
+               <button disabled aria-describedby="customer-action-limit" className="px-4 py-2 bg-blue-600 text-white rounded-md disabled:opacity-50">Draft Reply</button>
+               <button disabled aria-describedby="customer-action-limit" className="px-4 py-2 bg-red-600 text-white rounded-md disabled:opacity-50">Issue Refund</button>
+           </div>
+           <p id="customer-action-limit" className="mt-3 text-center text-sm text-gray-600 dark:text-gray-300">Reply and refund actions are not connected on this history page. No message or payment action has been performed.</p>
+        </div>
+
+      </div>
+      <div className="fixed bottom-4 left-0 right-0 flex justify-center z-50">
+          <PoweredByOmniSolo tenantId={owner.tenantId} />
+      </div>
+    </div>
+  );
+}
+
+export default function CustomerMemoryGraph() {
+  return (
+    <Suspense fallback={
+      <div className="flex h-screen w-full items-center justify-center bg-gray-50 dark:bg-gray-900 p-4">
+        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-[#0066FF]"></div>
+        <span className="sr-only">Loading customer history...</span>
+      </div>
+    }>
+      <CustomerMemoryGraphContent />
+    </Suspense>
+  );
+}

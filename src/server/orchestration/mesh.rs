@@ -1,0 +1,833 @@
+use ::server_omnisolo::orchestration::TeammateMeshEvent;
+use async_trait::async_trait;
+use omnisolo_builtin_agent::mesh::transport::{MeshTransport, Message};
+use opentelemetry::KeyValue;
+use opentelemetry::global;
+use opentelemetry::metrics::Counter;
+use opentelemetry::trace::Tracer;
+use std::sync::Arc;
+
+#[async_trait]
+pub trait P2PTransport: Send + Sync {
+    async fn handshake(
+        &self,
+        peer_id: &str,
+        spiffe_id: &str,
+        public_key: &str,
+        tenant_id: &str,
+    ) -> Result<bool, String>;
+    async fn broadcast_crdt_delta(
+        &self,
+        delta: ::server_omnisolo::orchestration::CrdtDelta,
+    ) -> Result<(), String>;
+    async fn discover_peers(&self, tenant_id: &str) -> Result<Vec<String>, String>;
+}
+
+#[async_trait]
+pub trait TeammateMesh: Send + Sync {
+    async fn publish(&self, topic: &str, payload: Vec<u8>) -> Result<(), String>;
+    async fn publish_with_ack(&self, topic: &str, payload: Vec<u8>) -> Result<(), String>;
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String>;
+
+    async fn subscribe_pattern(
+        &self,
+        pattern: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.subscribe(pattern, handler).await
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String>;
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String>;
+
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String>;
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String>;
+
+    async fn ping(&self) -> Result<(), String>;
+    async fn start_health_responder(&self) -> Result<Box<dyn Fn() + Send + Sync>, String>;
+
+    async fn publish_state_handoff(&self, payload: Vec<u8>) -> Result<(), String>;
+    async fn subscribe_state_handoff(
+        &self,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String>;
+}
+
+pub struct LocalTeammateMesh {
+    hub: Arc<crate::hub::Hub>,
+    inner: omnisolo_builtin_agent::mesh::transport::InProcessTransport,
+}
+
+impl LocalTeammateMesh {
+    pub fn new(hub: Arc<crate::hub::Hub>) -> Self {
+        Self {
+            hub,
+            inner: omnisolo_builtin_agent::mesh::transport::InProcessTransport::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl P2PTransport for LocalTeammateMesh {
+    async fn handshake(
+        &self,
+        peer_id: &str,
+        _spiffe_id: &str,
+        _public_key: &str,
+        tenant_id: &str,
+    ) -> Result<bool, String> {
+        if peer_id.trim().is_empty() || tenant_id.trim().is_empty() {
+            return Err("peer and tenant identity must be non-empty".to_string());
+        }
+
+        Ok(true)
+    }
+
+    async fn broadcast_crdt_delta(
+        &self,
+        _delta: ::server_omnisolo::orchestration::CrdtDelta,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn discover_peers(&self, _tenant_id: &str) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+}
+
+#[async_trait]
+impl MeshTransport for LocalTeammateMesh {
+    async fn publish(&self, topic: &str, message: TeammateMeshEvent) -> Result<(), String> {
+        let _ = self
+            .hub
+            .publish_teammate_event(topic.to_string(), message.clone())
+            .await;
+        self.inner.publish(topic, message).await
+    }
+
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        // Also subscribe to hub events? Wait, hub events are broadcasted to websocket clients.
+        // The transport is used for agent communication.
+        // LocalTeammateMesh is a transport for the agent to receive events, but it also broadcasts to the hub.
+        // But what about messages from the hub? Usually the hub doesn't receive teammate mesh events from websockets,
+        // it just broadcasts them. So we only need to subscribe to `inner`.
+        self.inner.subscribe(topic, handler).await
+    }
+
+    async fn subscribe_pattern(
+        &self,
+        pattern: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.inner.subscribe_pattern(pattern, handler).await
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        self.inner.acquire_lock(resource, owner, ttl_seconds).await
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        self.inner.release_lock(resource, owner).await
+    }
+
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        self.inner
+            .register_presence(agent_id, status, ttl_seconds)
+            .await
+    }
+
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.get_active_agents().await
+    }
+}
+
+pub struct CentrifugeNode {
+    transport: Arc<dyn MeshTransport>,
+    publish_counter: Counter<u64>,
+    receive_counter: Counter<u64>,
+}
+
+impl CentrifugeNode {
+    pub fn new(transport: Arc<dyn MeshTransport>) -> Self {
+        let meter = global::meter("ohc.orchestration.mesh");
+        let publish_counter = meter.u64_counter("mesh.messages.published").build();
+        let receive_counter = meter.u64_counter("mesh.messages.received").build();
+        Self {
+            transport,
+            publish_counter,
+            receive_counter,
+        }
+    }
+}
+
+#[async_trait]
+impl TeammateMesh for CentrifugeNode {
+    async fn publish(&self, topic: &str, payload: Vec<u8>) -> Result<(), String> {
+        let tracer = global::tracer("ohc.orchestration.mesh");
+        let _span = tracer.start("publish");
+        self.publish_counter
+            .add(1, &[KeyValue::new("topic", topic.to_string())]);
+        self.transport
+            .publish(
+                topic,
+                TeammateMeshEvent {
+                    agent_id: "sys".to_string(),
+                    action: topic.to_string(),
+                    status: "ok".to_string(),
+                    payload,
+                    msg_id: uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .await
+    }
+
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let receive_counter = self.receive_counter.clone();
+        let topic_str = topic.to_string();
+
+        let wrapped_handler = Box::new(move |msg: Message| {
+            receive_counter.add(1, &[KeyValue::new("topic", topic_str.clone())]);
+            handler(msg);
+        });
+
+        self.transport.subscribe(topic, wrapped_handler).await
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        self.transport
+            .acquire_lock(resource, owner, ttl_seconds)
+            .await
+    }
+
+    async fn subscribe_pattern(
+        &self,
+        pattern: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.receive_counter
+            .add(1, &[KeyValue::new("pattern", pattern.to_string())]);
+        self.transport.subscribe_pattern(pattern, handler).await
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        self.transport.release_lock(resource, owner).await
+    }
+
+    async fn publish_with_ack(&self, topic: &str, payload: Vec<u8>) -> Result<(), String> {
+        use prost::Message as ProstMessage;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let ack_topic = format!("system:job_ack:{}", job_id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let cancel = self
+            .transport
+            .subscribe(
+                &ack_topic,
+                Box::new(move |_msg| {
+                    let _ = tx.send(());
+                }),
+            )
+            .await?;
+
+        tokio::task::yield_now().await;
+
+        let dispatch = ::server_omnisolo::interop::JobDispatch {
+            job_id: job_id.clone(),
+            tenant_id: "default".to_string(),
+            action_name: topic.to_string(),
+            payload,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let mut buf = Vec::new();
+        dispatch.encode(&mut buf).map_err(|e| e.to_string())?;
+
+        let mut retries = 0;
+        let mut backoff = 200;
+
+        loop {
+            if retries > 10 {
+                cancel();
+                return Err("Failed to receive ack after retries".to_string());
+            }
+
+            let event = TeammateMeshEvent {
+                agent_id: "sys".to_string(),
+                action: topic.to_string(),
+                status: "pending".to_string(),
+                payload: buf.clone(),
+                msg_id: job_id.clone(),
+            };
+
+            if let Err(e) = self.transport.publish(topic, event).await {
+                cancel();
+                return Err(e);
+            }
+
+            if let Ok(Some(())) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(backoff), rx.recv()).await
+            {
+                cancel();
+                return Ok(());
+            }
+
+            retries += 1;
+            backoff = std::cmp::min(backoff * 2, 2000);
+        }
+    }
+
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        self.transport
+            .register_presence(agent_id, status, ttl_seconds)
+            .await
+    }
+
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        self.transport.get_active_agents().await
+    }
+
+    async fn ping(&self) -> Result<(), String> {
+        use prost::Message as ProstMessage;
+        let node_id = uuid::Uuid::new_v4().to_string();
+        let ping = ::server_omnisolo::interop::HealthPing {
+            source_node_id: node_id.clone(),
+            current_mode: 0,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let mut buf = Vec::new();
+        ping.encode(&mut buf).map_err(|e| e.to_string())?;
+
+        let ack_topic = format!("system:health_ack:{}", node_id);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = self
+            .transport
+            .subscribe(
+                &ack_topic,
+                Box::new(move |_msg| {
+                    let _ = tx.send(());
+                }),
+            )
+            .await?;
+
+        self.transport
+            .publish(
+                "system:health_ping",
+                TeammateMeshEvent {
+                    agent_id: "sys".to_string(),
+                    action: "system:health_ping".to_string(),
+                    status: "ok".to_string(),
+                    payload: buf,
+                    msg_id: uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .await?;
+
+        match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(_)) => {
+                cancel();
+                Ok(())
+            }
+            _ => {
+                cancel();
+                Err("Health ping timed out waiting for ack".to_string())
+            }
+        }
+    }
+
+    async fn start_health_responder(&self) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let transport_clone = self.transport.clone();
+
+        self.transport
+            .subscribe(
+                "system:health_ping",
+                Box::new(move |msg: Message| {
+                    use prost::Message as ProstMessage;
+                    if let Ok(ping) =
+                        ::server_omnisolo::interop::HealthPing::decode(&msg.payload[..])
+                    {
+                        let ack_topic = format!("system:health_ack:{}", ping.source_node_id);
+
+                        let ack = ::server_omnisolo::interop::HealthAck {
+                            source_node_id: "sys".to_string(),
+                            target_node_id: ping.source_node_id.clone(),
+                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        };
+                        let mut buf = Vec::new();
+                        if ack.encode(&mut buf).is_ok() {
+                            let t_clone = transport_clone.clone();
+                            let ack_topic_clone = ack_topic.clone();
+                            tokio::spawn(async move {
+                                let _ = t_clone
+                                    .publish(
+                                        &ack_topic_clone,
+                                        TeammateMeshEvent {
+                                            agent_id: "health_responder".to_string(),
+                                            action: ack_topic_clone.clone(),
+                                            status: "ok".to_string(),
+                                            payload: buf,
+                                            msg_id: uuid::Uuid::new_v4().to_string(),
+                                        },
+                                    )
+                                    .await;
+                            });
+                        }
+                    }
+                }),
+            )
+            .await
+    }
+
+    async fn publish_state_handoff(&self, payload: Vec<u8>) -> Result<(), String> {
+        self.publish("system:state_handoff", payload).await
+    }
+
+    async fn subscribe_state_handoff(
+        &self,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.subscribe("system:state_handoff", handler).await
+    }
+}
+
+pub async fn get_mesh_transport(
+    db_store: &crate::db::DbStore,
+) -> Result<Arc<dyn TeammateMesh>, String> {
+    match db_store {
+        crate::db::DbStore::Postgres => {
+            if let Ok(pg_url) = std::env::var("OMNISOLO_DATABASE_URL")
+                && (pg_url.starts_with("postgres://") || pg_url.starts_with("postgresql://"))
+            {
+                let node_id = super::node_identity::mesh_node_id(
+                    std::env::var("OMNISOLO_MESH_NODE_ID").ok().as_deref(),
+                    &crate::config::get_safe_user_dir().join("mesh"),
+                )?;
+                match omnisolo_builtin_agent::mesh::transport::PgTransport::new_with_subscriber_id(
+                    &pg_url, node_id,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        let t_clone = transport.clone();
+                        tokio::spawn(async move {
+                            t_clone.start_worker().await;
+                        });
+                        return Ok(Arc::new(CentrifugeNode::new(Arc::new(transport))));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Failed to initialize PgTransport");
+                    }
+                }
+            }
+            let transport = crate::orchestration::hub::MemoryMeshTransport::new();
+            Ok(Arc::new(CentrifugeNode::new(Arc::new(transport))))
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            if let Ok(pg_url) = std::env::var("OMNISOLO_DATABASE_URL")
+                && (pg_url.starts_with("postgres://") || pg_url.starts_with("postgresql://"))
+            {
+                let node_id = super::node_identity::mesh_node_id(
+                    std::env::var("OMNISOLO_MESH_NODE_ID").ok().as_deref(),
+                    &crate::config::get_safe_user_dir().join("mesh"),
+                )?;
+                match omnisolo_builtin_agent::mesh::transport::PgTransport::new_with_subscriber_id(
+                    &pg_url, node_id,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        let t_clone = transport.clone();
+                        tokio::spawn(async move {
+                            t_clone.start_worker().await;
+                        });
+                        return Ok(Arc::new(CentrifugeNode::new(Arc::new(transport))));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Failed to initialize PgTransport");
+                        // Fallback to memory
+                    }
+                }
+            }
+
+            match omnisolo_builtin_agent::mesh::transport::SqliteTransport::new(pool.clone()).await
+            {
+                Ok(transport) => {
+                    let t_clone = transport.clone();
+                    tokio::spawn(async move {
+                        t_clone.start_worker().await;
+                    });
+                    Ok(Arc::new(CentrifugeNode::new(Arc::new(transport))))
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Failed to initialize SqliteTransport");
+                    let transport = crate::orchestration::hub::MemoryMeshTransport::new();
+                    Ok(Arc::new(CentrifugeNode::new(Arc::new(transport))))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnisolo_builtin_agent::mesh::transport::InProcessTransport;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::time::{Duration, sleep};
+
+    struct LoopbackP2PTransport;
+
+    #[async_trait]
+    impl P2PTransport for LoopbackP2PTransport {
+        async fn handshake(
+            &self,
+            _peer_id: &str,
+            spiffe_id: &str,
+            _public_key: &str,
+            tenant_id: &str,
+        ) -> Result<bool, String> {
+            if !spiffe_id.trim().is_empty()
+                && spiffe_id.starts_with("peer://")
+                && tenant_id == "test_tenant"
+            {
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+
+        async fn broadcast_crdt_delta(
+            &self,
+            _delta: ::server_omnisolo::orchestration::CrdtDelta,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn discover_peers(&self, tenant_id: &str) -> Result<Vec<String>, String> {
+            if tenant_id == "test_tenant" {
+                Ok(vec!["peer_1".to_string(), "peer_2".to_string()])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_p2p_handshake_validation() {
+        let transport = LoopbackP2PTransport;
+        let valid_handshake = transport
+            .handshake(
+                "peer_1",
+                "peer://trust_domain/agent",
+                "pub_key",
+                "test_tenant",
+            )
+            .await
+            .unwrap();
+        assert!(valid_handshake);
+
+        let invalid_handshake = transport
+            .handshake("peer_1", "invalid_peer", "pub_key", "test_tenant")
+            .await
+            .unwrap();
+        assert!(!invalid_handshake);
+    }
+
+    #[tokio::test]
+    async fn test_p2p_peer_discovery() {
+        let transport = LoopbackP2PTransport;
+        let peers = transport.discover_peers("test_tenant").await.unwrap();
+        assert_eq!(peers.len(), 2);
+
+        let no_peers = transport.discover_peers("unknown_tenant").await.unwrap();
+        assert_eq!(no_peers.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_local_teammate_mesh_pubsub() {
+        if std::env::var("OMNISOLO_DATABASE_URL").is_err() {
+            return;
+        }
+        let db_url = std::env::var("OMNISOLO_DATABASE_URL").unwrap();
+        let pool = crate::db::secure_pg_pool_options()
+            .connect_lazy(&db_url)
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let hub = Arc::new(crate::hub::Hub::new(tx, pool));
+
+        let mesh = LocalTeammateMesh::new(hub.clone());
+
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        let _cancel = mesh
+            .subscribe(
+                "test_topic",
+                Box::new(move |msg: Message| {
+                    if msg.payload == b"hello world" {
+                        received_clone.store(true, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Also verify that the hub has the message
+        let mut hub_rx = hub.subscribe_teammate_mesh("test_topic".to_string()).await;
+
+        let event = TeammateMeshEvent {
+            agent_id: "test_agent".to_string(),
+            action: "test_action".to_string(),
+            status: "ok".to_string(),
+            payload: b"hello world".to_vec(),
+            msg_id: "msg_123".to_string(),
+        };
+
+        mesh.publish("test_topic", event.clone()).await.unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            received.load(Ordering::SeqCst),
+            "Should receive message published via LocalTeammateMesh"
+        );
+
+        if let Ok(hub_msg) = hub_rx.try_recv() {
+            assert_eq!(hub_msg.msg_id, "msg_123");
+        } else {
+            panic!("Hub did not receive the event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_centrifuge_node_pubsub() {
+        let transport: Arc<dyn MeshTransport> = Arc::new(InProcessTransport::new());
+        let node = CentrifugeNode::new(transport);
+
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        let _cancel = node
+            .subscribe(
+                "test_topic",
+                Box::new(move |msg: Message| {
+                    if msg.payload == b"hello world" {
+                        received_clone.store(true, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        node.publish("test_topic", b"hello world".to_vec())
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            received.load(Ordering::SeqCst),
+            "Should receive message published via CentrifugeNode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mesh_acquire_lock() {
+        let transport: Arc<dyn MeshTransport> = Arc::new(InProcessTransport::new());
+        let node = CentrifugeNode::new(transport);
+
+        let acquired = node
+            .acquire_lock("test_resource", "agent_1", 10)
+            .await
+            .unwrap();
+        assert!(acquired);
+
+        let acquired_again = node
+            .acquire_lock("test_resource", "agent_2", 10)
+            .await
+            .unwrap();
+        assert!(!acquired_again);
+
+        node.release_lock("test_resource", "agent_1").await.unwrap();
+
+        let acquired_after_release = node
+            .acquire_lock("test_resource", "agent_2", 10)
+            .await
+            .unwrap();
+        assert!(acquired_after_release);
+    }
+
+    #[tokio::test]
+    async fn test_mesh_register_presence() {
+        let transport: Arc<dyn MeshTransport> = Arc::new(InProcessTransport::new());
+        let node = CentrifugeNode::new(transport);
+
+        node.register_presence("agent_1", "online", 10)
+            .await
+            .unwrap();
+        node.register_presence("agent_2", "busy", 10).await.unwrap();
+
+        let mut agents = node.get_active_agents().await.unwrap();
+        agents.sort();
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0], ("agent_1".to_string(), "online".to_string()));
+        assert_eq!(agents[1], ("agent_2".to_string(), "busy".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_mesh_ping_pong() {
+        let transport: Arc<dyn MeshTransport> = Arc::new(InProcessTransport::new());
+        let node = CentrifugeNode::new(transport);
+
+        let _cancel_responder = node.start_health_responder().await.unwrap();
+
+        // Give the responder a moment to subscribe
+        sleep(Duration::from_millis(50)).await;
+
+        let result = node.ping().await;
+        assert!(result.is_ok(), "Ping should receive an ack successfully");
+    }
+
+    #[tokio::test]
+    async fn test_mesh_state_handoff() {
+        let transport: Arc<dyn MeshTransport> = Arc::new(InProcessTransport::new());
+        let node = CentrifugeNode::new(transport);
+
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        let _cancel = node
+            .subscribe_state_handoff(Box::new(move |msg| {
+                if msg.payload == b"state_data" {
+                    received_clone.store(true, Ordering::SeqCst);
+                }
+            }))
+            .await
+            .unwrap();
+
+        node.publish_state_handoff(b"state_data".to_vec())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            received.load(Ordering::SeqCst),
+            "Should receive state handoff message"
+        );
+    }
+    #[tokio::test]
+    async fn test_get_mesh_transport_sqlite_memory() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let db_store = crate::db::DbStore::Sqlite(pool);
+
+        let mesh_res = super::get_mesh_transport(&db_store).await;
+        assert!(mesh_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_mesh_transport_sqlite_file() {
+        if std::env::var("NATS_URL").is_ok() {
+            return;
+        }
+
+        let tmp_dir = std::env::var("TEST_TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        let db_path = format!(
+            "{}/test_mesh_ipc_file_{}.sqlite",
+            tmp_dir,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let db_url = format!("sqlite://{}", db_path);
+
+        std::fs::File::create(&db_path).unwrap();
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&db_url)
+            .await
+            .unwrap();
+
+        let db_store = crate::db::DbStore::Sqlite(pool);
+
+        let mesh_res = super::get_mesh_transport(&db_store).await;
+        assert!(mesh_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mesh_concurrent_lock_acquisition() {
+        let _ = crate::telemetry::get_mcp_tool_calls_counter();
+        let transport: Arc<dyn MeshTransport> = Arc::new(InProcessTransport::new());
+        let node = Arc::new(CentrifugeNode::new(transport));
+
+        let mut handles = vec![];
+        let success_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for i in 0..20 {
+            let n = node.clone();
+            let c = success_count.clone();
+            handles.push(tokio::spawn(async move {
+                let agent_id = format!("agent_{}", i);
+                if n.acquire_lock("concurrent_resource", &agent_id, 10)
+                    .await
+                    .unwrap()
+                {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        assert_eq!(success_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+// dummy validation comment

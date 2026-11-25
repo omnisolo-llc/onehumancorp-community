@@ -1,0 +1,367 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::collapsible_if,
+    clippy::useless_vec
+)]
+/// Master Catalog B.2. Tools
+use omnisolo_builtin_agent_core::types::ToolError;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+pub mod bash;
+pub mod edit;
+pub mod glob;
+pub mod grep;
+mod html_parser;
+pub mod network_policy;
+pub mod python;
+pub mod read;
+pub mod runner;
+pub mod sendmessage;
+pub mod tenant;
+pub mod webfetch;
+pub mod websearch;
+pub mod workspace_path;
+pub mod write;
+
+pub mod agent_tool;
+pub mod anthropic_memory;
+pub mod binary_dist;
+pub mod booking;
+pub mod browser;
+pub mod browser_proxy;
+pub mod checkout;
+pub mod create_skill;
+pub mod desktop;
+pub mod expert_team_tool;
+pub mod finance;
+pub mod find;
+pub mod generative_visibility;
+pub mod head;
+pub mod hybrid_blob;
+pub mod lazy_load;
+pub mod llm_judge;
+pub mod local_fs_sync;
+pub mod magentic;
+pub mod marketing;
+pub mod marketplace;
+pub mod marketplace_tool;
+pub mod mcp_dynamic;
+pub mod ollama;
+pub mod pydantic;
+pub mod quote;
+pub mod recall;
+pub mod repo_map;
+pub mod restic;
+pub mod skill;
+pub mod sleep;
+pub mod subagent;
+pub mod superpowers_tool;
+pub mod tail;
+pub mod task;
+pub mod toolsearch;
+pub mod workflow;
+
+#[async_trait::async_trait]
+impl ToolExecutor for omnisolo_builtin_agent_core::code_native::CodeNativeAdapter {
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        self.execute_adapter(args).await
+    }
+}
+
+/// A tool definition and executor — mirrors Go builtin.Tool.
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    pub is_read_only: bool,
+    pub parameters: Value,
+    pub execute: Arc<dyn ToolExecutor>,
+}
+
+impl std::fmt::Debug for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tool({})", self.name)
+    }
+}
+
+impl Clone for Tool {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            is_read_only: self.is_read_only,
+            parameters: self.parameters.clone(),
+            execute: self.execute.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ToolExecutor: Send + Sync {
+    async fn execute(&self, args: Value) -> Result<String, ToolError>;
+}
+
+/// Shared todo list state.
+///
+/// Shared task store state.
+pub type SharedTaskStore = Arc<RwLock<task::TaskStore>>;
+
+/// Shared mailbox for SendMessage.
+pub type SharedMailbox = Arc<RwLock<sendmessage::Mailbox>>;
+
+/// Build the default set of all tools.
+pub fn all_tools(
+    agent_llm: Option<std::sync::Arc<dyn omnisolo_builtin_agent_llm::LlmClient>>,
+    llm: Option<std::sync::Arc<dyn omnisolo_builtin_agent_core::expert_team::ExpertTeamLlmClient>>,
+    native_env: Option<
+        Arc<
+            tokio::sync::RwLock<omnisolo_builtin_agent_core::code_native::RichExecutionEnvironment>,
+        >,
+    >,
+
+    task_store: SharedTaskStore,
+    mailbox: SharedMailbox,
+    working_dir: Option<std::path::PathBuf>,
+    memory_accessor: Option<Arc<dyn anthropic_memory::MemoryAccessor>>,
+    observation_store: Arc<dashmap::DashMap<String, String>>,
+    tenant: tenant::TenantContext,
+) -> Vec<Tool> {
+    let runner = Arc::new(runner::SandboxedCommandRunner::new(working_dir.clone()));
+    let booking_store = Arc::new(RwLock::new(booking::BookingStore::default()));
+    let (browser_observe, browser_act, _) =
+        browser::browser_tools(working_dir.clone(), runner.clone());
+    let mut tools = vec![
+        repo_map::repomap_tool(working_dir.clone()),
+        bash::bash_tool(working_dir.clone(), runner.clone()),
+        python::python_tool(working_dir.clone(), runner.clone()),
+        read::read_tool(working_dir.clone()),
+        head::head_tool(working_dir.clone()),
+        tail::tail_tool(working_dir.clone()),
+        find::find_tool(working_dir.clone()),
+        write::write_tool(working_dir.clone(), runner.clone()),
+        edit::edit_tool(working_dir.clone(), runner.clone()),
+        glob::glob_tool(working_dir.clone()),
+        grep::grep_tool(working_dir.clone()),
+        webfetch::webfetch_tool(),
+        websearch::websearch_tool(),
+        booking::booking_get_services_tool(booking_store.clone(), tenant.clone()),
+        booking::booking_upsert_service_tool(booking_store.clone(), tenant.clone()),
+        booking::booking_list_appointments_tool(booking_store.clone(), tenant.clone()),
+        booking::booking_create_appointment_tool(booking_store.clone(), tenant.clone()),
+        booking::booking_negotiate_time_tool(booking_store.clone(), tenant.clone()),
+        booking::booking_reschedule_tool(booking_store.clone(), tenant.clone()),
+        sendmessage::sendmessage_tool(mailbox.clone()),
+        toolsearch::toolsearch_tool(),
+        task::task_create_tool(task_store.clone()),
+        task::task_get_tool(task_store.clone()),
+        task::task_list_tool(task_store.clone()),
+        task::task_update_tool(task_store.clone()),
+        agent_tool::agent_stop_tool(),
+        agent_tool::agent_status_tool(),
+        sleep::sleep_tool(),
+        marketing::qr_generate_tool(),
+        finance::finance_report_tool(),
+        local_fs_sync::local_fs_sync_tool(working_dir.clone()),
+        ollama::ollama_tool(),
+        subagent::subagent_tool(runner.clone(), llm.clone()),
+        workflow::workflow_tool(runner.clone()),
+        hybrid_blob::hybrid_blob_tool(working_dir.clone(), tenant.clone()),
+        browser_observe,
+        browser_act,
+        generative_visibility::generative_visibility_tool(),
+        magentic::magentic_tool(task_store.clone()),
+        recall::recall_observation_tool(observation_store),
+        mcp_dynamic::mcp_discover_tool(
+            std::env::var("MCP_GATEWAY_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+        ),
+        mcp_dynamic::mcp_invoke_tool(
+            std::env::var("MCP_GATEWAY_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+        ),
+        checkout::conversational_checkout_tool(),
+        quote::generate_quote_tool(booking_store, tenant),
+        aider_pair_programming::aider_pair_programming_tool(),
+        superpowers_tool::superpowers_skill_tool(),
+    ];
+    if restic::restic_tools_enabled() {
+        tools.push(restic::restic_tool(working_dir.clone(), runner.clone()));
+    }
+    tools.extend(desktop::desktop_tools(working_dir, runner));
+
+    if let Some(llm) = agent_llm {
+        tools.push(llm_judge::llm_judge_tool(llm, "gemini-2.5-pro".to_string()));
+    }
+
+    if let Some(env) = native_env {
+        tools.push(native_state::native_memory_stash_tool(env));
+    }
+
+    if let Some(accessor) = memory_accessor {
+        tools.push(anthropic_memory::topic_retrieve_tool(accessor.clone()));
+        tools.push(anthropic_memory::transcript_search_tool(accessor.clone()));
+        tools.push(anthropic_memory::cross_session_search_tool(
+            accessor.clone(),
+        ));
+        tools.push(anthropic_memory::topic_write_tool(accessor));
+    }
+
+    tools
+}
+
+mod aider_pair_programming;
+pub mod native_state;
+pub use aider_pair_programming::aider_pair_programming_tool;
+
+#[cfg(test)]
+mod marketing_test;
+
+#[cfg(test)]
+mod finance_test;
+
+#[cfg(test)]
+mod tenant_capability_test {
+    use super::tenant::TenantContext;
+
+    #[test]
+    fn tenant_context_trims_and_preserves_the_assigned_organization() {
+        let tenant = TenantContext::new("  org-a  ").expect("valid organization");
+
+        assert_eq!(tenant.as_str(), "org-a");
+    }
+
+    #[test]
+    fn tenant_context_rejects_an_empty_organization() {
+        assert!(TenantContext::new("   ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tenant_aware_tool_schema_test {
+    use super::{Tool, booking, quote, tenant::TenantContext};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn assert_tenant_is_not_model_selectable(tool: &Tool) {
+        let properties = tool.parameters["properties"]
+            .as_object()
+            .expect("tool properties");
+        assert!(
+            !properties.contains_key("tenant_id"),
+            "{} exposes tenant_id to the model",
+            tool.name
+        );
+        assert!(
+            !tool.parameters["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|field| field.as_str() == Some("tenant_id")),
+            "{} requires a model-selected tenant_id",
+            tool.name
+        );
+    }
+
+    #[test]
+    fn tenant_aware_tool_schemas_do_not_expose_tenant_selection() {
+        let store = Arc::new(RwLock::new(booking::BookingStore::default()));
+        let tenant = TenantContext::new("org-a").expect("tenant");
+        let tools = vec![
+            booking::booking_get_services_tool(store.clone(), tenant.clone()),
+            booking::booking_upsert_service_tool(store.clone(), tenant.clone()),
+            booking::booking_list_appointments_tool(store.clone(), tenant.clone()),
+            booking::booking_create_appointment_tool(store.clone(), tenant.clone()),
+            booking::booking_negotiate_time_tool(store.clone(), tenant.clone()),
+            booking::booking_reschedule_tool(store.clone(), tenant.clone()),
+            quote::generate_quote_tool(store, tenant),
+        ];
+
+        for tool in &tools {
+            assert_tenant_is_not_model_selectable(tool);
+        }
+    }
+
+    #[test]
+    fn all_tools_registers_agent_browser_and_gates_agent_desktop_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_tools = || {
+            super::all_tools(
+                None,
+                None,
+                None,
+                std::sync::Arc::new(tokio::sync::RwLock::new(super::task::TaskStore::default())),
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    super::sendmessage::Mailbox::default(),
+                )),
+                Some(dir.path().to_path_buf()),
+                None,
+                std::sync::Arc::new(dashmap::DashMap::new()),
+                TenantContext::new("org-a").expect("tenant"),
+            )
+        };
+
+        temp_env::with_vars(
+            [
+                ("OMNISOLO_ENABLE_AGENT_DESKTOP", None::<&str>),
+                ("OMNISOLO_ENABLE_RESTIC_BACKUP", None::<&str>),
+                ("OMNISOLO_EXECUTION_MODE", Some("standalone")),
+                ("OMNISOLO_AGENT_DISABLE_TOOLS", None::<&str>),
+            ],
+            || {
+                let tools = make_tools();
+                assert!(!tools.iter().any(|t| t.name == "Screenshot"));
+                assert!(
+                    tools
+                        .iter()
+                        .any(|t| t.name == "BrowserObserve" && t.is_read_only)
+                );
+                assert!(
+                    tools
+                        .iter()
+                        .any(|t| t.name == "BrowserAct" && !t.is_read_only)
+                );
+                assert!(!tools.iter().any(|t| t.name == "DesktopObserve"));
+                assert!(!tools.iter().any(|t| t.name == "DesktopAct"));
+                assert!(!tools.iter().any(|t| t.name == "ResticBackup"));
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                ("OMNISOLO_ENABLE_AGENT_DESKTOP", Some("true")),
+                ("OMNISOLO_ENABLE_RESTIC_BACKUP", Some("true")),
+                ("OMNISOLO_EXECUTION_MODE", Some("standalone")),
+                ("OMNISOLO_AGENT_EXECUTION_MODE", None::<&str>),
+                ("OMNISOLO_SOURCE_MODE", None::<&str>),
+                ("OMNISOLO_STANDALONE_MODE", None::<&str>),
+                ("OMNISOLO_AGENT_COMMAND_BACKEND", None::<&str>),
+                ("OMNISOLO_AGENT_SANDBOX_BACKEND", None::<&str>),
+            ],
+            || {
+                let tools = make_tools();
+                assert!(
+                    tools
+                        .iter()
+                        .any(|t| t.name == "DesktopObserve" && t.is_read_only)
+                );
+                assert!(
+                    tools
+                        .iter()
+                        .any(|t| t.name == "DesktopAct" && !t.is_read_only)
+                );
+                assert!(
+                    tools
+                        .iter()
+                        .any(|t| t.name == "ResticBackup" && !t.is_read_only)
+                );
+            },
+        );
+    }
+}
+
+pub mod agent_protocol;
+#[cfg(test)]
+mod agent_protocol_test;
+#[cfg(test)]
+mod glob_test;

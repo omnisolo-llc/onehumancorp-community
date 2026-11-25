@@ -1,0 +1,58 @@
+import { test, expect } from '@playwright/test';
+
+test.describe('scratch off Generator', () => {
+  test('generates scratch off widget embed code', async ({ page }) => {
+    await page.goto('/viral-scratch-off-generator');
+    await expect(page.locator('h1').filter({ hasText: 'scratch off Generator 🎡' })).toBeVisible();
+    await expect(page.locator('h3').filter({ hasText: 'scratch off!' })).toBeVisible();
+    await expect(page.locator('button').filter({ hasText: 'SCRATCH NOW' })).toBeVisible();
+
+    await page.fill('input[placeholder="10%, 20%, Free Shipping"]', '10%, 20%, 30%');
+    await page.click('button:has-text("Generate Widget")');
+
+    await expect(page.locator('h2').filter({ hasText: 'Embed scratch off' })).toBeVisible();
+
+    const embedCode = await page.inputValue('textarea');
+    expect(embedCode).toContain('10%');
+    expect(embedCode).toContain('20%');
+    expect(embedCode).toContain('30%');
+    expect(embedCode).toContain('OmniSolo');
+  });
+
+  test('unlocks branding removal without a soft paywall in Community Edition', async ({ page }) => {
+    await page.goto('/viral-scratch-off-generator');
+    const removeBrandingToggle = page.getByRole('checkbox', { name: 'Remove OmniSolo Branding' });
+    await expect(removeBrandingToggle).toBeChecked();
+
+    await page.click('input[type="checkbox"] + div');
+    await expect(page.locator('h2').filter({ hasText: 'Upgrade to Pro' })).toHaveCount(0);
+
+    await page.click('button:has-text("Generate Widget")');
+    await expect(page.locator('h2').filter({ hasText: 'Embed scratch off' })).toBeVisible();
+    const embedCode = await page.inputValue('textarea');
+    expect(embedCode).not.toContain('Powered by OmniSolo');
+  });
+
+  test('can close the embed code modal', async ({ page }) => {
+    await page.goto('/viral-scratch-off-generator');
+    await page.click('button:has-text("Generate Widget")');
+    await expect(page.locator('h2').filter({ hasText: 'Embed scratch off' })).toBeVisible();
+
+    // Click the Close button
+    await page.click('button:has-text("Close")');
+    await expect(page.locator('h2').filter({ hasText: 'Embed scratch off' })).toBeHidden();
+  });
+
+  test('generates widget with default prizes if none specified', async ({ page }) => {
+    await page.goto('/viral-scratch-off-generator');
+    // Generate without typing anything
+    await page.click('button:has-text("Generate Widget")');
+
+    await expect(page.locator('h2').filter({ hasText: 'Embed scratch off' })).toBeVisible();
+
+    const embedCode = await page.inputValue('textarea');
+    expect(embedCode).toContain('10%');
+    expect(embedCode).toContain('20%');
+    expect(embedCode).toContain('Free Shipping');
+  });
+});

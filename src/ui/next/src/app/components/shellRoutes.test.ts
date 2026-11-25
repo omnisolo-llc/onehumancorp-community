@@ -1,0 +1,138 @@
+import { describe, expect, test } from "vitest";
+import { resolveShellRoute } from "./shellRoutes";
+
+describe("resolveShellRoute", () => {
+  test.each([
+    "/onboarding",
+    "/settings/global-commerce",
+    "/booking-widget",
+    "/client-portal",
+    "/storefront-widget",
+    "/website-builder",
+    "/actor-model",
+    "/api-docs",
+    "/changelog",
+    "/help",
+  ])("assigns formerly standalone route %s to the guard", (pathname) => {
+    expect(resolveShellRoute(pathname).owner).toBe("guard");
+  });
+
+  test.each(["/login", "/register", "/verify-email"])(
+    "assigns public route %s to the public layout",
+    (pathname) => {
+      expect(resolveShellRoute(pathname).owner).toBe("public");
+    },
+  );
+
+  test.each([
+    "/action-center",
+    "/agent-activity",
+    "/ai-workspace",
+    "/analytics",
+    "/assistant",
+    "/business-analytics",
+    "/business-setup",
+    "/dashboard",
+    "/dashboard/growth/affiliates",
+    "/dashboard/growth/reputation",
+    "/diagnostics",
+    "/embed-builder",
+    "/feed",
+    "/finance",
+    "/inbox",
+    "/integrations",
+    "/inventory",
+    "/kairos",
+    "/kitchen",
+    "/lead-magnet-generator",
+    "/milestones",
+    "/operations",
+    "/orders",
+    "/perplexity-harness",
+    "/pipeline",
+    "/products",
+    "/services",
+    "/settings",
+    "/settings/referrals",
+    "/staff",
+    "/staff/manager",
+    "/tasks",
+    "/triage",
+    "/viral-product-widget",
+  ])("assigns exact shell-owning route %s to the page", (pathname) => {
+    expect(resolveShellRoute(pathname).owner).toBe("page");
+  });
+
+  test.each(["/dashboard/campaigns", "/orders/example-id", "/proposals/example", "/quotes/example"])(
+    "uses page ownership for shell-owning descendant %s",
+    (pathname) => {
+      expect(resolveShellRoute(pathname).owner).toBe("page");
+    },
+  );
+
+  test.each([
+    ["/dashboard/bookings", "Dashboard"],
+    ["/dashboard/daily-work", "Dashboard"],
+    ["/dashboard/ledger", "Dashboard"],
+    ["/dashboard/receipt", "Dashboard"],
+    ["/products/new", "Products"],
+    ["/proposals/new", "Proposals"],
+    ["/proposals/customer-view", "Proposals"],
+    ["/services/new", "Services"],
+  ])("assigns shell-less descendant %s to the guard", (pathname, title) => {
+    expect(resolveShellRoute(pathname)).toEqual({
+      owner: "guard",
+      title,
+      subtitle: "Use this workspace from the dashboard navigation.",
+    });
+  });
+
+  test.each(["/agents", "/visual-workflow", "/payments", "/pos"])(
+    "assigns shell-less workspace route %s to the guard",
+    (pathname) => {
+      expect(resolveShellRoute(pathname).owner).toBe("guard");
+    },
+  );
+
+  test("derives metadata for unknown routes", () => {
+    expect(resolveShellRoute("/new-feature")).toEqual({
+      owner: "guard",
+      title: "New Feature",
+      subtitle: "Use this workspace from the dashboard navigation.",
+    });
+  });
+
+  test.each([
+    ["/onboarding", "Setup", "Configure your business workspace."],
+  ])("uses explicit metadata for %s", (pathname, title, subtitle) => {
+    expect(resolveShellRoute(pathname)).toEqual({
+      owner: pathname === "/login" ? "public" : "guard",
+      title,
+      subtitle,
+    });
+  });
+
+  test("keeps login metadata on its standalone public surface", () => {
+    expect(resolveShellRoute("/login")).toEqual({
+      owner: "public",
+      title: "Login",
+      subtitle: "Access your business workspace.",
+    });
+  });
+
+  test("does not assign page ownership to a near-prefix route", () => {
+    expect(resolveShellRoute("/dashboarding")).toEqual({
+      owner: "guard",
+      title: "Dashboarding",
+      subtitle: "Use this workspace from the dashboard navigation.",
+    });
+  });
+
+  test("safely resolves a null pathname to the dashboard shell", () => {
+    expect(resolveShellRoute(null)).toEqual({
+      owner: "guard",
+      title: "Dashboard",
+      subtitle: "Use this workspace from the dashboard navigation.",
+    });
+  });
+});

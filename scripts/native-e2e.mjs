@@ -1,0 +1,306 @@
+import { spawn, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { createWriteStream, existsSync } from 'node:fs';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import path from 'node:path';
+import os from 'node:os';
+import { validateWebArtifact } from './package-web.mjs';
+import { runNativeCommand } from './native-process.mjs';
+import clickCoverage from './ui-click-audit.cjs';
+import browserShards from './browser-shards.cjs';
+import { verifiedFixtureDatabaseUrl } from './e2e-fixture-database.mjs';
+import { verifyProductionFixtureBoundary } from './verify-production-fixture-boundary.mjs';
+import { startShippoBrowserFixture } from './shippo-browser-fixture.mjs';
+import { reserveServicePorts } from './native-port-reservations.mjs';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(path.join(root, 'package.json'));
+const postgresImage = 'pgvector/pgvector:pg15@sha256:18d16372b8406bb38a9f94cbff15d125c463d71fde2770aa8b5c64bfcc1578ee';
+const valkeyImage = 'valkey/valkey:8-alpine@sha256:94365b275456ae14621001c03556c732b1d93a0cdeacc317d1bdd52eba680885';
+
+// Deliberately do not load .env or inherit model/payment/production credentials.
+export function testEnvironment(source = process.env) {
+  const keep = ['PATH', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'WINDIR', 'TMP', 'TEMP',
+    'TMPDIR', 'LANG', 'LC_ALL', 'CI', 'PLAYWRIGHT_BROWSERS_PATH',
+    'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'];
+  return Object.fromEntries(keep.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]));
+}
+
+export function nativeBinaryPaths(repository = root, environment = process.env, platform = process.platform) {
+  const configured = environment.CARGO_TARGET_DIR;
+  if (configured !== undefined && !configured.trim()) {
+    throw new Error('CARGO_TARGET_DIR must be a nonempty directory');
+  }
+  const directory = path.resolve(repository, configured ?? 'target', 'debug');
+  const suffix = platform === 'win32' ? '.exe' : '';
+  return {
+    server: path.join(directory, `server${suffix}`),
+    agent: path.join(directory, `omnisolo-builtin-agent${suffix}`),
+  };
+}
+
+function command(executable, args, options = {}) {
+  return runNativeCommand(executable, args, { cwd: root, ...options });
+}
+
+async function waitHttp(url, child, seconds = 120, signal) {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    signal?.throwIfAborted();
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Local process exited before ${url} was ready`);
+    try {
+      const timeout = AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - Date.now())));
+      const response = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout, redirect: 'manual' });
+      await response.body?.cancel();
+      if (response.ok) return;
+    } catch { signal?.throwIfAborted(); }
+    await delay(Math.max(1, Math.min(1000, deadline - Date.now())), undefined, { signal });
+  }
+  throw new Error(`Local test service did not become ready: ${url}`);
+}
+
+async function stop(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGTERM');
+  for (let i = 0; i < 30 && child.exitCode === null && child.signalCode === null; i++) await delay(100);
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+}
+
+export async function finishShippoBrowserFixture(fixture, cleanup, runFailed) {
+  let closeError;
+  try { await fixture?.close(); } catch (error) { closeError = error; }
+  // Provider teardown must not prevent removal of this run's database/cache or
+  // temporary state. Keep an existing application/test failure as the primary one.
+  await cleanup();
+  if (closeError && !runFailed) throw closeError;
+  return closeError;
+}
+
+export function nativeDiscoveryArgs(playwright, args) {
+  // Discovery must never invoke HTML reporting: its default output cleanup
+  // would remove evidence from earlier logical executions in this job.
+  return [playwright, 'test', '--config', 'playwright.config.ts', '--list', '--reporter=list', ...args.filter(arg => arg !== '--list')];
+}
+
+export async function runNativeE2e(inputArgs = process.argv.slice(2), logicalContext) {
+  const ciSelection = inputArgs.includes('--ci');
+  let args = inputArgs.filter((arg) => arg !== '--ci');
+  if (args.some((arg) => arg === '--pass-with-no-tests')) throw new Error('Zero-test success is not allowed');
+  const completeSelection = clickCoverage.completeSelection(args);
+  if (ciSelection && !completeSelection) throw new Error('Required CI cannot narrow or override the complete browser selection');
+  const env = testEnvironment();
+  env.PLAYWRIGHT_TEST_DIR = './src';
+  env.PLAYWRIGHT_LIST_REPORTER = '1';
+  if (ciSelection) env.CI = 'true';
+  const playwright = require.resolve('@playwright/test/cli');
+  const groupFlag = args.find(arg => arg.startsWith('--grouped-shard='));
+  if (args.includes('--grouped-shard')) throw new Error('Use --grouped-shard=N/3');
+  if (groupFlag) {
+    if (!completeSelection) throw new Error('Grouped browser runs require the complete selection');
+    const index = Number(groupFlag.match(/^--grouped-shard=([1-3])\/3$/)?.[1]);
+    args = args.filter(arg => arg !== groupFlag);
+    const execution = new AbortController();
+    const interrupt = () => execution.abort(new Error('Grouped browser execution cancelled'));
+    process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
+    try {
+      const coverage = clickCoverage.makeRunContext(root, process.env);
+      return await browserShards.runGroupedUnits({ index, source: {commit:coverage.commit, sourceDigest:coverage.sourceDigest}, signal: execution.signal,
+        list: selection => browserShards.readDiscovery(filename => command(process.execPath, [playwright, 'test', '--config', 'playwright.config.ts',
+          '--list', '--reporter', './scripts/browser-inventory-reporter.cjs', ...args, ...selection],
+        { env: { ...env, OHC_BROWSER_INVENTORY_OUTPUT: filename }, signal: execution.signal, quiet: true })),
+        runUnit: (logical, context) => runNativeE2e([...inputArgs.filter(arg => arg !== groupFlag), `--shard=${logical}/12`], {...context, coverage}),
+      });
+    } finally {
+      process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
+    }
+  }
+
+  // Fail on broken imports, invalid fixtures or zero selection BEFORE spending
+  // time starting Docker, applying migrations or launching either application.
+  const listed = await command(process.execPath, nativeDiscoveryArgs(playwright, args), { env, signal: logicalContext?.signal });
+  if (!/Total:\s*[1-9]\d* tests?/.test(listed)) throw new Error('Playwright selected zero tests or did not report its test count');
+  if (args.includes('--list')) return;
+  // Respect the native Cargo output directory instead of silently executing
+  // stale default-directory binaries after a custom-target build.
+  const { server, agent } = nativeBinaryPaths();
+  const web = path.join(root, 'target/native-web/src/ui/next/server.js');
+  for (const required of [server, agent, web]) if (!existsSync(required)) {
+    throw new Error(`Required native test input missing: ${required}. Build Cargo binaries and run npm run build:web first.`);
+  }
+  // Detect conflicting migrations before starting containers or the backend.
+  await command('bash', ['src/server/migrations/sqlx_migration_contract_test.sh'], { env, signal: logicalContext?.signal });
+  await validateWebArtifact(path.join(root, 'target/native-web'), root);
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'ohc-native-e2e-'));
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 12);
+  const pg = `ohc-e2e-pg-${suffix}`, cache = `ohc-e2e-cache-${suffix}`;
+  const processes = [], logs = [];
+  let shippoFixture;
+  let portReservations;
+  let reservationCloseError;
+  let runFailed = false;
+  const start = (binary, arguments_, name, environment) => {
+    const output = createWriteStream(path.join(temp, name), { mode: 0o600 });
+    logs.push(output);
+    const child = spawn(binary, arguments_, { cwd: root, env: environment, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.pipe(output, { end: false }); child.stderr.pipe(output, { end: false });
+    child.once('error', (error) => output.write(`Unable to start ${name}: ${error.message}\n`));
+    processes.push(child); return child;
+  };
+  const execution = new AbortController();
+  const execute = (binary, argv, options = {}) => command(binary, argv, { ...options, signal: execution.signal });
+  const interrupt = () => {
+    execution.abort();
+    for (const child of processes) child.kill('SIGTERM');
+  };
+  process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
+  logicalContext?.signal.addEventListener('abort', interrupt, { once: true });
+  if (logicalContext?.signal.aborted) interrupt();
+  try {
+    await execute('docker', ['info'], { env, quiet: true });
+    for (const image of [postgresImage, valkeyImage]) {
+    if (spawnSync('docker', ['image', 'inspect', image], { env, stdio: 'ignore' }).status !== 0) {
+      await execute('docker', ['pull', image], { env });
+    }
+  }
+    await execute('docker', ['run', '-d', '--name', pg, '--label', `com.onehumancorp.e2e-run=${suffix}`, '-p', '127.0.0.1:0:5432',
+      '-e', 'POSTGRES_USER=ohc', '-e', 'POSTGRES_PASSWORD=ohc', '-e', 'POSTGRES_DB=ohc', postgresImage], { env });
+    await execute('docker', ['run', '-d', '--name', cache, '-p', '127.0.0.1:0:6379', valkeyImage], { env });
+    const mapped = async (name, port) => Number((await execute('docker', ['port', name, port], { env, quiet: true })).trim().split(':').at(-1));
+    const pgPort = await mapped(pg, '5432/tcp'), cachePort = await mapped(cache, '6379/tcp');
+    let ready = false;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      execution.signal.throwIfAborted();
+      try {
+        await execute('docker', ['exec', pg, 'pg_isready', '-U', 'ohc', '-d', 'ohc'], { env, quiet: true, timeoutMs: 5000 });
+        ready = true;
+        break;
+      }
+      catch { await delay(1000, undefined, { signal: execution.signal }); }
+    }
+    if (!ready) throw new Error('PostgreSQL test container did not become ready; no SQLite fallback is permitted');
+    await execute('bash', ['deploy/tests/support/generate_test_tls.sh', temp], { env });
+    portReservations = await reserveServicePorts(['api', 'grpc', 'web'], { signal: execution.signal });
+    const { api: apiPort, grpc: grpcPort, web: webPort } = portReservations.ports;
+    console.log(`Native service ports: api=${apiPort} grpc=${grpcPort} web=${webPort}`);
+    const apiOrigin = `http://127.0.0.1:${apiPort}`, webOrigin = `http://127.0.0.1:${webPort}`;
+    Object.assign(env, {
+      OMNISOLO_PORT: String(apiPort), OMNISOLO_GRPC_PORT: String(grpcPort),
+      DATABASE_URL: `postgres://ohc:ohc@127.0.0.1:${pgPort}/ohc`,
+      REDIS_URL: `redis://127.0.0.1:${cachePort}`, OMNISOLO_STANDALONE_MODE: 'false',
+      OMNISOLO_ENV: 'test', OMNISOLO_DEFAULT_TENANT_ID: 'e2e-tenant',
+      OMNISOLO_AGENT_AUTH_KEY: randomBytes(32).toString('hex'), OMNISOLO_AGENT_TOKEN: randomBytes(32).toString('hex'),
+      JWT_SECRET: randomBytes(32).toString('hex'), OMNISOLO_BUILTIN_AGENT_BINARY: agent,
+      OMNISOLO_GRPC_TLS_CERT_PATH: path.join(temp, 'server.crt'),
+      OMNISOLO_GRPC_TLS_KEY_PATH: path.join(temp, 'server.key'),
+      OMNISOLO_GRPC_CLIENT_CA_PATH: path.join(temp, 'ca.crt'),
+      E2E_POSTGRES_CONTAINER: pg, OMNISOLO_E2E_FIXTURE_PROOF: path.join(temp, 'fixture-database.json'),
+      API_BASE_URL: apiOrigin, BACKEND_URL: apiOrigin,
+      OMNISOLO_BACKEND_URL: apiOrigin, OMNISOLO_API_URL: apiOrigin, BASE_URL: webOrigin,
+      PLAYWRIGHT_BASE_URL: webOrigin,
+      OMNISOLO_WEB_CANONICAL_ORIGIN: webOrigin, OMNISOLO_WEB_LOCAL_DEV: 'true',
+      OMNISOLO_WEB_SESSION_KEY_ID: 'e2e-v1', OMNISOLO_WEB_SESSION_SECRET: randomBytes(32).toString('base64url'),
+      PLAYWRIGHT_STORAGE_STATE: path.join(temp, 'browser-state.json'),
+      OMNISOLO_E2E_SESSION_STATE_DIR: path.join(temp, 'actor-sessions'),
+      OMNISOLO_LLM_CONFIG_PATH: path.join(temp, 'no-provider-config.json'),
+      PLAYWRIGHT_TEST_DIR: './src', PLAYWRIGHT_LIST_REPORTER: '1',
+      PLAYWRIGHT_OUTPUT_DIR: path.join(root, 'test-results/native', logicalContext?.artifactSuffix ?? ''),
+      PLAYWRIGHT_HTML_REPORT: path.join(root, 'playwright-report', logicalContext?.artifactSuffix ?? ''), NEXT_TELEMETRY_DISABLED: '1',
+    });
+    const container = JSON.parse(await execute('docker', ['inspect', pg], { env, quiet: true }))[0];
+    await writeFile(env.OMNISOLO_E2E_FIXTURE_PROOF, JSON.stringify({
+      runId: suffix, containerName: pg, containerId: container.Id, port: pgPort,
+    }), { mode: 0o600, flag: 'wx' });
+    verifiedFixtureDatabaseUrl(env);
+    // The configured-checkout journey alone may start a second owned process
+    // pair from these same-run outputs. It verifies producer/source hashes and
+    // this DB identity before startup; global Stripe-missing cases stay intact.
+    env.OMNISOLO_E2E_CHECKOUT_RUNTIME = path.join(temp, 'checkout-runtime.json');
+    await writeFile(env.OMNISOLO_E2E_CHECKOUT_RUNTIME, JSON.stringify({
+      schemaVersion: 1, runId: suffix, server, agent, web,
+      binaryProof: path.join(path.dirname(server), 'native-binary-proof.json'),
+      databaseUrl: verifiedFixtureDatabaseUrl(env), redisUrl: env.REDIS_URL,
+      databaseProof: env.OMNISOLO_E2E_FIXTURE_PROOF,
+    }), { mode: 0o600, flag: 'wx' });
+    // A real HTTP provider boundary, owned by this run; never inherited live credentials.
+    shippoFixture = await startShippoBrowserFixture({ runId: suffix, tenantId: 'e2e-tenant' });
+    Object.assign(env, shippoFixture.environment);
+    await portReservations.release('api', 'grpc');
+    execution.signal.throwIfAborted();
+    const backend = start(server, [], 'server.log', {
+      ...env,
+      OMNISOLO_ALLOW_RELAXED_TEST_RATE_LIMIT: '1',
+    });
+    await waitHttp(`${apiOrigin}/readyz`, backend, 120, execution.signal);
+    await execute('docker', ['exec', '-i', pg, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'ohc', '-d', 'ohc'], {
+      env, input: await readFile(path.join(root, 'src/e2e/e2e-seed.sql')), quiet: true,
+    });
+    // Authenticate the SQL-seeded owner through the actual production login.
+    const login = await fetch(`${apiOrigin}/api/v1/auth/login`, {
+      method: 'POST', redirect: 'manual', signal: execution.signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'test@example.com', password: 'password123', organization_id: 'e2e-tenant' }),
+    });
+    if (!login.ok) throw new Error(`Fixture owner login failed: HTTP ${login.status}`);
+    const identity = await login.json();
+    if (!identity.token || identity.user?.organization_id !== 'e2e-tenant'
+        || !identity.user.roles?.includes('ADMIN')) throw new Error('Fixture owner identity was not verified');
+    await verifyProductionFixtureBoundary(apiOrigin, identity.token, execution.signal);
+    await portReservations.release('web');
+    execution.signal.throwIfAborted();
+    const frontend = start(process.execPath, [web], 'web.log', { ...env, PORT: String(webPort), HOSTNAME: '127.0.0.1', NODE_ENV: 'production' });
+    await waitHttp(`${webOrigin}/login`, frontend, 120, execution.signal);
+    // Execute exactly the complete/sharded selection checked by preflight.
+    const coverage = logicalContext?.coverage ?? (completeSelection ? clickCoverage.makeRunContext(root, process.env) : undefined);
+    const receiptDirectory = path.join(root, 'test-results/click-receipts', coverage ? `${coverage.runId}-${coverage.attempt}` : 'partial');
+    const browserEnv = coverage ? { ...env, ...(logicalContext ? { OHC_BROWSER_GROUP_INVENTORY: logicalContext.proofFile } : {}), OHC_CLICK_AUDIT_CONTEXT: JSON.stringify(coverage), OHC_CLICK_AUDIT_DIRECTORY: receiptDirectory } : env;
+    const browserCommand = ({ timeoutMs }) => command(process.execPath, [playwright, 'test', '--config', 'playwright.config.ts', ...args], {
+      env: browserEnv, signal: execution.signal, timeoutMs,
+    });
+    if (logicalContext) await logicalContext.runBrowser(browserCommand);
+    else await browserCommand({ timeoutMs: browserShards.BROWSER_BUDGET_MS });
+    if (coverage) {
+      clickCoverage.assertSource(root, coverage);
+      if (!logicalContext && !args.some(arg => arg === '--shard' || arg.startsWith('--shard='))) {
+        console.log('Complete click coverage:', clickCoverage.validateReceipts(clickCoverage.readReceipts(receiptDirectory), coverage, 1));
+      }
+    }
+  } catch (error) {
+    runFailed = true;
+    // The database contains only this run's synthetic seed. Its bounded error
+    // tail makes migration/type failures diagnosable instead of a bare HTTP 503.
+    try {
+      console.error('Isolated PostgreSQL diagnostics:');
+      await command('docker', ['logs', '--tail', '20', pg], { env });
+    } catch { /* Startup may have failed before the test database existed. */ }
+    for (const name of ['server.log', 'web.log']) {
+      try {
+        let tail = (await readFile(path.join(temp, name), 'utf8')).split('\n').slice(-35).join('\n');
+        for (const [key, value] of Object.entries(env)) if (/SECRET|TOKEN|KEY/.test(key) && value) tail = tail.replaceAll(value, '<redacted>');
+        console.error(`${name}:\n${tail}`);
+      } catch { /* process may not have started */ }
+    }
+    throw error;
+  } finally {
+    try { await portReservations?.close(); } catch (error) { reservationCloseError = error; }
+    for (const child of processes.reverse()) await stop(child);
+    for (const log of logs) log.end();
+    const closeError = await finishShippoBrowserFixture(shippoFixture, async () => {
+      await command('docker', ['rm', '-f', pg, cache], { env, quiet: true }).catch(() => {});
+      await rm(temp, { recursive: true, force: true });
+      logicalContext?.signal.removeEventListener('abort', interrupt);
+      process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
+    }, runFailed);
+    if (closeError) console.error('Shippo fixture shutdown also failed; owned-container and temporary-file cleanup was attempted.');
+    if (reservationCloseError) {
+      console.error(`Service port reservation cleanup also failed: ${reservationCloseError.message}`);
+    }
+  }
+  if (reservationCloseError) throw reservationCloseError;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  runNativeE2e().catch((error) => { console.error(error.message); process.exitCode = 1; });
+}

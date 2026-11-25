@@ -1,0 +1,189 @@
+use omnisolo_builtin_agent_core::types::ToolError;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+use super::{
+    Tool,
+    pydantic::{PydanticAdapter, PydanticToolExecutor},
+    workspace_path,
+};
+
+#[derive(Deserialize)]
+struct HeadArgs {
+    path: String,
+    lines: Option<u64>,
+}
+
+struct HeadExecutor {
+    working_dir: Option<std::path::PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl PydanticToolExecutor<HeadArgs> for HeadExecutor {
+    async fn execute_typed(&self, args: HeadArgs) -> Result<String, ToolError> {
+        let path = args.path.clone();
+
+        if path.contains("..") {
+            return Err(ToolError::LlmRecoverable(
+                "head: path traversal via '..' is not allowed".to_string(),
+            ));
+        }
+
+        let lines_to_read = args.lines.unwrap_or(10) as usize;
+        if lines_to_read > 1000 {
+            return Err(ToolError::LlmRecoverable(
+                "JIT Retrieval Error: Cannot read more than 1000 lines at once.".to_string(),
+            ));
+        }
+
+        let root = workspace_path::required_root(self.working_dir.clone())?;
+        let actual_path = workspace_path::resolve_workspace_path(&root, &path, true).await?;
+
+        let file = File::open(&actual_path)
+            .await
+            .map_err(|e| ToolError::LlmRecoverable(format!("head: {}: {}", path, e)))?;
+
+        let mut reader = BufReader::new(file);
+        let mut lines = Vec::new();
+        let mut buffer = String::new();
+
+        for _ in 0..lines_to_read {
+            buffer.clear();
+            let bytes_read = reader
+                .read_line(&mut buffer)
+                .await
+                .map_err(|e| ToolError::LlmRecoverable(format!("head: read error: {}", e)))?;
+            if bytes_read == 0 {
+                break;
+            }
+            lines.push(buffer.trim_end_matches(&['\r', '\n'][..]).to_string());
+        }
+
+        Ok(lines.join("\n"))
+    }
+}
+
+pub fn head_tool(working_dir: Option<std::path::PathBuf>) -> Tool {
+    Tool {
+        name: "Head".to_string(),
+        description: "Read the first N lines of a file (default 10). Used for Context Management (Preventing Context Rot): JetBrains JIT Retrieval (grep, glob).".to_string(),
+        is_read_only: true,
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to read."
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of lines to read from the beginning (default 10)."
+                }
+            },
+            "required": ["path"]
+        }),
+        execute: Arc::new(PydanticAdapter::new(HeadExecutor { working_dir })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    #[tokio::test]
+    async fn test_head_basic() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line1\nline2\nline3\nline4\n")
+            .await
+            .unwrap();
+
+        let tool = head_tool(Some(dir.path().to_path_buf()));
+
+        let args = json!({ "path": "test.txt", "lines": 2 });
+        let result = tool.execute.execute(args).await.unwrap();
+        assert_eq!(result, "line1\nline2");
+    }
+
+    #[tokio::test]
+    async fn test_head_default_lines() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let content = (1..=15)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&file_path, content).await.unwrap();
+
+        let tool = head_tool(Some(dir.path().to_path_buf()));
+
+        let args = json!({ "path": "test.txt" });
+        let result = tool.execute.execute(args).await.unwrap();
+        let result_lines: Vec<&str> = result.split('\n').collect();
+        assert_eq!(result_lines.len(), 10);
+        assert_eq!(result_lines[0], "line1");
+        assert_eq!(result_lines[9], "line10");
+    }
+
+    #[tokio::test]
+    async fn test_head_path_traversal() {
+        let tool = head_tool(None);
+        let args = json!({ "path": "../../../etc/passwd" });
+        let result = tool.execute.execute(args).await;
+        assert!(result.is_err());
+        if let Err(ToolError::LlmRecoverable(msg)) = result {
+            assert!(msg.contains("path traversal"));
+        } else {
+            panic!("Expected LlmRecoverable error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_blocks_none_working_dir_absolute_and_symlinks() {
+        let unconfined = head_tool(None);
+        assert!(
+            unconfined
+                .execute
+                .execute(json!({ "path": "/etc/passwd" }))
+                .await
+                .is_err()
+        );
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, "secret").await.unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, root.path().join("link.txt")).unwrap();
+
+        let tool = head_tool(Some(root.path().to_path_buf()));
+        for bad in ["/etc/passwd", "//etc/passwd", "link.txt"] {
+            assert!(tool.execute.execute(json!({ "path": bad })).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_head_jit_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "test").await.unwrap();
+        let tool = head_tool(Some(dir.path().to_path_buf()));
+        let args = json!({ "path": "test.txt", "lines": 1001 });
+        let result = tool.execute.execute(args).await;
+        assert!(result.is_err());
+        if let Err(ToolError::LlmRecoverable(msg)) = result {
+            assert!(
+                msg.contains("Cannot read more than 1000 lines"),
+                "msg was: {}",
+                msg
+            );
+        } else {
+            panic!("Expected LlmRecoverable error");
+        }
+    }
+}

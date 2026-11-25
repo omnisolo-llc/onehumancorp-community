@@ -1,0 +1,270 @@
+<div markdown="1" style="backdrop-filter: blur(20px) saturate(200%); font-family: Outfit, Inter, sans-serif; border: 1px solid rgba(255, 255, 255, 0.1); padding: 20px; border-radius: 12px; background: rgba(255, 255, 255, 0.05);">
+
+# Design Doc: OmniSolo (OmniSolo) Platform
+
+**Author(s):** OneHumanCorp Engineering
+**Status:** Approved
+**Last Updated:** 2026-03-28
+
+## 1. Overview
+OmniSolo (OmniSolo) is an enterprise-grade AI-agent orchestration platform. It enables organisations to define a virtual workforce of AI agents, assign them hierarchical roles, coordinate complex multi-agent tasks through persistence-backed "Meeting Rooms", track granular cost and billing at the token level, and gate high-risk or high-cost actions behind human approval (Confidence Gating).
+
+The platform is intentionally hybrid. The same backend can run as a multi-tenant cloud service, an API-only headless deployment for remote clients, or the local backend managed by a standalone desktop wrapper.
+
+The platform is built on 4 conceptual layers:
+1. **Domain Knowledge**: The industry or area the corporation operates in (e.g., Software Company). This is an extensible framework; users can import new skills, areas, and domain knowledge at any time.
+2. **Role**: Specific positions required within the domain. For a Software Company, this includes PM, SWE, Engineering Director, Marketing Manager, Security Engineer, QA Tester, UI/UX Designer, Sales Representative, Customer Support Specialist, and DevOps Engineer.
+3. **Organization**: The management hierarchy and structure (e.g., a Director managing X PMs and Y SWEs).
+4. **User**: The human user, who always acts as the CEO.
+
+When the CEO defines a goal, the organisation works collaboratively. Agents enter **virtual meeting rooms** to discuss, define scopes, design products, and implement them autonomously, guided by their specialized roles.
+
+## 2. Goals & Non-Goals
+### 2.1 Goals
+- **Autonomous Orchestration**: Enable agents to delegate tasks to specialists without human intervention.
+- **Cost Observability**: Provide real-time USD cost tracking based on specific model pricing (GPT-4o-mini, Claude 3.5, etc.).
+- **Verifiable Identity**: Use SPIFFE SVIDs for mTLS-backed agent-to-agent and agent-to-tool communication.
+- **Zero Lock-in**: Abstract all external tools behind the Model Context Protocol (MCP).
+### 2.2 Non-Goals
+- **Model Training**: OmniSolo consumes existing LLMs via standardized providers.
+- **General Purpose ERP**: While OmniSolo manages an "org chart", it is focused on AI workflow, not traditional HR/Payroll processing.
+
+## 3. Detailed Architecture
+
+```mermaid
+graph TD
+    subgraph "Thin Client Mode (UI-Only)"
+        Desktop[Tauri Desktop Client] -->|API/OAuth| BE[OmniSolo Backend Server]
+        Web[Static Web Client] -->|API/OAuth| BE
+    end
+    
+    subgraph "Cloud-Native Mode (Multi-Tenant)"
+        BE --> Hub[Orchestration Hub]
+        BE --> Billing[Billing Tracker]
+        BE --> Approval[Approval Engine]
+        BE --> DB[(Postgres: Persistence)]
+        BE --> Redis[(Redis: Session/PubSub)]
+    end
+
+    subgraph "Standalone Desktop Mode (Local Single-User)"
+        DesktopShell[Desktop Wrapper] -->|Manages| LocalBE[Local OmniSolo Backend]
+        LocalBE --> LocalHub[Local Orchestration Hub]
+        LocalBE --> LocalDB[(SQLite: Persistence)]
+    end
+
+    subgraph "Core Orchestration"
+        BE --> Hub[Orchestration Hub]
+    end
+
+    subgraph "Data Tier"
+        BE --> Redis[(Redis: Session/PubSub)]
+        BE --> DB[(Postgres: Persistence/Audit)]
+    end
+
+    subgraph "External Ecosystem"
+        BE --> MCP[MCP Gateway]
+        MCP --> Tools[Git, Jira, Slack, AWS, etc.]
+    end
+
+    classDef premium fill:rgba(255,255,255,0.03),stroke:rgba(255,255,255,0.08),stroke-width:1px,color:#fff,backdrop-filter:blur(20px) saturate(200%);
+    class Hub,Billing,DesktopShell,MCP,LocalDB,Tools,Desktop,Web,LocalBE,Mobile,LocalHub,Approval,DB,Redis,BE premium;
+```
+
+### 3.1 Operating Modes
+- **Cloud-native shared service**: the Rust API tier runs in Kubernetes, scales horizontally, and relies on Postgres as the consistency boundary.
+- **Headless remote-service mode**: the backend runs with UI serving disabled so mobile and desktop clients use it as an API-only service.
+- **Desktop standalone mode**: the desktop shell manages a local backend lifecycle, local SQLite-backed state, and optional public integrations.
+- **Remote client mode**: the Tauri app behaves mainly as a UI, points at a configured backend URL, and authenticates against the remote deployment.
+
+### 3.2 Hybrid Parity and Graceful Degradation
+- **Standalone Wrapper Spec**: The desktop wrapper must instantiate the Rust backend as a child process, utilizing SQLite instead of Postgres and relying on local process boundaries rather than strict multi-tenant container isolation.
+- **Thin Client APIs**: UI actions use the Axum HTTP routes and tonic gRPC services registered from `src/server/lib.rs` and `src/server/api/`. Mode-specific integrations degrade where an implementation exists, such as Redis-backed mesh transport falling back to local transport in standalone paths.
+- **Verification**: Architectural changes must maintain parity across both hybrid targets.
+
+### 3.3 Orchestration Hub (`src/server/orchestration/`)
+The `Hub` is the central coordinator using a thread-safe registry (`tokio::sync::RwLock`). It manages:
+- **Agent Lifecycle**: `RegisterAgent(Agent)`, `FireAgent(id)`.
+- **Communication**: `Publish(Message)` routes events to specific agent inboxes or meeting room transcripts.
+- **Meeting Rooms**: Persisted workspaces for multi-agent collaboration on specific tasks. This is where cross-functional roles (e.g., a PM, UI/UX Designer, and SWE) converse, debate constraints, define scopes, design products, and implement them based on the CEO's goal.
+- **Capability Plugin Mesh**: A decentralized capability system where agents dynamically ingest "Capability Plugins" at runtime. Capabilities are hosted as standalone K8s services exposing a standardized `CapabilityManifest`, enabling agents to discover and adopt new tools and roles on the fly via the MCP Gateway.
+
+### 3.4 Data Models (Rust & Protobuf)
+#### Domain Entities (`src/server/domain/organization.rs`)
+```rust
+struct Organization {
+    id: String,
+    name: String,
+    domain: String,
+    members: Vec<Employee>,
+    role_profiles: Vec<RoleProfile>,
+}
+```
+#### Protobuf API Contract (`src/proto/agent.proto`)
+```protobuf
+message AgentMessage {
+  string id = 1;
+  string sender_id = 2;
+  string recipient_id = 3;
+  string content = 4;
+  map<string, string> metadata = 5;
+}
+```
+
+## 4. API Design (Backend :8080)
+
+| Method | Path | Request Body | Resulting State |
+|--------|------|--------------|-----------------|
+| `GET` | `/healthz`, `/readyz`, `/api/v1/health` | N/A | Returns service or hub health. |
+| `POST` | `/api/v1/auth/login` | `{"username": "...", "password": "...", "organization_id": "..."}` | Issues an authenticated session token. |
+| `GET` / `POST` | `/api/agents/` and `/api/agents/hire` | Agent hire payload | Lists or hires agents through the Hub-backed agent API. |
+| `GET` / `POST` | `/api/agents/approvals/` and `/api/agents/approvals/{id}` | Approval decision payload | Lists and decides department approvals. |
+| `POST` | `/api/mesh/v2/broadcast`, `/api/mesh/v2/direct`, `/api/mesh/v2/mailbox` | Mesh event payload | Publishes or stores teammate mesh events. |
+| `GET` | `/api/v1/mesh/connect` | WebSocket upgrade | Opens the mesh WebSocket stream. |
+| `POST` | `/api/v1/builder/generate`, `/api/v1/builder/publish_draft` | Builder payload | Generates or publishes storefront drafts. |
+
+## 5. Security & Trust Domain
+### 5.1 SPIFFE/SPIRE Identity
+Every agent workload is assigned a SPIFFE ID (e.g., `spiffe://ohc.local/agent/swe-1`). In production, the `spire-agent` sidecar provides X.509 SVIDs via the Workload API, ensuring that only authenticated agents can access the `MCP Gateway`.
+
+### 5.2 Confidence Gating
+High-risk actions (e.g., `git push`, `terraform apply`, `billing upgrade`) are intercepted by the `Guardian Agent`. The action is suspended, the state is snapshotted, and an `ApprovalRequest` is created. Execution only resumes upon a `PUT /api/approvals/decide` call with an `APPROVED` status.
+
+## 6. Infrastructure & Deployment
+### 6.1 Containerization
+- **Backend/Frontend**: Built using native Cargo and Node.js pipelines and packaged as minimal container images.
+- **Security**: Rootless execution, read-only root filesystems where possible.
+### 6.2 Managed PostgreSQL (Kubernetes)
+Audit logs and snapshots can be stored in a managed Postgres cluster providing:
+- Automated failover (Leader/Follower).
+- Point-in-time recovery (PITR) to S3-compatible object storage.
+- Integrated Prometheus metrics for DB health.
+
+### 6.3 Workspace Routing and Headless Serving
+- Authenticated requests carry `organization_id` claims; service handlers and shared-database queries use those claims to scope workspace-visible data.
+- Managed cloud deployments enforce workspace-scoped authentication requirements across auth and related service paths (see `docs/public/edition-comparison.md`).
+- `OMNISOLO_HEADLESS=true` selects API-only/headless integration behavior. The current Rust entrypoint still registers the Axum UI fallback route; static Tauri assets are packaged by the desktop app, not by a `FRONTEND_STATIC_DIR` server setting.
+- Current persistence hardening is focused on making every shared Postgres query org-aware end to end; the auth, dashboard, billing, onboarding, orchestration, and growth surfaces already carry org-scoped behavior.
+
+## 7. Monitoring & Observability
+- **Metrics**: OpenTelemetry metrics from `src/server/telemetry/`, including token, agent, queue, mission, and business event counters.
+- **Tracing**: W3C Traceparent propagation through agent handoffs for distributed request tracking.
+- **Liveness/Readiness**: `/healthz` (service up) and `/readyz` (DB/Redis reachable).
+d-to-end mTLS via SPIFFE.
+
+## Agent Delegate Mode
+
+An agent in "Delegate Mode" acts as a routing proxy: it inspects an incoming task, selects the best-fit specialist agent from the registry, forwards the task, and surfaces the result back to the originating caller.  The orchestration `Hub` exposes `DelegateTask(fromAgentID, toAgentID, task)` for this purpose.
+
+## 8. Scalability
+- Horizontal pod autoscaling on both `backend` and `frontend` deployments
+- Redis pub/sub decouples event producers from consumers
+- CloudNative PG read replicas serve read-heavy API paths
+- Multi-tenant routing keeps the API tier stateless so replicas can scale independently while Postgres preserves shared-data consistency
+
+## 9. Roadmap (Production Readiness Extensions)
+
+### 9.1 Phase 3: Global Scale (Multi-Cluster Federation)
+Extend the OmniSolo control plane to manage agent workloads across multiple geographic clusters.
+- **Federated SPIRE**: Cross-cluster SVID validation for mTLS.
+- **Global Hub Router**: Intelligent message routing based on agent locality and latency.
+
+### 9.2 Phase 4: Autonomous Reliability (SRE Engine)
+Incorporate self-healing capabilities into the core orchestration.
+- **Incident Response Agents**: Agents with direct access to Prometheus/Loki for real-time RCA.
+- **Auto-Rollback Gating**: Integration with ArgoCD/Flux for automated canary rollouts and AI-driven rollbacks.
+
+### 9.3 Phase 5: Ecosystem Interoperability (B2B Collaboration)
+Enable secure agent-to-agent negotiation between separate OmniSolo organizations.
+- **Trust Domain Peering**: Shared OIDC/SPIFFE trust between partner organizations.
+- **Inter-Org Meeting Rooms**: Securely bridged workspaces for B2B collaboration.
+
+### 9.4 Phase 6: Performance Optimization (Hardware-Aware Scheduling)
+Optimize agent throughput by aligning LLM requirements with cluster hardware.
+- **GPU Affinity Scoring**: Scheduling agents onto nodes with NVIDIA H100/A100 based on task priority.
+- **VRAM Quota Management**: Granular control over VRAM consumption to prevent OOM in dense agent clusters.
+
+## 10. Alternatives Considered
+
+- **Custom API Integrations**: Instead of MCP, we could have built bespoke integrations for every tool. This was rejected due to lack of scalability and high maintenance cost.
+- **Synchronous Agent Communication**: Initial designs considered purely synchronous A2A. This was rejected in favor of an asynchronous Pub/Sub model to handle long-running agent tasks and improve platform responsiveness.
+- **SaaS-only Identity**: Using Auth0 or similar for all identities. Rejected to allow for self-hosted, air-gapped deployments and better agent workload identity (SVIDs).
+
+## Monitoring & Observability
+
+- **Liveness & Readiness**: `/healthz` and `/readyz` endpoints for Kubernetes probes.
+- **Tracing**: OpenTelemetry traces exported to OTLP compatible backends (Jaeger, Honeycomb).
+- **Logging**: `tracing` and `tracing-subscriber`, with JSON output when `LOG_FORMAT=json`.
+- **Metrics**: Prometheus metrics for system health (CPU, Memory, Request Latency).
+
+## 11. Modular Capability Expansion Flow
+
+The OmniSolo platform supports dynamic expansion and industrial-strength team instantiation via the **Modular Capability Plugin Mesh**.
+
+1. **Discovery**: Agents query the MCP Gateway for capabilities matching their intent. Capabilities are standalone K8s services exposing a `CapabilityManifest`.
+2. **Registration**: The Orchestration Hub dynamically registers new endpoints in the `capability_plugins` database table.
+3. **Hydration**: The Hub automatically injects the newly discovered capabilities into the agent's context and persists embeddings into `swarm_memory_embeddings` for future semantic retrieval.
+4. **Execution**: Agents immediately adopt their new roles or utilize newly bound tools to execute their directives autonomously.
+
+## 12. Aesthetics: Next-Generation OmniSolo Design System
+
+To reflect the fluidity of the new Agentic OS, the OmniSolo frontend adopts the Next-Generation "Premium Feel" Design System. The UI must hide infrastructure complexity (K8s, MCP) behind consumer-grade "Apple-level aesthetics".
+
+### 12.1 Design System Tokens
+*   **Backdrop & Depth**: Glassmorphism is the core structural element.
+    *   `backdrop-filter: blur(20px) saturate(200%)`
+*   **Surfaces**: Ghostly, semi-transparent layers to indicate dynamic, ephemeral agent capabilities.
+    *   `background: rgba(255, 255, 255, 0.03)`
+*   **Borders**: Subtle definition.
+    *   `border: 1px solid rgba(255, 255, 255, 0.1)`
+*   **Typography**: Clean, geometric sans-serif for clarity at a glance.
+    *   `font-family: 'Outfit', 'Inter', sans-serif`
+*   **Transitions**: Smooth data transitions for all asynchronous operations (e.g., capability binding).
+
+### 12.2 Architectural Flow Diagram
+
+```mermaid
+graph TD
+    %% Core Infrastructure
+    K8s[Kubernetes Cluster]
+    DB[(OmniSolo SIP Database)]
+    MCP[MCP Gateway]
+
+    %% Plugin Mesh
+    PluginA[Capability Plugin A]
+    PluginB[Capability Plugin B]
+
+    %% Agents
+    Agent1[Autonomous Agent]
+
+    %% UI Components
+    UI[Next-Gen OmniSolo Dashboard]
+
+    %% Relationships
+    PluginA -- Registers Manifest --> MCP
+    PluginB -- Registers Manifest --> MCP
+
+    Agent1 -- Queries Capabilities --> MCP
+    MCP -- Injects Context --> Agent1
+
+    Agent1 -- Updates State --> DB
+
+    UI -- Fetches Real-Time State --> DB
+
+    %% Aesthetic Application
+    subgraph UI Design System
+        Tokens[Glassmorphism Tokens]
+        Tokens -.-> UI
+    end
+
+    %% K8s Bound
+    subgraph "Agentic OS Fabric"
+        K8s --> DB
+        K8s --> MCP
+        K8s --> Agent1
+    end
+
+    classDef premium fill:rgba(255,255,255,0.03),stroke:rgba(255,255,255,0.08),stroke-width:1px,color:#fff,backdrop-filter:blur(20px) saturate(200%);
+    class PluginB,Agent1,UI,MCP,Tokens,PluginA,DB,K8s premium;
+```
+
+</div>

@@ -1,0 +1,321 @@
+use super::*;
+use axum::http::HeaderMap;
+use omnisolo_builtin_agent::mesh::transport::{InProcessTransport, MeshTransport};
+use serde_json::json;
+
+async fn fixture() -> Option<(sqlx::PgPool, HeaderMap)> {
+    let url = std::env::var("OHC_SYNC_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("OMNISOLO_DATABASE_URL"))
+        .ok()?;
+    if !url.contains("test") {
+        return None;
+    }
+    let schema = format!("offline_route_test_{}", uuid::Uuid::new_v4().simple());
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .after_connect(move |connection, _| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path TO {schema}"))
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("durable_sync_test_schema.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    const DURABLE_SYNC_RECEIPTS_DDL: &str = r#"
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS request_identity JSONB;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS receipt_status TEXT;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS receipt_route TEXT;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS client_event_id TEXT;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS entity_type TEXT;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS entity_id TEXT;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS base_version BIGINT;
+ALTER TABLE sync_events ADD COLUMN IF NOT EXISTS result_version BIGINT;
+CREATE INDEX IF NOT EXISTS sync_events_entity_receipts
+    ON sync_events (tenant_id, entity_type, entity_id, result_version)
+    WHERE receipt_status = 'acknowledged';
+ALTER TABLE operation_intents ADD COLUMN IF NOT EXISTS request_identity JSONB;
+CREATE OR REPLACE FUNCTION touch_sync_entity_updated_at() RETURNS trigger
+LANGUAGE plpgsql AS $$ BEGIN NEW.updated_at = GREATEST(clock_timestamp(), OLD.updated_at + INTERVAL '1 microsecond'); RETURN NEW; END $$;
+DROP TRIGGER IF EXISTS sync_entity_updated_at ON products;
+CREATE TRIGGER sync_entity_updated_at BEFORE UPDATE ON products
+FOR EACH ROW EXECUTE FUNCTION touch_sync_entity_updated_at();
+DROP TRIGGER IF EXISTS sync_entity_updated_at ON orders;
+CREATE TRIGGER sync_entity_updated_at BEFORE UPDATE ON orders
+FOR EACH ROW EXECUTE FUNCTION touch_sync_entity_updated_at();
+DROP TRIGGER IF EXISTS sync_entity_updated_at ON appointments;
+CREATE TRIGGER sync_entity_updated_at BEFORE UPDATE ON appointments
+FOR EACH ROW EXECUTE FUNCTION touch_sync_entity_updated_at();
+"#;
+    sqlx::raw_sql(DURABLE_SYNC_RECEIPTS_DDL)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE revoked_tokens(jti TEXT,tenant_id TEXT,expires_at TIMESTAMPTZ,UNIQUE(jti,tenant_id))").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO products(id,tenant_id) VALUES ('p','tenant-a')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    use sea_orm::{ConnectionTrait, Schema};
+    let orm = sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
+    let backend = sea_orm::DatabaseBackend::Postgres;
+    for statement in [
+        Schema::new(backend)
+            .create_table_from_entity(server_auth::seaorm_store::entities::user::Entity),
+        Schema::new(backend).create_table_from_entity(
+            server_auth::seaorm_store::entities::identity_user_role::Entity,
+        ),
+        Schema::new(backend)
+            .create_table_from_entity(server_auth::seaorm_store::entities::revoked_token::Entity),
+    ] {
+        orm.execute(backend.build(&statement)).await.unwrap();
+    }
+    sqlx::raw_sql("INSERT INTO users(id,username,email,password_hash,active,tenant_id,created_at,updated_at)VALUES('owner','owner','owner@example.test','',true,'tenant-a',now(),now());INSERT INTO identity_user_roles(user_id,role_name,tenant_id,position)VALUES('owner','OWNER','tenant-a',0);").execute(&pool).await.unwrap();
+    let store = crate::auth::Store::with_portable_repo(Arc::new(
+        crate::auth::seaorm_store::SeaOrmAuthRepository::new(orm),
+    ));
+    let user = crate::auth::User {
+        id: "owner".into(),
+        username: "owner".into(),
+        email: "owner@example.test".into(),
+        password_hash: String::new(),
+        roles: vec!["owner".into()],
+        active: true,
+        organization_id: Some("tenant-a".into()),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let token = store.issue_token(&user).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+    Some((pool, headers))
+}
+fn canonical_store(pool: &sqlx::PgPool) -> Arc<server_auth::Store> {
+    Arc::new(server_auth::Store::with_portable_repo(Arc::new(
+        server_auth::seaorm_store::SeaOrmAuthRepository::new(
+            sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone()),
+        ),
+    )))
+}
+fn sync_state(pool: sqlx::PgPool) -> SyncEventsState {
+    let store = canonical_store(&pool);
+    SyncEventsState {
+        pool,
+        access: crate::api::field_ops::records::FieldAccess { pool: None, store },
+    }
+}
+async fn write_state(pool: sqlx::PgPool) -> SyncWriteState {
+    SyncWriteState::new(canonical_store(&pool), Some(&pool)).await
+}
+async fn body(response: impl IntoResponse) -> serde_json::Value {
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+fn event(id: &str, expected: bool) -> SyncEvent {
+    SyncEvent {
+        id: id.into(),
+        entity_id: "p".into(),
+        entity_type: "product".into(),
+        action_type: "ToggleSoldOut".into(),
+        payload: json!({"is_sold_out":true,"expected_is_sold_out":expected,"expected_updated_at":"2026-01-01T00:00:00Z"}),
+        base_version: 1,
+    }
+}
+fn mutation(id: &str, quantity: i32) -> OfflineMutation {
+    OfflineMutation {
+        transaction_id: id.into(),
+        timestamp: None,
+        product_id: "p".into(),
+        quantity_deducted: quantity,
+        amount: Some(100),
+        payment_method: None,
+        payment_intent_id: None,
+        currency: Some("USD".into()),
+        mutation_type: Some("inventory_sale".into()),
+        payload: None,
+        client_mutation_id: Some(id.into()),
+    }
+}
+fn mesh() -> Arc<dyn MeshTransport> {
+    Arc::new(InProcessTransport::new())
+}
+
+#[tokio::test]
+async fn test_sync_events_success() {
+    let Some((pool, headers)) = fixture().await else {
+        return;
+    };
+    let value = body(
+        sync_events_handler(
+            State(sync_state(pool.clone())),
+            headers,
+            Json(SyncEventsRequest {
+                events: vec![event("success", false)],
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(value["applied_count"], 1);
+    assert_eq!(value["outcomes"][0]["status"], "acknowledged");
+    let sold: bool = sqlx::query_scalar("SELECT is_sold_out FROM products WHERE id='p'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(sold);
+}
+#[tokio::test]
+async fn test_sync_events_idempotency() {
+    let Some((pool, headers)) = fixture().await else {
+        return;
+    };
+    for _ in 0..2 {
+        let value = body(
+            sync_events_handler(
+                State(sync_state(pool.clone())),
+                headers.clone(),
+                Json(SyncEventsRequest {
+                    events: vec![event("replay", false)],
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["outcomes"][0]["status"], "acknowledged");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+#[tokio::test]
+async fn test_sync_events_conflict() {
+    let Some((pool, headers)) = fixture().await else {
+        return;
+    };
+    for _ in 0..2 {
+        let value = body(
+            sync_events_handler(
+                State(sync_state(pool.clone())),
+                headers.clone(),
+                Json(SyncEventsRequest {
+                    events: vec![event("conflict", true)],
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["conflict_count"], 1);
+        assert_eq!(value["outcomes"][0]["status"], "reconciliation");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_conflict_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+#[tokio::test]
+async fn test_offline_sync_unauthorized() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(10))
+        .connect_lazy("postgres://localhost/dummy")
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-tenant-id", "tenant-a".parse().unwrap());
+    let response = offline_sync_handler(
+        State((
+            SyncWriteState::new(Arc::new(server_auth::Store::new()), Some(&pool)).await,
+            mesh(),
+        )),
+        headers,
+        Json(OfflineSyncRequest { mutations: vec![] }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+#[tokio::test]
+async fn test_offline_sync_success_and_negative_guard() {
+    let Some((pool, headers)) = fixture().await else {
+        return;
+    };
+    let mut missing = mutation("missing", 2);
+    missing.product_id = "nonexistent".into();
+    let value = body(
+        offline_sync_handler(
+            State((write_state(pool.clone()).await, mesh())),
+            headers,
+            Json(OfflineSyncRequest {
+                mutations: vec![mutation("valid", 3), mutation("negative", -1), missing],
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(value["applied_count"], 1);
+    assert_eq!(value["failed_count"], 2);
+    assert_eq!(value["outcomes"][0]["status"], "acknowledged");
+    assert_eq!(value["outcomes"][1]["status"], "blocked");
+    let stock: i32 = sqlx::query_scalar("SELECT inventory_count FROM products WHERE id='p'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stock, 7);
+}
+#[tokio::test]
+async fn test_offline_sync_field_service_mutations() {
+    let Some((pool, headers)) = fixture().await else {
+        return;
+    };
+    let mut quote = mutation("quote", 0);
+    quote.mutation_type = Some("draft_quote".into());
+    quote.payload = Some("Prepare plumbing quote".into());
+    let mut intent = mutation("intent", 0);
+    intent.mutation_type = Some("agent_intent".into());
+    intent.payload = Some(json!({"message":"Prepare schedule"}).to_string());
+    for _ in 0..2 {
+        let value = body(
+            offline_sync_handler(
+                State((write_state(pool.clone()).await, mesh())),
+                headers.clone(),
+                Json(OfflineSyncRequest {
+                    mutations: vec![quote.clone(), intent.clone()],
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(value["applied_count"], 2);
+    }
+    let tasks: i64 = sqlx::query_scalar("SELECT count(*) FROM department_tasks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tasks, 1);
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM ohc_job_queue")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 1);
+}

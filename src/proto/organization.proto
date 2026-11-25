@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package ohc.organization;
+
+import "src/proto/common.proto";
+
+option go_package = "github.com/onehumancorp/mono/src/proto/ohc/organization;organizationpb";
+
+message RoleProfile {
+  ohc.common.Role role = 1;
+  string base_prompt = 2;
+  repeated string capabilities = 3;
+  repeated string context_inputs = 4;
+}
+
+message Organization {
+  string id = 1;
+  string name = 2;
+  string domain = 3;
+  string ceo_id = 4;
+  int64 created_at_unix = 5;
+  repeated TeamMember members = 6;
+  repeated RoleProfile role_profiles = 7;
+  reserved 8;
+  reserved "tier";
+}
+
+message TeamMember {
+  string id = 1;
+  string organization_id = 2;
+  string name = 3;
+  ohc.common.Role role = 4;
+  string manager_id = 5;
+  bool is_human = 6;
+}
+
+message OrganizationChart {
+  Organization organization = 1;
+  repeated TeamMember members = 2;
+}
+
+message Product {
+  string id = 1;
+  string organization_id = 2;
+  string name = 3;
+  string description = 4;
+  int64 price_cents = 5;
+  string currency = 6;
+  string fulfillment_strategy = 7;
+  string metadata_json = 8;
+  bool is_subscribable = 9;
+  string subscription_frequency = 10;
+  int32 subscription_discount_percent = 11;
+}
+
+message OnboardingRequest {
+  string organization_id = 1;
+  string business_type = 2;
+  string company_name = 3;
+  string company_description = 4;
+  repeated string selling_categories = 5;
+  string payment_pref = 6;
+  string admin_email = 7;
+}
+
+service OrganizationService {
+  rpc CreateOrganization(Organization) returns (Organization);
+  rpc GetOrganizationChart(Organization) returns (OrganizationChart);
+}

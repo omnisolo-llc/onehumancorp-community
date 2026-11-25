@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <style>
+      .glassmorphism {
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.65);
+        backdrop-filter: blur(40px) saturate(220%);
+        -webkit-backdrop-filter: blur(40px) saturate(220%);
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      }
+      @media (prefers-color-scheme: dark) {
+        .glassmorphism {
+          border-radius: 16px;
+          background: rgba(22, 22, 26, 0.7);
+          backdrop-filter: blur(40px) saturate(220%);
+          -webkit-backdrop-filter: blur(40px) saturate(220%);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+      }
+      .old-glassmorphism {
+        background: rgba(255, 255, 255, 0.65);
+        backdrop-filter: blur(40px) saturate(220%);
+        -webkit-backdrop-filter: blur(40px) saturate(220%);
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        border-radius: 16px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      }
+      .glassmorphism-btn {
+        border-radius: 8px;
+      }
+      .glassmorphism-input {
+        border-radius: 8px;
+      }
+    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Link-in-Bio Generator - OmniSolo OneHumanCorp</title>
+    <style>
+        :root {
+            --bg-color: #f3f4f6;
+            --text-color: #111827;
+            --card-bg: rgba(255, 255, 255, 0.65);
+            --card-border: rgba(255, 255, 255, 0.4);
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            -webkit-font-smoothing: antialiased;
+            min-height: 100vh;
+        }
+
+        .header {
+            padding: 24px;
+            background: white;
+            border-bottom: 1px solid #e5e7eb;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .back-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #6b7280;
+            transition: background 0.2s;
+        }
+
+        .back-btn:hover {
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        .header h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            color: #1D1D1F;
+            letter-spacing: -0.02em;
+        }
+
+        .container {
+            max-w: 1200px;
+            margin: 0 auto;
+            padding: 32px 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 32px;
+        }
+
+        @media (min-width: 768px) {
+            .container {
+                flex-direction: row;
+            }
+        }
+
+        .editor-section {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .panel {
+            background: var(--card-bg);
+            backdrop-filter: blur(40px) saturate(220%);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+
+        .panel h2 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #1D1D1F;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            color: #374151;
+            margin-bottom: 4px;
+        }
+
+        .form-group input, .form-group textarea {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-family: 'Inter', sans-serif;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus, .form-group textarea:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+        }
+
+        .theme-selector {
+            display: flex;
+            gap: 8px;
+        }
+
+        .theme-btn {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: 2px solid transparent;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+
+        .theme-btn:hover {
+            transform: scale(1.1);
+        }
+
+        .theme-btn.active {
+            border-color: var(--primary);
+        }
+
+        .btn-primary {
+            width: 100%;
+            padding: 12px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-hover);
+        }
+
+        .btn-success {
+            background: #d1fae5;
+            color: #047857;
+        }
+
+        .btn-success:hover {
+            background: #d1fae5;
+        }
+
+        /* Preview Section */
+        .preview-section {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+
+        .phone-container {
+            width: 375px;
+            height: 812px;
+            background: white;
+            border-radius: 40px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+            border: 8px solid #111827;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .notch {
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 160px;
+            height: 24px;
+            background: #111827;
+            border-bottom-left-radius: 16px;
+            border-bottom-right-radius: 16px;
+            z-index: 50;
+        }
+
+        .preview-content {
+            flex: 1;
+            padding: 64px 24px 48px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow-y: auto;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        .avatar {
+            width: 96px;
+            height: 96px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.65);
+            backdrop-filter: blur(40px) saturate(220%);
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 36px;
+            margin-bottom: 16px;
+            margin-top: 16px;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.06);
+        }
+
+        .preview-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+
+        .preview-bio {
+            font-size: 14px;
+            font-weight: 500;
+            opacity: 0.9;
+            text-align: center;
+            margin-bottom: 32px;
+            max-width: 250px;
+            line-height: 1.5;
+        }
+
+        .links-container {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .preview-link {
+            width: 100%;
+            padding: 16px 24px;
+            border-radius: 16px;
+            text-align: center;
+            font-weight: 600;
+            font-size: 14px;
+            text-decoration: none;
+            transition: transform 0.2s;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            display: block;
+        }
+
+        .preview-link:hover {
+            transform: scale(1.02);
+        }
+
+        .footer {
+            margin-top: auto;
+            padding-top: 40px;
+            padding-bottom: 24px;
+        }
+
+        .footer a {
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            text-decoration: none;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+
+        .footer a:hover {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+
+<header class="header">
+    <button class="back-btn" onclick="window.history.back()">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <h1>Link-in-Bio Generator</h1>
+</header>
+
+<div class="container glassmorphism">
+    <section class="editor-section">
+        <fieldset id="private-profile-editor" disabled style="border:0;padding:0;margin:0;min-width:0;display:flex;flex-direction:column;gap:24px">
+        <div class="panel glassmorphism glassmorphism">
+            <h2>Profile Details</h2>
+            <div class="form-group">
+                <label>Business Name</label>
+                <input type="text" id="store-name" value="My Store">
+            </div>
+            <div class="form-group">
+                <label>Bio / Tagline</label>
+                <textarea id="bio-text" rows="2">Welcome to my storefront!</textarea>
+            </div>
+            <div class="form-group">
+                <label>Theme</label>
+                <div class="theme-selector">
+                    <button class="theme-btn active" data-theme="gradient" style="background: linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%);"></button>
+                    <button class="theme-btn" data-theme="dark" style="background: #1D1D1F;"></button>
+                    <button class="theme-btn" data-theme="light" style="background: #ffffff; border: 1px solid #d1d5db;"></button>
+                    <button class="theme-btn" data-theme="purple" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);"></button>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel glassmorphism glassmorphism">
+            <h2>Private configuration</h2>
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 16px; margin-bottom: 16px; background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px;">
+                <div>
+                    <span style="font-size: 14px; font-weight: 500; color: #111827;">Remove "OmniSolo" Badge</span>
+                    <p style="font-size: 12px; color: #6b7280; margin-top: 4px; margin-bottom: 0;">Hide the OmniSolo branding in your private preview.</p>
+                </div>
+                <label style="position: relative; display: inline-block; width: 48px; height: 24px;">
+                    <input type="checkbox" id="remove-branding-toggle" style="opacity: 0; width: 0; height: 0;">
+                    <span id="remove-branding-slider" style="position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #d1d5db; transition: .2s; border-radius: 24px;">
+                        <span id="remove-branding-knob" style="position: absolute; height: 16px; width: 16px; left: 4px; bottom: 4px; background-color: white; transition: .2s; border-radius: 50%;"></span>
+                    </span>
+                </label>
+            </div>
+            <button id="copy-btn" class="btn-primary">Copy saved private preview link</button>
+            <p style="text-align: center; font-size: 12px; color: #6b7280; margin-top: 8px;">Private previews require sign-in to the owning business. Public publication is not available.</p>
+        </div>
+        <p id="private-profile-status" role="status">Verifying private profile access…</p>
+        </fieldset>
+    </section>
+
+    <section class="preview-section">
+        <div class="phone-container">
+            <div class="notch"></div>
+            <div id="preview-content" class="preview-content">
+                <div class="avatar">✨</div>
+                <h1 id="preview-title" class="preview-title">My Store</h1>
+                <p id="preview-bio" class="preview-bio">Welcome to my storefront!</p>
+
+                <div class="links-container" id="preview-links">
+                    <!-- Links will be added here -->
+                </div>
+
+                <div class="footer">
+                    <a id="powered-by-link" href="/api/v1/growth/referrals/click?target=/setup.html&ref=my-store&source=bio_page">⚡ OmniSolo</a>
+                </div>
+            </div>
+        </div>
+    </section>
+</div>
+
+<script>
+function isSupportedBioUrl(value) {
+    if(typeof value!=='string'||!/^https?:\/\//i.test(value)||/[\s\p{Cc}\\]/u.test(value))return false;
+    try{const url=new URL(value);return (url.protocol==='http:'||url.protocol==='https:')&&url.hostname.length>0;}catch{return false;}
+}
+function initLinkInBio() {
+    const $ = id => document.getElementById(id);
+    const editor = $('private-profile-editor'), status = $('private-profile-status');
+    const name = $('store-name'), bio = $('bio-text'), copy = $('copy-btn');
+    const themes = document.querySelectorAll('.theme-btn');
+    let owner = null, epoch = 0, phase = 'loading', hasSaved = false, saving = false;
+    let saveTimer, expiryTimer, copyTimer;
+    let state = {store_name:'',bio:'',theme:'gradient',links:[],remove_branding:false};
+    function controls() {editor.disabled = phase !== 'ready' || saving;copy.disabled = phase !== 'ready' || !hasSaved || saving;}
+    function message(value) {status.textContent=value;}
+    function styles(theme) {
+        switch(theme) {
+            case 'dark': return {bg:'#1D1D1F',color:'#ffffff',linkBg:'rgba(255,255,255,.15)',border:'rgba(255,255,255,.3)'};
+            case 'light': return {bg:'#f3f4f6',color:'#111827',linkBg:'#ffffff',border:'#e5e7eb'};
+            case 'purple': return {bg:'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',color:'#ffffff',linkBg:'rgba(255,255,255,.15)',border:'rgba(255,255,255,.3)'};
+            default:return {bg:'linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%)',color:'#1D1D1F',linkBg:'rgba(255,255,255,.15)',border:'rgba(255,255,255,.3)'};
+        }
+    }
+    function preview() {
+        $('preview-title').textContent=state.store_name;$('preview-bio').textContent=state.bio;
+        const theme=styles(state.theme);$('preview-content').style.background=theme.bg;$('preview-content').style.color=theme.color;
+        $('powered-by-link').style.display=owner && !state.remove_branding?'block':'none';
+        if(owner)$('powered-by-link').href=`/api/v1/growth/referrals/click?target=/setup.html&ref=${encodeURIComponent(owner.tenantId)}&source=bio_page`;
+        $('powered-by-link').style.color=theme.color;
+        $('remove-branding-toggle').checked=state.remove_branding;
+        $('remove-branding-slider').style.backgroundColor=state.remove_branding?'#4f46e5':'#d1d5db';
+        $('remove-branding-knob').style.transform=state.remove_branding?'translateX(24px)':'translateX(0)';
+        $('preview-links').replaceChildren();
+        for(const link of state.links){const supported=isSupportedBioUrl(link.url);const a=document.createElement(supported?'a':'span');if(supported)a.href=link.url;else a.setAttribute('aria-disabled','true');a.textContent=link.title+(supported?'':' (unavailable)');a.className='preview-link';a.style.background=theme.linkBg;a.style.border=`1px solid ${theme.border}`;a.style.color=theme.color;$('preview-links').appendChild(a);}
+        for(const button of themes){button.classList.toggle('active',button.dataset.theme===state.theme);button.setAttribute('aria-pressed',String(button.dataset.theme===state.theme));}
+    }
+    function retire() {
+        ++epoch;owner=null;phase='held';saving=false;hasSaved=false;
+        clearTimeout(saveTimer);clearTimeout(expiryTimer);clearTimeout(copyTimer);
+        state={store_name:'',bio:'',theme:'gradient',links:[],remove_branding:false};name.value='';bio.value='';copy.textContent='Copy saved private preview link';
+        preview();controls();message('Your session changed. Reload to verify private profile access.');
+    }
+    async function identity() {
+        const response=await fetch('/api/v1/auth/session-identity',{credentials:'same-origin',cache:'no-store',redirect:'error'});
+        const value=await response.json();
+        if(response.status!==200 || value?.error!=null || value?.success===false || typeof value?.userId!=='string' || !value.userId || typeof value?.tenantId!=='string' || !value.tenantId || !Number.isFinite(value.expiresAt) || value.expiresAt<=Date.now())throw new Error('Verified private identity unavailable');
+        return value;
+    }
+    function headers(value,jsonBody=false) {
+        const h=new Headers({'x-ohc-expected-user':value.userId,'x-ohc-expected-tenant':value.tenantId});
+        if(jsonBody)h.set('Content-Type','application/json');
+        if(h.get('x-ohc-expected-user')!==value.userId || h.get('x-ohc-expected-tenant')!==value.tenantId)throw new Error('Identity cannot be represented');
+        return h;
+    }
+    function scheduleSave() {
+        clearTimeout(saveTimer);
+        if(phase!=='ready' || saving || !owner)return;
+        if(state.links.some(link=>!isSupportedBioUrl(link.url))){message('Each link needs an absolute HTTP or HTTPS URL without whitespace or control characters.');return;}
+        message('Private changes are not saved yet.');
+        saveTimer=setTimeout(async()=>{
+            if(phase!=='ready' || saving || !owner)return;
+            const current=epoch,intended={...owner},payload={...state,links:state.links.map(link=>({...link})),tenant_id:owner.tenantId};
+            saving=true;controls();message('Saving private configuration…');
+            try {
+                let verified;
+                try{verified=await identity();}catch{if(current===epoch)retire();return;}
+                if(current!==epoch)return;
+                if(verified.userId!==intended.userId || verified.tenantId!==intended.tenantId){retire();return;}
+                const response=await fetch('/api/v1/growth/link-in-bio',{method:'POST',headers:headers(intended,true),body:JSON.stringify(payload),credentials:'same-origin',cache:'no-store',redirect:'error'});
+                if(current!==epoch)return;
+                if(response.status===401||response.status===403){retire();return;}
+                const body=await response.text();if(current!==epoch)return;
+                if(response.status===409){
+                    let error;try{error=JSON.parse(body)?.error;}catch{/* An unreadable conflict is an unknown save outcome. */}
+                    if(error==='queued owner does not match the current session'||error==='session_identity_changed'){retire();return;}
+                }
+                if(response.status!==200 || body!=='')throw new Error('Unconfirmed save');
+                hasSaved=true;message('Saved private configuration. Public publication is not available.');
+            }catch{if(current===epoch){phase='held';message('The private save could not be confirmed. Reload and review stored data before trying again.');}}
+            finally{if(current===epoch){saving=false;controls();}}
+        },500);
+    }
+    name.addEventListener('input',()=>{if(phase!=='ready'||saving)return;state.store_name=name.value;preview();scheduleSave();});
+    bio.addEventListener('input',()=>{if(phase!=='ready'||saving)return;state.bio=bio.value;preview();scheduleSave();});
+    for(const button of themes)button.addEventListener('click',()=>{if(phase!=='ready'||saving)return;state.theme=button.dataset.theme;preview();scheduleSave();});
+    $('remove-branding-toggle').addEventListener('change',()=>{if(phase!=='ready'||saving)return;state.remove_branding=$('remove-branding-toggle').checked;preview();scheduleSave();});
+    copy.addEventListener('click',async()=>{
+        if(phase!=='ready'||!hasSaved||!owner)return;
+        const current=epoch;const url=`${location.origin}/bio/${encodeURIComponent(owner.tenantId)}`;copy.disabled=true;
+        try{if(!navigator.clipboard?.writeText)throw new Error('Clipboard unavailable');await navigator.clipboard.writeText(url);if(current!==epoch)return;copy.textContent='Copied private preview link';message('Copied the saved private preview link; it requires sign-in to this business.');copyTimer=setTimeout(()=>{if(current===epoch)copy.textContent='Copy saved private preview link';},2000);}
+        catch{if(current===epoch)message('Copy failed. No success was confirmed.');}
+        finally{if(current===epoch)controls();}
+    });
+    window.addEventListener('omnisolo_auth_changed',retire);
+    window.addEventListener('storage',event=>{if(event.key===null||event.key==='omnisolo_queue_identity_epoch_v2')retire();});
+    window.addEventListener('pagehide',retire);
+    name.value='';bio.value='';preview();controls();
+    const current=++epoch;
+    void(async()=>{
+        try{
+            if(!['http:','https:'].includes(location.protocol))throw new Error('Authenticated app origin required');
+            const verified=await identity();if(current!==epoch)return;const expected=headers(verified);owner=verified;
+            expiryTimer=setTimeout(retire,Math.min(owner.expiresAt-Date.now(),2147483647));
+            const response=await fetch(`/api/v1/growth/link-in-bio/${encodeURIComponent(owner.tenantId)}`,{headers:expected,credentials:'same-origin',cache:'no-store',redirect:'error'});
+            if(response.status===404){await response.text();if(current!==epoch)return;phase='ready';controls();message('No saved private profile. Enter your details to save one.');return;}
+            if(response.status!==200)throw new Error('Private profile unavailable');
+            const data=await response.json();if(current!==epoch)return;
+            if(data?.error!=null || data?.success===false || typeof data?.store_name!=='string' || typeof data.bio!=='string' || typeof data.theme!=='string' || !Array.isArray(data.links) || data.links.some(link=>!link||typeof link.title!=='string'||typeof link.url!=='string') || (data.remove_branding!==undefined && typeof data.remove_branding!=='boolean'))throw new Error('Invalid private profile');
+            state={store_name:data.store_name,bio:data.bio,theme:data.theme,links:data.links,remove_branding:data.remove_branding??false};name.value=state.store_name;bio.value=state.bio;phase='ready';hasSaved=true;preview();controls();message('Saved private profile loaded. Public publication is not available.');
+        }catch{if(current===epoch){phase='held';controls();message('Private profile could not be loaded. Open the authenticated app and reload before editing.');}}
+    })();
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initLinkInBio);else initLinkInBio();
+</script>
+
+  <script src="help-widget.mjs" type="module"></script>
+  </body>
+</html>

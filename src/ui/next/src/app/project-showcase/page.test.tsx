@@ -1,0 +1,55 @@
+import React from 'react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import ProjectShowcasePage from './page';
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    push: vi.fn(),
+  }),
+}));
+
+vi.mock('../components/PoweredByOmniSolo', () => ({
+  PoweredByOmniSolo: () => <div data-testid="powered-by-omnisolo">⚡ Powered by OmniSolo</div>,
+}));
+
+describe('ProjectShowcasePage', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ current_plan: 'free' }) });
+  });
+
+  it('renders Powered by OmniSolo branding in preview by default', () => {
+    render(<ProjectShowcasePage />);
+
+    const brandingElements = screen.getAllByTestId('powered-by-omnisolo');
+    expect(brandingElements.length).toBeGreaterThan(0);
+    expect(brandingElements[0]).toBeInTheDocument();
+  });
+
+  it('shows paywall when free user tries to remove branding', () => {
+    render(<ProjectShowcasePage />);
+
+    const toggle = screen.getByRole('checkbox');
+    fireEvent.click(toggle);
+
+    expect(screen.getByText('Upgrade to Pro')).toBeInTheDocument();
+
+    const brandingElements = screen.getAllByTestId('powered-by-omnisolo');
+    expect(brandingElements[0]).toBeInTheDocument();
+  });
+
+  it('allows verified owners to remove branding after capabilities confirm Community Edition', async () => {
+    global.fetch = vi.fn(async url => Response.json(url === '/api/v1/auth/session-identity' ? { userId: 'plan-owner', tenantId: 'plan-tenant', expiresAt: Date.now() + 60000 } : { edition: 'community', features: { cloud_sync: false, oidc: false, saas_billing: false, multitenant: false } }));
+    render(<ProjectShowcasePage />);
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/v1/capabilities', expect.objectContaining({ credentials: 'same-origin' })));
+    await new Promise(r => setTimeout(r, 0));
+    const toggle = screen.getByRole('checkbox');
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+
+    // PoweredBy should not be rendered
+    expect(screen.queryByTestId('powered-by-omnisolo')).toBeNull();
+  });
+});

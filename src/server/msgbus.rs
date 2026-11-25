@@ -1,0 +1,601 @@
+use async_trait::async_trait;
+use tokio::sync::Mutex;
+use tokio::sync::broadcast;
+
+#[derive(Clone, prost::Message)]
+pub struct Message {
+    #[prost(string, tag = "1")]
+    pub topic: String,
+    #[prost(bytes, tag = "2")]
+    pub payload: Vec<u8>,
+}
+
+#[async_trait]
+pub trait DistributedLock: Send + Sync {
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String>;
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String>;
+}
+
+#[async_trait]
+pub trait Bus: Send + Sync {
+    async fn publish(&self, msg: Message) -> Result<(), String>;
+    async fn subscribe(
+        &self,
+        topic: String,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String>;
+}
+
+pub struct MemoryBus {
+    subs: Mutex<std::collections::HashMap<String, broadcast::Sender<Message>>>,
+    locks: Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+}
+
+impl MemoryBus {
+    pub fn new() -> Self {
+        MemoryBus {
+            subs: Mutex::new(std::collections::HashMap::new()),
+            locks: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Bus for MemoryBus {
+    async fn publish(&self, msg: Message) -> Result<(), String> {
+        let subs = self.subs.lock().await;
+        for (topic, tx) in subs.iter() {
+            if msg.topic == *topic || (topic.ends_with(':') && msg.topic.starts_with(topic)) {
+                let _ = tx.send(msg.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        topic: String,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let mut subs = self.subs.lock().await;
+        let tx = subs.entry(topic.clone()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(100);
+            tx
+        });
+
+        let mut rx = tx.subscribe();
+
+        let worker = tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                handler(msg);
+            }
+        });
+
+        let cancel = Box::new(move || {
+            worker.abort();
+        });
+
+        Ok(cancel)
+    }
+}
+
+impl Default for MemoryBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl DistributedLock for MemoryBus {
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        let mut locks = self.locks.lock().await;
+        let now = std::time::Instant::now();
+
+        // Remove expired locks
+        locks.retain(|_, (_, expires_at)| *expires_at > now);
+
+        let expires_at = now + std::time::Duration::from_secs(ttl_seconds);
+        if let Some((current_owner, _)) = locks.get(resource) {
+            if current_owner == owner {
+                locks.insert(resource.to_string(), (owner.to_string(), expires_at));
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        locks.insert(resource.to_string(), (owner.to_string(), expires_at));
+        Ok(true)
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        let mut locks = self.locks.lock().await;
+        if let Some((current_owner, _)) = locks.get(resource)
+            && current_owner == owner
+        {
+            locks.remove(resource);
+        }
+        Ok(())
+    }
+}
+
+pub struct IpcBus {
+    pool: sqlx::SqlitePool,
+    subs: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::broadcast::Sender<Message>>,
+        >,
+    >,
+}
+
+impl IpcBus {
+    pub async fn new(db_url: &str) -> Result<Self, String> {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let path_str_opt = if let Some(p) = db_url.strip_prefix("sqlite://") {
+            Some(p)
+        } else {
+            db_url.strip_prefix("sqlite:")
+        };
+
+        if let Some(path_str) = path_str_opt {
+            let db_path = std::path::Path::new(path_str.split('?').next().unwrap_or(path_str));
+            if !matches!(db_path.to_str(), Some(":memory:" | "memory:")) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .mode(0o600)
+                        .open(db_path)
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = file.metadata() {
+                            let mut perms = metadata.permissions();
+                            if perms.mode() & 0o777 != 0o600 {
+                                perms.set_mode(0o600);
+                                let _ = file.set_permissions(perms);
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(db_path);
+                }
+            }
+        }
+
+        let options: SqliteConnectOptions = db_url
+            .parse()
+            .map_err(|e| format!("Invalid db url: {}", e))?;
+        let options = options.create_if_missing(false);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bus_checkpoints (
+                subscriber_id TEXT PRIMARY KEY,
+                last_id INTEGER NOT NULL
+            );",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bus_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bus_locks (
+                resource TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            );",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let subs = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let bus = IpcBus {
+            pool: pool.clone(),
+            subs: subs.clone(),
+        };
+
+        bus.start_worker().await;
+
+        let cleanup_pool = pool.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                let _ = sqlx::query(
+                    "DELETE FROM bus_messages WHERE created_at < datetime('now', '-1 day')",
+                )
+                .execute(&cleanup_pool)
+                .await;
+            }
+        });
+
+        Ok(bus)
+    }
+
+    pub async fn start_worker(&self) {
+        let pool = self.pool.clone();
+        let subs = self.subs.clone();
+
+        tokio::spawn(async move {
+            let subscriber_id = "standalone_node".to_string();
+            let mut last_id: i64 =
+                sqlx::query_scalar("SELECT last_id FROM bus_checkpoints WHERE subscriber_id = ?")
+                    .bind(&subscriber_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0);
+
+            loop {
+                let rows: Result<Vec<(i64, String, Vec<u8>)>, _> = sqlx::query_as(
+                    "SELECT id, topic, payload FROM bus_messages WHERE id > ? ORDER BY id ASC",
+                )
+                .bind(last_id)
+                .fetch_all(&pool)
+                .await;
+
+                if let Ok(results) = rows {
+                    let s = subs.lock().await;
+                    for (id, topic, payload_buf) in &results {
+                        last_id = *id;
+                        for (sub_topic, tx) in s.iter() {
+                            if topic == sub_topic
+                                || (sub_topic.ends_with(':') && topic.starts_with(sub_topic))
+                            {
+                                use prost::Message as ProstMessage;
+                                let m =
+                                    Message::decode(&payload_buf[..]).unwrap_or_else(|_| Message {
+                                        topic: topic.clone(),
+                                        payload: vec![],
+                                    });
+                                let _ = tx.send(m);
+                            }
+                        }
+                    }
+                    if !results.is_empty() {
+                        let _ = sqlx::query("INSERT INTO bus_checkpoints (subscriber_id, last_id) VALUES (?, ?) ON CONFLICT(subscriber_id) DO UPDATE SET last_id = excluded.last_id")
+                            .bind(&subscriber_id)
+                            .bind(last_id)
+                            .execute(&pool)
+                            .await;
+                    }
+                }
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        });
+    }
+}
+
+#[async_trait]
+impl Bus for IpcBus {
+    async fn publish(&self, msg: Message) -> Result<(), String> {
+        use prost::Message as ProstMessage;
+        let mut payload = Vec::new();
+        msg.encode(&mut payload).unwrap();
+
+        let mut retries = 0;
+        loop {
+            match sqlx::query("INSERT INTO bus_messages (topic, payload) VALUES (?, ?)")
+                .bind(&msg.topic)
+                .bind(&payload)
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if retries >= 3 {
+                        return Err(e.to_string());
+                    }
+                    retries += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100 * retries)).await;
+                }
+            }
+        }
+    }
+
+    async fn subscribe(
+        &self,
+        topic: String,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let mut s = self.subs.lock().await;
+        let tx = s.entry(topic.clone()).or_insert_with(|| {
+            let (tx, _) = tokio::sync::broadcast::channel(100);
+            tx
+        });
+
+        let mut rx = tx.subscribe();
+
+        let worker = tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                handler(msg);
+            }
+        });
+
+        let cancel = Box::new(move || {
+            worker.abort();
+        });
+
+        Ok(cancel)
+    }
+}
+
+#[async_trait]
+impl DistributedLock for IpcBus {
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        let expires_at = chrono::Utc::now().timestamp() + ttl_seconds as i64;
+        let res = sqlx::query("INSERT INTO bus_locks (resource, owner, expires_at) VALUES (?, ?, ?) ON CONFLICT(resource) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at WHERE bus_locks.owner = excluded.owner OR bus_locks.expires_at <= cast(strftime('%s', 'now') as integer) RETURNING resource")
+            .bind(resource)
+            .bind(owner)
+            .bind(expires_at)
+            .fetch_optional(&self.pool)
+            .await;
+
+        match res {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM bus_locks WHERE resource = ? AND owner = ?")
+            .bind(resource)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn test_memory_bus_pub_sub() {
+        let bus = MemoryBus::new();
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        let handler = Box::new(move |msg: Message| {
+            tracing::debug!("Received message: {:?}", msg);
+            received_clone.store(true, Ordering::SeqCst);
+        });
+
+        let cancel = bus
+            .subscribe("test_topic".to_string(), handler)
+            .await
+            .unwrap();
+
+        let msg = Message {
+            topic: "test_topic".to_string(),
+            payload: vec![],
+        };
+
+        bus.publish(msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert!(received.load(Ordering::SeqCst));
+
+        cancel();
+    }
+
+    #[tokio::test]
+    async fn test_ipc_bus_pub_sub() {
+        let tmp_dir = std::env::var("TEST_TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        let db_path = format!(
+            "{}/test_ipc_bus_{}.sqlite",
+            tmp_dir,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let db_url = format!("sqlite://{}", db_path);
+
+        let bus = IpcBus::new(&db_url).await.unwrap();
+
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        let handler = Box::new(move |msg: Message| {
+            if msg.topic == "test_ipc_topic" {
+                received_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let cancel = bus
+            .subscribe("test_ipc_topic".to_string(), handler)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let msg = Message {
+            topic: "test_ipc_topic".to_string(),
+            payload: vec![],
+        };
+
+        bus.publish(msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        assert!(received.load(Ordering::SeqCst));
+        cancel();
+    }
+
+    #[tokio::test]
+    async fn test_memory_bus_distributed_lock() {
+        let bus = MemoryBus::new();
+        let resource = "test_resource";
+        let owner1 = "owner1";
+        let owner2 = "owner2";
+
+        assert!(bus.acquire_lock(resource, owner1, 1).await.unwrap());
+        assert!(!bus.acquire_lock(resource, owner2, 1).await.unwrap());
+        assert!(bus.acquire_lock(resource, owner1, 1).await.unwrap());
+
+        bus.release_lock(resource, owner1).await.unwrap();
+        assert!(bus.acquire_lock(resource, owner2, 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_ipc_bus_distributed_lock() {
+        let tmp_dir = std::env::var("TEST_TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        let db_path = format!(
+            "{}/test_ipc_lock_{}.sqlite",
+            tmp_dir,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let db_url = format!("sqlite://{}", db_path);
+
+        let bus = IpcBus::new(&db_url).await.unwrap();
+        let resource = "test_ipc_resource";
+        let owner1 = "owner1";
+        let owner2 = "owner2";
+
+        assert!(bus.acquire_lock(resource, owner1, 2).await.unwrap());
+        assert!(!bus.acquire_lock(resource, owner2, 2).await.unwrap());
+
+        // Allow lock to expire. Poll because SQLite's second-granularity clock can
+        // land on the boundary under loaded test runs.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let mut acquired_after_expiration = false;
+        while tokio::time::Instant::now() < deadline {
+            if bus.acquire_lock(resource, owner2, 2).await.unwrap() {
+                acquired_after_expiration = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(acquired_after_expiration);
+
+        bus.release_lock(resource, owner2).await.unwrap();
+        assert!(bus.acquire_lock(resource, owner1, 2).await.unwrap());
+
+        // Re-acquire by same owner to extend
+        assert!(bus.acquire_lock(resource, owner1, 2).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests_ipc {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ipc_lock() {
+        let db_url = "sqlite::memory:";
+        let bus = IpcBus::new(db_url).await.unwrap();
+
+        let acquired1 = bus.acquire_lock("test_res", "owner1", 10).await.unwrap();
+        assert!(acquired1);
+
+        let acquired2 = bus.acquire_lock("test_res", "owner2", 10).await.unwrap();
+        assert!(!acquired2);
+
+        bus.release_lock("test_res", "owner1").await.unwrap();
+
+        let acquired3 = bus.acquire_lock("test_res", "owner2", 10).await.unwrap();
+        assert!(acquired3);
+    }
+}
+
+#[cfg(test)]
+mod memory_bus_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn test_memory_bus_publish_subscribe() {
+        let bus = MemoryBus::new();
+        let received = Arc::new(AtomicBool::new(false));
+        let rx = received.clone();
+
+        let handler = Box::new(move |msg: Message| {
+            if msg.topic == "test_topic" && msg.payload == b"hello" {
+                rx.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let _cancel = bus
+            .subscribe("test_topic".to_string(), handler)
+            .await
+            .unwrap();
+
+        let msg = Message {
+            topic: "test_topic".to_string(),
+            payload: b"hello".to_vec(),
+        };
+
+        bus.publish(msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(received.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_memory_bus_lock_acquire_release() {
+        let bus = MemoryBus::new();
+
+        let acquired = bus.acquire_lock("resource1", "owner1", 10).await.unwrap();
+        assert!(acquired);
+
+        let acquired_again = bus.acquire_lock("resource1", "owner2", 10).await.unwrap();
+        assert!(!acquired_again);
+
+        bus.release_lock("resource1", "owner1").await.unwrap();
+
+        let acquired_after_release = bus.acquire_lock("resource1", "owner2", 10).await.unwrap();
+        assert!(acquired_after_release);
+    }
+}

@@ -1,0 +1,415 @@
+pub mod claude_subagents;
+pub mod compaction;
+pub mod durable_execution;
+pub mod omni_context;
+pub mod plugins;
+pub mod scalable_multi_agent;
+// omnisolo-builtin-agent: Rust reimplementation of the OmniSolo builtin agent.
+//
+// Configuration via environment variables:
+//   OMNISOLO_AGENT_ADDRESS          gRPC listen address (default: 127.0.0.1:50051)
+//   OMNISOLO_AGENT_ID               agent identifier
+//   ANTHROPIC_API_KEY          enables Anthropic Claude backend
+//   OPENAI_API_KEY             enables OpenAI backend
+//   MINIMAX_API_KEY            enables MiniMax backend
+//   OMNISOLO_LLM_API_KEY            generic key for OpenAI-compatible backends
+//   OMNISOLO_LLM_BASE_URL           generic OpenAI-compatible /v1 API base URL
+//   OMNISOLO_LOCAL_LLM_ENDPOINT     Ollama endpoint
+//   OMNISOLO_LLM_PROVIDER           "anthropic" | "openai" | "openai-compatible" | "minimax" | "ollama"
+//   OMNISOLO_LLM_MODEL              LLM model name
+//   OMNISOLO_MAX_TOKENS             max tokens per LLM response (default 2048)
+//   OMNISOLO_MAX_ITERATIONS         max ReAct iterations (default 100)
+//   OMNISOLO_AGENT_WORKSPACE        workspace/sandbox root for file and shell tools
+//   OMNISOLO_AGENT_EXECUTION_MODE   "standalone" | "cluster" | "cloud"; cluster/cloud use containers when available
+//   OMNISOLO_AGENT_COMMAND_BACKEND  "container" to force Docker/Podman execution
+//   OMNISOLO_AGENT_CONTAINER_IMAGE  container image for cluster command execution (default alpine:3.20)
+//   OMNISOLO_AGENT_AUTH_DISABLED    "true" to disable auth (dev/test only)
+//   OMNISOLO_AGENT_TOKEN            pre-shared token for token-based auth
+
+pub use omnisolo_builtin_agent_core::*;
+
+pub mod agent;
+pub mod human_in_loop;
+pub mod observability;
+pub mod observation_masking;
+pub mod perplexity;
+pub mod tools_gating;
+pub mod verification_loops;
+
+pub mod autogen;
+pub mod departments;
+pub mod goose;
+pub mod guardrails;
+pub mod in_memory_store;
+pub mod json_store;
+pub mod local_service_adapters;
+pub mod memory;
+pub mod memory_exhaustive_tests;
+pub mod memory_store;
+pub mod middleware;
+pub mod openhands;
+pub mod openhands_runner;
+pub mod prompt_construction;
+pub mod ralph_loop;
+pub mod ruflo;
+pub mod service;
+
+pub use omnisolo_builtin_agent_llm as llm;
+pub use omnisolo_builtin_agent_tools as tools;
+pub mod mesh;
+pub mod proto;
+pub mod tenant_analysis;
+pub use service::start_builtin_agent;
+
+pub mod checkpointer;
+pub mod codex_runner;
+pub mod consolidation_worker;
+pub mod harness;
+pub mod hibernation;
+pub mod json_rpc_server;
+pub mod langgraph;
+pub mod plane;
+pub mod progressive_skills;
+pub mod provider;
+pub mod registry;
+pub mod sqlite_memory;
+
+pub mod actor_model;
+pub mod agent_protocol;
+pub mod gpt_researcher;
+pub mod llm_condensation;
+pub mod plan_and_execute;
+pub mod sona_patterns;
+pub mod swarm_topology;
+pub mod visual_workflow;
+pub mod visual_workflow_client;
+
+pub mod agentic_seek;
+pub mod pi;
+pub mod ruflo_plugins;
+pub mod tool_executor_engine;
+
+#[cfg(test)]
+mod middleware_integration_tests;
+
+fn get_env(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn get_env_int(key: &str, default: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn resolve_process_tenant(
+    execution_mode: &str,
+    configured_org: Option<&str>,
+) -> Result<tools::tenant::TenantContext, String> {
+    let execution_mode = execution_mode.trim().to_ascii_lowercase();
+    if execution_mode == "standalone" {
+        return match configured_org {
+            Some(organization_id) if !organization_id.trim().is_empty() => {
+                tools::tenant::TenantContext::new(organization_id).map_err(str::to_string)
+            }
+            _ => Ok(tools::tenant::TenantContext::system()),
+        };
+    }
+
+    let organization_id = configured_org
+        .map(str::trim)
+        .filter(|organization_id| !organization_id.is_empty())
+        .ok_or_else(|| {
+            "OMNISOLO_ORGANIZATION_ID is required when OMNISOLO_AGENT_EXECUTION_MODE is not standalone"
+                .to_string()
+        })?;
+    if organization_id.eq_ignore_ascii_case("system") {
+        return Err("the system tenant is not allowed outside standalone mode".to_string());
+    }
+
+    tools::tenant::TenantContext::new(organization_id).map_err(str::to_string)
+}
+
+#[cfg(test)]
+mod process_tenant_tests {
+    use super::resolve_process_tenant;
+
+    #[test]
+    fn standalone_defaults_to_the_local_system_tenant() {
+        let tenant = resolve_process_tenant("standalone", None).expect("standalone tenant");
+
+        assert_eq!(tenant.as_str(), "system");
+    }
+
+    #[test]
+    fn cloud_requires_a_real_organization() {
+        assert!(resolve_process_tenant("cloud", None).is_err());
+        assert!(resolve_process_tenant("cloud", Some(" ")).is_err());
+        assert!(resolve_process_tenant("cloud", Some("system")).is_err());
+
+        let tenant = resolve_process_tenant("cloud", Some("org-a")).expect("cloud tenant");
+        assert_eq!(tenant.as_str(), "org-a");
+    }
+}
+
+async fn hold_specialist_exit_if_requested(task: &str) {
+    if !task.contains("Specialist:") {
+        return;
+    }
+    let secs = std::env::var("OMNISOLO_AGENT_SPECIALIST_EXIT_HOLD_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    if secs > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+}
+
+fn init_otel() {
+    use opentelemetry_otlp::WithExportConfig;
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+    let tracer = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(otlp_endpoint)
+        .build()
+        .expect("failed to build tracer");
+
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(tracer)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder_empty()
+                .with_attributes([opentelemetry::KeyValue::new("service.name", "ohc-agent")])
+                .build(),
+        )
+        .build();
+
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "ohc-agent");
+
+    let use_json = std::env::var("LOG_FORMAT").unwrap_or_default() == "json";
+
+    if use_json {
+        use tracing_subscriber::prelude::*;
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().json())
+            .with(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .try_init();
+    } else {
+        use tracing_subscriber::prelude::*;
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .try_init();
+    }
+}
+
+pub async fn run_agent() -> Result<(), Box<dyn std::error::Error>> {
+    // Set up logging and OTEL.
+    init_otel();
+
+    let args: Vec<String> = std::env::args().collect();
+    let mut task = None;
+    let mut worktree = None;
+    let mut mailbox = None;
+    let mut ralph_loop = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ralph-loop" => {
+                ralph_loop = true;
+            }
+            "--task" if i + 1 < args.len() => {
+                task = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--parent-context-file" => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--parent-context-file is disabled to prevent arbitrary host file reads",
+                )
+                .into());
+            }
+            "--worktree" if i + 1 < args.len() => {
+                worktree = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--mailbox" if i + 1 < args.len() => {
+                mailbox = Some(args[i + 1].clone());
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let address = get_env("OMNISOLO_AGENT_ADDRESS", service::DEFAULT_ADDRESS);
+    let agent_id = get_env(
+        "OMNISOLO_AGENT_ID",
+        &uuid::Uuid::new_v4().hyphenated().to_string(),
+    );
+
+    let cfg = service::AgentConfig {
+        llm_provider: get_env("OMNISOLO_LLM_PROVIDER", ""),
+        model: get_env("OMNISOLO_LLM_MODEL", ""),
+        llm_endpoint: get_env(
+            "OMNISOLO_LLM_BASE_URL",
+            &get_env(
+                "OMNISOLO_LLM_ENDPOINT",
+                &get_env("OMNISOLO_LOCAL_LLM_ENDPOINT", ""),
+            ),
+        ),
+        system_prompt: get_env("OMNISOLO_SYSTEM_PROMPT", ""),
+        max_tokens: get_env_int("OMNISOLO_MAX_TOKENS", 2048),
+        temperature: std::env::var("OMNISOLO_TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
+        max_iterations: get_env_int("OMNISOLO_MAX_ITERATIONS", 100),
+        max_context_messages: get_env_int("OMNISOLO_MAX_CONTEXT_MESSAGES", 80),
+    };
+
+    let auth = auth::auth_mode_from_env().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid agent authentication configuration: {error}"),
+        )
+    })?;
+
+    let execution_mode = std::env::var("OMNISOLO_AGENT_EXECUTION_MODE").unwrap_or_else(|_| {
+        if std::env::var("OMNISOLO_STANDALONE_MODE")
+            .map(|value| value == "true")
+            .unwrap_or(true)
+        {
+            "standalone".to_string()
+        } else {
+            "cloud".to_string()
+        }
+    });
+    let configured_org = std::env::var("OMNISOLO_ORGANIZATION_ID").ok();
+    let tenant =
+        resolve_process_tenant(&execution_mode, configured_org.as_deref()).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid agent tenant configuration: {error}"),
+            )
+        })?;
+
+    let mut svc_impl =
+        service::AgentServiceImpl::new_for_tenant(agent_id.clone(), cfg.clone(), auth, tenant);
+    svc_impl.init_memory().await;
+
+    if let Some(t) = task {
+        // Run as a subagent (Fork, Worktree, Teammate)
+        let working_dir = worktree.or(mailbox).unwrap_or_default();
+
+        if ralph_loop {
+            let req = proto::agent_service::RunTaskRequest {
+                task_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+                task: t,
+                llm_provider: cfg.llm_provider.clone(),
+                model: cfg.model.clone(),
+                llm_endpoint: cfg.llm_endpoint.clone(),
+                department: "ralph".to_string(),
+                ..Default::default()
+            };
+            svc_impl.run_ralph_loop(req).await;
+            return Ok(());
+        } else {
+            let task_for_hold = t.clone();
+            let req = proto::agent_service::SubAgentRequest {
+                task: t,
+                working_dir,
+                parent_context_json: String::new(),
+                ..Default::default()
+            };
+
+            match svc_impl.dispatch_local_cli_sub_agent(req).await {
+                Ok(inner) => {
+                    if !inner.error.is_empty() {
+                        tracing::error!("{}", inner.error);
+                        hold_specialist_exit_if_requested(&task_for_hold).await;
+                        std::process::exit(1);
+                    } else {
+                        tracing::info!("{}", inner.result);
+                        hold_specialist_exit_if_requested(&task_for_hold).await;
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Subagent dispatch error: {}", e);
+                    hold_specialist_exit_if_requested(&task_for_hold).await;
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "Starting OmniSolo builtin agent (Rust) at {} (id: {})",
+        address,
+        agent_id
+    );
+
+    let addr: std::net::SocketAddr = address.parse()?;
+    let svc = std::sync::Arc::new(svc_impl);
+    let svc_for_mesh = svc.clone();
+
+    let standalone_mode =
+        std::env::var("OMNISOLO_STANDALONE_MODE").unwrap_or_else(|_| "true".to_string());
+    let is_cloud = standalone_mode != "true";
+    let transport_url = std::env::var("OMNISOLO_MESH_TRANSPORT_URL").ok();
+
+    match mesh::transport::create_transport(transport_url.as_deref(), is_cloud).await {
+        Ok(transport) => {
+            let heartbeat_transport = transport.clone();
+            let heartbeat_agent_id = agent_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = heartbeat_transport
+                        .register_presence(&heartbeat_agent_id, "active", 30)
+                        .await
+                    {
+                        tracing::error!("Failed to register presence: {}", e);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            });
+            start_builtin_agent(transport, svc_for_mesh).await;
+        }
+        Err(e) => {
+            tracing::error!("Failed to create mesh transport: {}", e);
+        }
+    }
+
+    tonic::transport::Server::builder()
+        .add_service(
+            proto::agent_service::agent_service_server::AgentServiceServer::new(
+                service::SharedAgentService(svc),
+            ),
+        )
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+pub mod aider_repomap;
+pub mod deerflow;
+pub mod deerflow_subagents;
+pub mod jit_retrieval;
+pub mod microagent;

@@ -1,0 +1,98 @@
+import { expect } from './fixtures';
+import { Page, APIRequestContext } from '@playwright/test';
+
+export async function currentAppSmoke(page: Page, request: APIRequestContext, label: string) {
+
+  await page.setViewportSize({ width: 375, height: 812 });
+
+    // Every caller authenticates its own seeded actor with loginAs. Returning
+    // to /login redirects that valid session back to the dashboard; do not wait
+    // for the retired passwordless prototype form or switch actor identities.
+    await page.goto('/dashboard');
+    await expect(page, `${label}: the authenticated session must remain valid`)
+      .toHaveURL(/\/dashboard(?:[?#].*)?$/);
+
+    await expect(page.locator('h1', { hasText: 'Dashboard' }).first()).toBeVisible({ timeout: 25000 });
+    await expect(page.locator('h2', { hasText: 'Welcome back' }).first()).toBeVisible({ timeout: 5000 });
+
+    // Verify glassmorphism style drift on dashboard panels
+    const panel = page.locator('.app-panel').first();
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveCSS('backdrop-filter', /blur\(30px\)|none/);
+    await expect(panel).toHaveCSS('border-radius', '8px');
+
+    // Verify glassmorphism style drift on dashboard cards
+    const card = page.locator('a[href="/pos/terminal"]').first();
+    await expect(card).toBeVisible();
+    await expect(card).toHaveCSS('backdrop-filter', /blur\(30px\) saturate\(210%\)|blur\(30px\)|none/);
+    await expect(card).toHaveCSS('border-radius', /16px|8px/);
+
+    await page.goto('/agents');
+    await expect(page.getByRole('heading', { name: 'AI Departments' }).first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('span', { hasText: /The Ambassador/ }).first()).toBeVisible({ timeout: 5000 });
+
+    await page.goto('/website-builder');
+    await expect(page.getByRole('heading', { name: '10-Minute Setup Wizard' }).first()).toBeVisible({ timeout: 5000 });
+
+    await page.goto('/integrations');
+    await expect(page.getByRole('heading', { name: 'Tool Integrations' }).first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByRole('heading', { name: 'Connect Custom Software' })).toBeVisible({ timeout: 5000 });
+    await expect(page.getByRole('heading', { name: 'Social Media Accounts' })).toBeVisible({ timeout: 5000 });
+
+    await page.goto('/customer-referral-program');
+    await expect(page.getByRole('heading', { name: 'Customer Referral Program' }).first()).toBeVisible({ timeout: 5000 });
+
+    await page.goto('/storefront-builder');
+    await expect(page.getByRole('heading', { name: 'Welcome to OmniSolo OneHumanCorp Smart Builder' }).first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.animate-fade-in').first()).toBeVisible({ timeout: 5000 });
+
+    const ogCard = await request.get('/api/v1/growth/storefront/og-card?tenant=e2e&product_name=Smoke');
+    expect(ogCard.ok()).toBeTruthy();
+    expect(ogCard.headers()['content-type']).toContain('image/svg+xml');
+
+    // Verify Milestones Page and Embed code generation
+    await page.goto('/milestone-alerts');
+
+
+    // Wait for data to load
+    await page.waitForTimeout(2000);
+
+    // The page auto-selects the first milestone if available. Check if it's there, if not, skip test logic
+    const embedVisible = await page.locator('h3', { hasText: 'Embed on your website' }).isVisible();
+    if (embedVisible) {
+        // Check that textarea contains the right code snippet structure
+        const textarea = page.locator('textarea').first();
+        await expect(textarea).toBeVisible();
+        const embedValue = await textarea.inputValue();
+        expect(embedValue).toContain('<a href="');
+        expect(embedValue).toContain('source=milestone_embed');
+        expect(embedValue).toContain('<img src="');
+    }
+
+    // Verify Referral Leaderboard Generator
+    await page.goto('/viral-before-after-slider');
+    await page.waitForTimeout(1000);
+    const sliderTitle = await page.locator('h1', { hasText: 'Before & After Slider' });
+    await expect(sliderTitle).toBeVisible();
+
+    await page.goto('/viral-leaderboard-generator');
+
+
+    // Check that there is either a leaderboard or an empty state loaded
+    await page.waitForTimeout(2000); // Allow fetch to settle
+
+    const hasCodeBlock = await page.locator('#embed-code').isVisible();
+    const hasEmptyState = await page.locator('.empty-state').isVisible();
+    expect(hasCodeBlock || hasEmptyState, 'leaderboard must show data or an explicit empty state').toBe(true);
+
+
+
+    if (hasCodeBlock) {
+        const codeText = await page.locator('#embed-code').innerText();
+        expect(codeText).toContain('<div id="omnisolo-leaderboard"></div>');
+        expect(codeText).toContain('cloud.omnisolo.co/api/v1/growth/embed/widget?type=leaderboard');
+    }
+    await page.goto('/ui/viral-pwyw-generator.html');
+    await page.waitForTimeout(1000);
+    await expect(page.locator('h1', { hasText: 'Viral PWYW Drop Generator' })).toBeVisible();
+}

@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) OmniSolo LLC.
+
+use dashmap::DashMap;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+pub struct CachedResponse {
+    pub text: String,
+    pub created_at: Instant,
+    pub token_count: usize,
+    pub ttl: Duration,
+}
+
+/// Optional telemetry sink invoked when a prompt cache lookup hits.
+pub trait PromptCacheTelemetrySink: Send + Sync {
+    fn record_cache_hit(&self, model: &str, saved_tokens: usize);
+}
+
+/// OpenTelemetry counter-backed [`PromptCacheTelemetrySink`].
+pub struct OtelPromptCacheTelemetrySink {
+    llm_cost_counter: Counter<u64>,
+}
+
+impl OtelPromptCacheTelemetrySink {
+    pub fn new(llm_cost_counter: Counter<u64>) -> Self {
+        Self { llm_cost_counter }
+    }
+}
+
+impl PromptCacheTelemetrySink for OtelPromptCacheTelemetrySink {
+    fn record_cache_hit(&self, model: &str, _saved_tokens: usize) {
+        self.llm_cost_counter.add(
+            0,
+            &[
+                KeyValue::new("cache_hit", "true"),
+                KeyValue::new("model", model.to_string()),
+            ],
+        );
+    }
+}
+
+pub struct PromptCache {
+    cache: Arc<DashMap<String, CachedResponse>>,
+    default_ttl: Duration,
+    max_capacity: usize,
+    telemetry_sink: Option<Arc<dyn PromptCacheTelemetrySink>>,
+}
+
+impl PromptCache {
+    pub fn new(default_ttl: Duration) -> Self {
+        Self::with_capacity(default_ttl, 1000)
+    }
+
+    pub fn with_capacity(default_ttl: Duration, max_capacity: usize) -> Self {
+        PromptCache {
+            cache: Arc::new(DashMap::new()),
+            default_ttl,
+            max_capacity,
+            telemetry_sink: None,
+        }
+    }
+
+    pub fn with_telemetry(mut self, sink: Arc<dyn PromptCacheTelemetrySink>) -> Self {
+        self.telemetry_sink = Some(sink);
+        self
+    }
+
+    pub fn get(&self, prompt: &str) -> Option<CachedResponse> {
+        let entry = self.cache.get_mut(prompt);
+        if let Some(mut entry_ref) = entry {
+            if entry_ref.value().created_at.elapsed() <= entry_ref.value().ttl {
+                // True LRU support: update created_at on access so evict_oldest properly evicts least-recently-used items
+                entry_ref.value_mut().created_at = Instant::now();
+                return Some(entry_ref.value().clone());
+            }
+            drop(entry_ref);
+            // Remove expired entry atomically
+            self.cache
+                .remove_if(prompt, |_, v| v.created_at.elapsed() > v.ttl);
+        }
+        None
+    }
+
+    pub fn get_with_cost_cents(&self, prompt: &str, model: &str) -> (Option<CachedResponse>, i64) {
+        if self.telemetry_sink.is_some() {
+            tracing::info!("Prompt cache lookup recorded with telemetry sink");
+        } else {
+            tracing::info!("Prompt cache lookup");
+        }
+        let res = self.get(prompt);
+        let cost = if let Some(ref r) = res {
+            tracing::info!("Prompt cache hit saved {} tokens", r.token_count); // pii-safe
+
+            if let Some(sink) = &self.telemetry_sink {
+                sink.record_cache_hit(model, r.token_count);
+            }
+
+            let pricing = super::model_cost::get_pricing(model);
+            let cost_dollars = (r.token_count as f64 / 1_000_000.0) * pricing.cached_cost;
+            (cost_dollars * 100.0).round() as i64
+        } else {
+            0
+        };
+        (res, cost)
+    }
+
+    pub fn set(&self, prompt: &str, response: &str, token_count: usize) {
+        self.set_with_ttl(prompt, response, token_count, self.default_ttl);
+    }
+
+    pub fn set_with_ttl(&self, prompt: &str, response: &str, token_count: usize, ttl: Duration) {
+        if self.cache.len() >= self.max_capacity {
+            self.evict_oldest();
+        }
+        self.cache.insert(
+            prompt.to_string(),
+            CachedResponse {
+                text: response.to_string(),
+                created_at: Instant::now(),
+                token_count,
+                ttl,
+            },
+        );
+    }
+
+    fn evict_oldest(&self) {
+        self.clear_expired();
+
+        let len = self.cache.len();
+        if len < self.max_capacity {
+            return;
+        }
+
+        let target_len = (self.max_capacity as f64 * 0.9) as usize;
+        let to_remove = len.saturating_sub(target_len);
+
+        if to_remove == 0 {
+            return;
+        }
+
+        let mut instants: Vec<Instant> = Vec::with_capacity(len);
+        for kv in self.cache.iter() {
+            instants.push(kv.value().created_at);
+        }
+
+        if instants.is_empty() {
+            return;
+        }
+
+        let target_idx = std::cmp::min(to_remove.saturating_sub(1), instants.len() - 1);
+        let (_, &mut threshold_instant, _) = instants.select_nth_unstable(target_idx);
+
+        let mut keys_to_remove = Vec::with_capacity(to_remove);
+        for kv in self.cache.iter() {
+            if kv.value().created_at <= threshold_instant {
+                keys_to_remove.push(kv.key().clone());
+                if keys_to_remove.len() >= to_remove {
+                    break;
+                }
+            }
+        }
+
+        for k in keys_to_remove {
+            self.cache.remove(&k);
+        }
+    }
+
+    pub fn clear_expired(&self) {
+        let now = Instant::now();
+        self.cache
+            .retain(|_, entry| now.duration_since(entry.created_at) <= entry.ttl);
+    }
+
+    /// Intelligently truncates a context string to fit within a given token limit.
+    /// Uses a fast 4-chars-per-token heuristic and safely handles UTF-8 boundaries.
+    pub fn truncate_context(context: &str, max_tokens: usize) -> String {
+        if max_tokens == 0 {
+            return String::new();
+        }
+
+        let max_chars = max_tokens * 4;
+        let mut result = String::with_capacity(std::cmp::min(context.len(), max_chars));
+        let mut char_count = 0;
+
+        let mut last_space_byte_index = None;
+        let mut last_space_char_count = 0;
+
+        let mut chars = context.char_indices().peekable();
+        let mut in_url = false;
+        let mut truncated = false;
+
+        while let Some((_, c)) = chars.next() {
+            if char_count >= max_chars {
+                truncated = true;
+                break;
+            }
+
+            if !in_url && c == ']' {
+                result.push(c);
+                char_count += 1;
+
+                if let Some(&(_, '(')) = chars.peek() {
+                    let rest = &context[chars.clone().next().unwrap().0..];
+                    if rest.starts_with("(http://") || rest.starts_with("(https://") {
+                        in_url = true;
+                        chars.next();
+                    }
+                }
+            } else if in_url && c == ')' {
+                in_url = false;
+            } else if !in_url {
+                result.push(c);
+                if c.is_whitespace() {
+                    last_space_byte_index = Some(result.len());
+                    last_space_char_count = char_count;
+                }
+                char_count += 1;
+            }
+        }
+
+        if !truncated && result.len() == context.len() {
+            return context.to_string();
+        }
+
+        if truncated {
+            if let Some(space_idx) = last_space_byte_index
+                && last_space_char_count > max_chars / 2
+            {
+                result.truncate(space_idx);
+            }
+
+            let trimmed_len = result
+                .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+                .len();
+            result.truncate(trimmed_len);
+
+            result.push_str("...");
+        }
+
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    struct CountingTelemetrySink {
+        hits: AtomicUsize,
+        saved_tokens: AtomicUsize,
+    }
+
+    impl PromptCacheTelemetrySink for CountingTelemetrySink {
+        fn record_cache_hit(&self, _model: &str, saved_tokens: usize) {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.saved_tokens.fetch_add(saved_tokens, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_prompt_cache_get_set() {
+        let cache = PromptCache::new(Duration::from_secs(10));
+        cache.set("What is the capital of France?", "Paris", 1);
+
+        let response = cache.get("What is the capital of France?");
+        assert!(response.is_some());
+        assert_eq!(response.expect("failed to unwrap").text, "Paris");
+    }
+
+    #[test]
+    fn test_prompt_cache_expiration() {
+        let cache = PromptCache::new(Duration::from_millis(50));
+        cache.set("Hello", "World", 1);
+
+        thread::sleep(Duration::from_millis(60));
+        assert!(cache.get("Hello").is_none());
+    }
+
+    #[test]
+    fn test_prompt_cache_clear_expired() {
+        let cache = PromptCache::new(Duration::from_millis(50));
+        cache.set("Test", "Data", 1);
+
+        thread::sleep(Duration::from_millis(60));
+        cache.clear_expired();
+
+        assert!(cache.cache.is_empty());
+    }
+
+    #[test]
+    fn test_prompt_cache_clear_expired_partial() {
+        let cache = PromptCache::new(Duration::from_millis(100));
+        cache.set_with_ttl("Expired", "Data", 1, Duration::from_millis(10));
+        cache.set_with_ttl("Keep", "Data", 1, Duration::from_millis(1000));
+
+        thread::sleep(Duration::from_millis(20));
+        cache.clear_expired();
+
+        assert!(cache.get("Expired").is_none());
+        assert!(cache.get("Keep").is_some());
+    }
+
+    #[test]
+    fn test_prompt_cache_with_telemetry() {
+        let sink = Arc::new(CountingTelemetrySink {
+            hits: AtomicUsize::new(0),
+            saved_tokens: AtomicUsize::new(0),
+        });
+        let cache = PromptCache::new(Duration::from_secs(10)).with_telemetry(sink.clone());
+
+        cache.set("What is the capital of France?", "Paris", 100);
+        let (response, _cost) =
+            cache.get_with_cost_cents("What is the capital of France?", "gpt-4o");
+
+        assert!(response.is_some());
+        assert_eq!(sink.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.saved_tokens.load(Ordering::SeqCst), 100);
+
+        let meter = opentelemetry::global::meter("ohc_core_prompt_cache_test");
+        let otel_sink = Arc::new(OtelPromptCacheTelemetrySink::new(
+            meter.u64_counter("llm_cost_counter").build(),
+        ));
+        let otel_cache = PromptCache::new(Duration::from_secs(10)).with_telemetry(otel_sink);
+        otel_cache.set("Hello", "World", 42);
+        let (otel_resp, _) = otel_cache.get_with_cost_cents("Hello", "gpt-4o");
+        assert!(otel_resp.is_some());
+    }
+
+    #[test]
+    fn test_prompt_cache_get_with_cost_cents() {
+        let cache = PromptCache::new(Duration::from_secs(10));
+        cache.set("What is the capital of France?", "Paris", 1_000_000);
+
+        let (response, cost) =
+            cache.get_with_cost_cents("What is the capital of France?", "gpt-4o");
+        assert!(response.is_some());
+        assert_eq!(response.expect("failed to unwrap").text, "Paris");
+        assert_eq!(cost, 250);
+    }
+
+    #[test]
+    fn test_prompt_cache_get_missing() {
+        let cache = PromptCache::new(Duration::from_secs(10));
+        let response = cache.get("What is the capital of France?");
+        assert!(response.is_none());
+        let (response_with_cost, cost) =
+            cache.get_with_cost_cents("What is the capital of France?", "gpt-4o");
+        assert!(response_with_cost.is_none());
+        assert_eq!(cost, 0);
+    }
+
+    #[test]
+    fn test_prompt_cache_get_with_cost_cents_different_models() {
+        let cache = PromptCache::new(Duration::from_secs(10));
+        cache.set("What is the capital of France?", "Paris", 1_000_000);
+
+        let (_, cost_4o) = cache.get_with_cost_cents("What is the capital of France?", "gpt-4o");
+        assert_eq!(cost_4o, 250);
+
+        let (_, cost_mini) =
+            cache.get_with_cost_cents("What is the capital of France?", "gpt-4o-mini");
+        assert_eq!(cost_mini, 8);
+
+        let (_, cost_opus) =
+            cache.get_with_cost_cents("What is the capital of France?", "claude-3-opus");
+        assert_eq!(cost_opus, 0);
+
+        let (_, cost_sonnet) =
+            cache.get_with_cost_cents("What is the capital of France?", "claude-3.5-sonnet");
+        assert_eq!(cost_sonnet, 30);
+    }
+
+    #[test]
+    fn test_prompt_cache_capacity_eviction() {
+        let cache = PromptCache::with_capacity(Duration::from_secs(10), 3);
+
+        cache.set("key1", "val1", 1);
+        thread::sleep(Duration::from_millis(10));
+        cache.set("key2", "val2", 1);
+        thread::sleep(Duration::from_millis(10));
+        cache.set("key3", "val3", 1);
+
+        assert_eq!(cache.cache.len(), 3);
+
+        thread::sleep(Duration::from_millis(10));
+        cache.set("key4", "val4", 1);
+
+        assert_eq!(cache.cache.len(), 3);
+        assert!(cache.get("key1").is_none());
+        assert!(cache.get("key2").is_some());
+        assert!(cache.get("key3").is_some());
+        assert!(cache.get("key4").is_some());
+    }
+
+    #[test]
+    fn test_prompt_cache_mass_eviction_memory_optimization() {
+        let max_cap = 100;
+        let cache = PromptCache::with_capacity(Duration::from_secs(10), max_cap);
+
+        for i in 0..max_cap {
+            let key = format!("prompt-key-{}", i);
+            cache.set(&key, "val", 1);
+            if i < 20 {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        assert_eq!(cache.cache.len(), 100);
+
+        cache.set("prompt-key-new", "new_val", 1);
+
+        assert_eq!(cache.cache.len(), 91);
+
+        for i in 0..10 {
+            let key = format!("prompt-key-{}", i);
+            assert!(
+                cache.get(&key).is_none(),
+                "Old key {} was not evicted!",
+                key
+            );
+        }
+
+        assert!(cache.get("prompt-key-new").is_some());
+    }
+
+    #[test]
+    fn test_prompt_cache_set_with_ttl() {
+        let cache = PromptCache::new(Duration::from_secs(10));
+        cache.set_with_ttl(
+            "What is the capital of France?",
+            "Paris",
+            1,
+            Duration::from_millis(10),
+        );
+
+        let response = cache.get("What is the capital of France?");
+        assert!(response.is_some());
+        assert_eq!(response.expect("failed to unwrap").text, "Paris");
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(cache.get("What is the capital of France?").is_none());
+    }
+
+    #[test]
+    fn test_truncate_context() {
+        let text =
+            "This is a very long string that we need to truncate to save some tokens and money.";
+
+        let res = PromptCache::truncate_context(text, 100);
+        assert_eq!(res, text);
+
+        let res2 = PromptCache::truncate_context(text, 10);
+        assert!(res2.len() <= 43);
+        assert!(res2.ends_with("..."));
+
+        let res3 = PromptCache::truncate_context(text, 1);
+        assert_eq!(res3, "This...");
+
+        let res4 = PromptCache::truncate_context(text, 0);
+        assert_eq!(res4, "");
+    }
+
+    #[test]
+    fn test_truncate_context_trailing_punctuation() {
+        let text = "This is a sentence, with a comma that we want to truncate.";
+        let res = PromptCache::truncate_context(text, 7);
+        assert_eq!(res, "This is a sentence, with a...");
+
+        let text2 = "Sentence,  more";
+        let res2 = PromptCache::truncate_context(text2, 2);
+        assert_eq!(res2, "Sentence...");
+
+        let text3 = "Sentence ,  more";
+        let res3 = PromptCache::truncate_context(text3, 2);
+        assert_eq!(res3, "Sentence...");
+    }
+
+    #[test]
+    fn test_truncate_context_multibyte_characters() {
+        let text = "こんにちは世界！これは長い文字列です。";
+        let res = PromptCache::truncate_context(text, 2);
+        assert_eq!(res, "こんにちは世界！...");
+    }
+
+    #[test]
+    fn test_truncate_context_strips_urls() {
+        let text = "Check out this [link](https://example.com/very/long/url/that/wastes/tokens) for more info.";
+        let res = PromptCache::truncate_context(text, 10);
+        assert_eq!(res, "Check out this [link] for more info.");
+    }
+
+    #[test]
+    fn test_truncate_context_incomplete_url() {
+        let text = "Check out this [link](https://example.com/very/long/url/that/wastes/tokens";
+        let res = PromptCache::truncate_context(text, 10);
+        assert!(!res.is_empty());
+
+        let text2 = "Check out this [link](http";
+        let res2 = PromptCache::truncate_context(text2, 10);
+        assert!(!res2.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_context_single_pass_efficiency() {
+        let text = "Check out this [link](https://example.com/very/long/url) and then [another](http://example.com). More text here.";
+        let res = PromptCache::truncate_context(text, 15);
+        assert!(res.contains("[link]"));
+        assert!(!res.contains("https://"));
+        assert!(res.len() <= 65);
+    }
+}

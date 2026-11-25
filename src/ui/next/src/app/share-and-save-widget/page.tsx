@@ -1,0 +1,152 @@
+"use client";
+
+import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+
+export default function ShareAndSaveWidgetPage() {
+  const router = useRouter();
+  const [tenantId, setTenantId] = useState('DEFAULT');
+  const [shareOpened, setShareOpened] = useState(false);
+  const [hasPro, setHasPro] = useState(false);
+  const [showPaywall, setShowPaywall] = useState(false);
+  const [removeBranding, setRemoveBranding] = useState(false);
+  const [isClient, setIsClient] = useState(false);
+
+  useEffect(() => {
+    setIsClient(true);
+    if (typeof window !== 'undefined') {
+      const tid = localStorage.getItem('business_display_name') || 'DEFAULT';
+      setTenantId(tid);
+      setHasPro(localStorage.getItem('has_pro') === 'true');
+    }
+  }, []);
+
+  const handleShareOnTwitter = () => {
+    const text = "I'm checking out this amazing store on OmniSolo OneHumanCorp! Discover more at:";
+    const url = `https://cloud.omnisolo.co/store/${tenantId}`;
+    window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`, '_blank');
+
+    setShareOpened(true);
+  };
+
+  const handleBrandingToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!hasPro) {
+        e.preventDefault();
+        setShowPaywall(true);
+        return;
+    }
+    setRemoveBranding(e.target.checked);
+  };
+
+  if (!isClient) return null;
+
+  return (
+    <div className="flex flex-col min-h-screen font-inter bg-gradient-to-br from-indigo-50 via-purple-50 to-pink-50 items-center justify-center py-10 px-4">
+      {/* Back Button */}
+      <div className="w-full max-w-md mb-6">
+        <button
+          onClick={() => router.push('/dashboard')}
+          className="text-gray-600 hover:text-indigo-600 font-medium text-sm flex items-center gap-2 transition-colors"
+        >
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+          Back to Dashboard
+        </button>
+      </div>
+
+      {/* Widget Container */}
+      <div className="omnisolo-growth-card w-full max-w-md p-8 rounded-[24px] backdrop-blur-[30px] saturate-[210%] bg-white/60 shadow-xl border border-white/50 dark:bg-black/40 dark:border-white/10 flex flex-col items-center text-center">
+
+        {/* Header Icon */}
+        <div className="w-16 h-16 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-2xl flex items-center justify-center text-3xl mb-6 shadow-lg shadow-indigo-500/30">
+          💸
+        </div>
+
+        <h1 className="text-2xl font-bold font-outfit text-gray-900 dark:text-white mb-2">
+          Share This Store
+        </h1>
+
+        <p className="text-gray-600 dark:text-gray-300 mb-8 px-4 text-sm leading-relaxed">
+          Share our store with your friends on X. Automatic discount verification is not connected, so sharing will not issue a code.
+        </p>
+
+        {!shareOpened ? (
+          <button
+            onClick={handleShareOnTwitter}
+            className="w-full relative group overflow-hidden bg-black text-white font-semibold py-4 px-6 rounded-xl shadow-md transition-transform active:scale-95 flex items-center justify-center gap-3"
+          >
+            <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-gray-800 to-black opacity-0 group-hover:opacity-100 transition-opacity"></div>
+            <svg className="w-5 h-5 relative z-10" fill="currentColor" viewBox="0 0 24 24"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.008 5.94H5.078z"/></svg>
+            <span className="relative z-10">Share on X</span>
+          </button>
+        ) : (
+          <div className="w-full flex flex-col items-center animate-in fade-in zoom-in duration-300">
+            <p className="text-sm text-indigo-700 font-bold mb-3 flex items-center gap-1">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+              Share window opened
+            </p>
+            <p className="text-sm text-gray-600">No discount code was issued because share verification is unavailable.</p>
+          </div>
+        )}
+
+        <div className="w-full mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+          <label className="flex items-center gap-2 text-sm font-medium text-gray-700 dark:text-gray-300 cursor-pointer justify-center mb-4">
+            <input
+              type="checkbox"
+              checked={removeBranding}
+              onChange={handleBrandingToggle}
+              className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+            />
+            Remove "Powered by OmniSolo" Badge
+            {!hasPro && <span className="bg-yellow-100 text-yellow-800 text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider ml-1">PRO</span>}
+          </label>
+
+          {!removeBranding && (
+            <div className="text-center">
+              <a href={`/onboarding?ref=${tenantId}`} target="_blank" rel="noopener noreferrer" className="text-xs font-semibold text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors">
+                ⚡ Powered by OmniSolo
+              </a>
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {showPaywall && (
+        <div className="fixed inset-0 bg-black/60 z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md p-8 shadow-2xl relative overflow-hidden font-inter border border-blue-100 text-center">
+             <div className="absolute top-0 right-0 w-32 h-32 bg-blue-50 rounded-bl-full -z-10"></div>
+             <div className="flex justify-end mb-2">
+               <button
+                 aria-label="Close paywall"
+                 onClick={() => setShowPaywall(false)}
+                 className="text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100 transition-colors w-8 h-8 flex items-center justify-center"
+               >
+                 <span className="text-xl leading-none">&times;</span>
+               </button>
+             </div>
+             <div className="w-16 h-16 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center text-3xl shadow-lg mx-auto mb-6 text-white font-bold">
+               PRO
+             </div>
+             <h2 className="text-2xl font-bold font-outfit text-gray-900 mb-3">Upgrade to Remove Branding</h2>
+             <p className="text-gray-600 mb-6 text-sm leading-relaxed">
+               Make the Share and Save Widget 100% yours. Upgrade to Pro to remove the "Powered by OmniSolo" watermark.
+             </p>
+             <button
+               onClick={() => { setShowPaywall(false); window.location.href = '/settings'; }}
+               className="w-full py-4 rounded-xl font-bold text-white mb-4 transition-all shadow-md hover:shadow-lg hover:opacity-90"
+               style={{ background: 'linear-gradient(135deg, #0066ff 0%, #3b82f6 100%)' }}
+             >
+               Upgrade to Pro
+             </button>
+             <button
+               onClick={() => setShowPaywall(false)}
+               className="mt-2 text-gray-500 hover:text-gray-700 font-medium text-sm w-full"
+             >
+               Cancel
+             </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

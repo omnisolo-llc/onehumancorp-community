@@ -1,0 +1,17 @@
+[package]
+name = "server_common"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+server_config = { path = "../config" }
+serde = { workspace = true }
+sqlx = { version = "0.8", features = ["postgres", "sqlite", "runtime-tokio-rustls", "chrono", "uuid", "macros"] }
+
+[dev-dependencies]
+temp-env = "0.3.6"
+tempfile = "3"
+
+[lib]
+path = "mod.rs"

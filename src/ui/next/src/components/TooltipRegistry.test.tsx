@@ -1,0 +1,358 @@
+import '@testing-library/jest-dom';
+import { render,screen,fireEvent,act } from '@testing-library/react';
+import { TooltipProvider,WithTooltip,useTooltip } from './TooltipRegistry';
+import { describe,it,expect,vi,beforeEach,afterEach } from 'vitest';
+
+const navigationMocks = vi.hoisted(() => ({ pathname: '/' }));
+
+vi.mock('next/navigation', () => ({
+  usePathname: () => navigationMocks.pathname,
+}));
+
+vi.mock("framer-motion", () => {
+  return {
+    motion: {
+      div: ({ children, ...props }: import('react').HTMLAttributes<HTMLDivElement> & {
+        initial?: unknown; animate?: unknown; exit?: unknown; transition?: unknown;
+      }) => {
+        for (const key of ['initial', 'animate', 'exit', 'transition'] as const) delete props[key];
+        return <div {...props}>{children}</div>;
+      },
+    },
+    AnimatePresence: ({ children }: { children?: import('react').ReactNode }) => <>{children}</>,
+  };
+});
+
+const mockTooltipFetch = vi.fn<typeof fetch>((url) => {
+    if (url && (url === '/api/v1/tooltips' || url.toString().includes('/api/v1/tooltips'))) {
+        return Promise.resolve(Response.json({ "test-id": "Fetched tooltip text" }));
+    }
+    return Promise.resolve(Response.json({}));
+});
+
+describe('TooltipRegistry', () => {
+  beforeEach(() => {
+    navigationMocks.pathname = '/';
+    mockTooltipFetch.mockClear();
+    global.fetch = mockTooltipFetch;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('supports a focusable explanation with one associated tooltip and Escape dismissal', async () => {
+    await act(async () => {
+      render(<TooltipProvider><WithTooltip id="api-explanation" defaultText="Real API reference" tabIndex={0}>
+        <span>Advanced explanation</span>
+      </WithTooltip></TooltipProvider>);
+    });
+    const target = screen.getByText('Advanced explanation').parentElement!;
+    expect(target.tabIndex).toBe(0);
+    act(() => target.focus());
+    const tooltip = screen.getByRole('tooltip');
+    expect(tooltip).toHaveTextContent('Real API reference');
+    expect(target).toHaveAttribute('aria-describedby', tooltip.id);
+    fireEvent.mouseEnter(target);
+    expect(screen.getAllByRole('tooltip')).toHaveLength(1);
+    fireEvent.keyDown(target, { key: 'Escape' });
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    expect(target).toHaveFocus();
+    expect(target).not.toHaveAttribute('aria-describedby');
+    act(() => target.blur());
+    act(() => target.focus());
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    act(() => target.blur());
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+  });
+
+  it('renders default text on hover', async () => {
+    const ui = (
+      <TooltipProvider>
+        <WithTooltip id="test-id" defaultText="Default Tooltip">
+          <button>Hover me</button>
+        </WithTooltip>
+      </TooltipProvider>
+    );
+    await act(async () => {
+      render(ui);
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    const button = screen.getByText('Hover me');
+
+    Element.prototype.getBoundingClientRect = vi.fn(() => ({
+      width: 100, height: 20, top: 10, left: 10, bottom: 30, right: 110, x: 10, y: 10, toJSON: () => {}
+    }));
+
+    await act(async () => {
+        fireEvent.mouseEnter(button.parentElement!);
+        await new Promise(r => setTimeout(r, 20));
+    });
+
+    expect(screen.getByText('Fetched tooltip text')).toBeInTheDocument();
+
+    await act(async () => {
+        fireEvent.mouseLeave(button.parentElement!);
+        await new Promise(r => setTimeout(r, 20));
+    });
+
+    expect(screen.queryByText('Fetched tooltip text')).not.toBeInTheDocument();
+  });
+
+  it('handles touch events (long press) for mobile', async () => {
+    vi.useFakeTimers();
+    const advance = async (milliseconds: number) => {
+      await act(async () => { await vi.advanceTimersByTimeAsync(milliseconds); });
+    };
+    await act(async () => {
+      render(<TooltipProvider><WithTooltip id="test-id" defaultText="Default Tooltip">
+        <button>Touch me</button>
+      </WithTooltip></TooltipProvider>);
+    });
+    const wrapper = screen.getByText('Touch me').parentElement!;
+    vi.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue(new DOMRect(10, 10, 100, 20));
+    fireEvent.touchStart(wrapper);
+    await advance(499);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    await advance(1);
+    expect(screen.getByText('Fetched tooltip text')).toBeInTheDocument();
+
+    fireEvent.touchEnd(wrapper);
+    await advance(1999);
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    await advance(1);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    fireEvent.touchStart(wrapper);
+    await advance(200);
+    fireEvent.touchCancel(wrapper);
+    await advance(350);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    fireEvent.touchStart(wrapper);
+    await advance(500);
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    fireEvent.touchMove(wrapper);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+  });
+
+  it('falls back silently when the optional tooltip service is unavailable', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockTooltipFetch.mockResolvedValueOnce(Response.json({}, { status: 500 }));
+    await act(async () => {
+      render(<TooltipProvider><div>Test</div></TooltipProvider>);
+      await new Promise(r => setTimeout(r, 20));
+    });
+    expect(global.fetch).toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('does not fetch optional tooltips on the public login route', async () => {
+    navigationMocks.pathname = '/login';
+
+    await act(async () => {
+      render(<TooltipProvider><div>Login</div></TooltipProvider>);
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    expect(mockTooltipFetch).not.toHaveBeenCalled();
+  });
+
+  it('handles aborted fetch gracefully', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockTooltipFetch.mockImplementationOnce(() => Promise.reject({ name: 'AbortError' }));
+    await act(async () => {
+      render(<TooltipProvider><div>Test</div></TooltipProvider>);
+      await new Promise(r => setTimeout(r, 20));
+    });
+    expect(global.fetch).toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+  });
+});
+
+describe('useTooltip Hook sync', () => {
+  it('throws an error if used outside TooltipProvider', () => {
+    const originalError = console.error;
+    console.error = vi.fn(); // Suppress the expected React error boundary log
+    const preventError = (e: ErrorEvent) => e.preventDefault();
+    window.addEventListener('error', preventError);
+
+    const TestComponent = () => {
+      useTooltip();
+      return <div />;
+    };
+
+    expect(() => render(<TestComponent />)).toThrow('useTooltip must be used within a TooltipProvider');
+
+    console.error = originalError;
+    window.removeEventListener('error', preventError);
+  });
+});
+
+describe('TooltipRegistry window resize', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+  it('debounces resize events and uses the latest viewport width', async () => {
+    const originalWidth = window.innerWidth;
+    try {
+      window.innerWidth = 1024;
+      await act(async () => {
+        render(<TooltipProvider><WithTooltip id="resize" defaultText="Resize tooltip">
+          <button>Resize target</button>
+        </WithTooltip></TooltipProvider>);
+      });
+      const wrapper = screen.getByText('Resize target').parentElement!;
+      vi.spyOn(wrapper, 'getBoundingClientRect').mockReturnValue(new DOMRect(900, 10, 100, 20));
+      fireEvent.mouseEnter(wrapper);
+      expect(screen.getByRole('tooltip')).toHaveStyle({ left: '880px' });
+      act(() => {
+        window.innerWidth = 500;
+        fireEvent(window, new Event('resize'));
+        window.innerWidth = 800;
+        fireEvent(window, new Event('resize'));
+        vi.advanceTimersByTime(149);
+      });
+      expect(screen.getByRole('tooltip')).toHaveStyle({ left: '880px' });
+      act(() => { vi.advanceTimersByTime(1); });
+      expect(screen.getByRole('tooltip')).toHaveStyle({ left: '656px' });
+    } finally { window.innerWidth = originalWidth; }
+  });
+
+  it('removes the scroll listener on unmount without leaving deferred dismissals', async () => {
+    const addListener = vi.spyOn(window, 'addEventListener');
+    const removeListener = vi.spyOn(window, 'removeEventListener');
+    let view: ReturnType<typeof render>;
+    await act(async () => { view = render(<TooltipProvider><div>Test</div></TooltipProvider>); });
+    const scrollListener = addListener.mock.calls.find(([type]) => type === 'scroll')![1];
+    fireEvent.scroll(window);
+    expect(vi.getTimerCount()).toBe(0);
+    view!.unmount();
+    expect(removeListener).toHaveBeenCalledWith('scroll', scrollListener, true);
+    expect(vi.getTimerCount()).toBe(0);
+    addListener.mockRestore();
+    removeListener.mockRestore();
+  });
+});
+
+describe('TooltipRegistry scroll and contextmenu', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each(['window', 'container'])('keeps a tooltip opened after %s scrolling visible', async (scroller) => {
+    await act(async () => {
+      render(<TooltipProvider><div data-testid="scroll-container">
+        <WithTooltip id="total-sales-tooltip"><span>Total Sales</span></WithTooltip>
+      </div></TooltipProvider>);
+    });
+    const target = screen.getByText('Total Sales').parentElement!;
+
+    // Scrolling a below-the-fold target into view must not queue a dismissal
+    // that closes the tooltip opened by the subsequent pointer entry.
+    fireEvent.scroll(scroller === 'window' ? window : screen.getByTestId('scroll-container'));
+    fireEvent.mouseEnter(target);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Total gross revenue generated.');
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Total gross revenue generated.');
+    expect(target).toHaveAttribute('aria-describedby', 'total-sales-tooltip-description');
+
+    fireEvent.mouseLeave(target);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+  });
+
+  it.each(['window', 'container'])('keeps a hovered tooltip when a queued %s scroll event arrives after entry', async (scroller) => {
+    await act(async () => {
+      render(<TooltipProvider><div data-testid="scroll-container">
+        <WithTooltip id="total-sales-tooltip"><span>Total Sales</span></WithTooltip>
+      </div></TooltipProvider>);
+    });
+    const target = screen.getByText('Total Sales').parentElement!;
+    vi.spyOn(target, 'getBoundingClientRect').mockReturnValue(new DOMRect(200, 300, 100, 20));
+    fireEvent.mouseEnter(target);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Total gross revenue generated.');
+
+    // The browser can deliver the scrollIntoView event after pointer entry.
+    // Its layout change already happened before the tooltip captured its anchor.
+    fireEvent.scroll(scroller === 'window' ? window : screen.getByTestId('scroll-container'));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Total gross revenue generated.');
+    expect(target).toHaveAttribute('aria-describedby', 'total-sales-tooltip-description');
+  });
+
+  it('tracks the actual hovered wrapper when multiple cards share tooltip copy', async () => {
+    await act(async () => {
+      render(<TooltipProvider>
+        <WithTooltip id="department-card-tooltip"><span>First department</span></WithTooltip>
+        <WithTooltip id="department-card-tooltip"><span>Second department</span></WithTooltip>
+      </TooltipProvider>);
+    });
+    const firstTarget = screen.getByText('First department').parentElement!;
+    const activeTarget = screen.getByText('Second department').parentElement!;
+    Object.defineProperty(firstTarget, 'getBoundingClientRect', { value: () => new DOMRect(100, 100, 100, 20) });
+    const activeRect = vi.fn(() => new DOMRect(300, 300, 100, 20));
+    Object.defineProperty(activeTarget, 'getBoundingClientRect', { value: activeRect });
+    fireEvent.mouseEnter(activeTarget);
+    fireEvent.scroll(window);
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+
+    activeRect.mockReturnValue(new DOMRect(300, 200, 100, 20));
+    fireEvent.scroll(window);
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+  });
+
+  it.each(['window', 'container'])('hides a tooltip when %s scrolling moves its anchor', async (scroller) => {
+    await act(async () => {
+      render(<TooltipProvider><div data-testid="scroll-container">
+        <WithTooltip id="test-id" defaultText="Default Tooltip"><button>Hover me</button></WithTooltip>
+      </div></TooltipProvider>);
+    });
+    const target = screen.getByText('Hover me').parentElement!;
+    const anchorRect = vi.spyOn(target, 'getBoundingClientRect');
+    anchorRect.mockReturnValue(new DOMRect(10, 300, 100, 20));
+    fireEvent.mouseEnter(target);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Fetched tooltip text');
+
+    anchorRect.mockReturnValue(new DOMRect(10, 200, 100, 20));
+    fireEvent.scroll(scroller === 'window' ? window : screen.getByTestId('scroll-container'));
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    expect(target).not.toHaveAttribute('aria-describedby');
+  });
+
+  it('prevents default on context menu', async () => {
+    const ui = (
+      <TooltipProvider>
+        <WithTooltip id="test-id" defaultText="Default Tooltip">
+          <button>Hover me</button>
+        </WithTooltip>
+      </TooltipProvider>
+    );
+    await act(async () => {
+      render(ui);
+      vi.advanceTimersByTime(200);
+    });
+
+    const button = screen.getByText('Hover me');
+
+    let preventDefaultCalled = false;
+    await act(async () => {
+      const event = new MouseEvent('contextmenu', {
+        bubbles: true,
+        cancelable: true,
+      });
+      event.preventDefault = () => { preventDefaultCalled = true; };
+      button.parentElement!.dispatchEvent(event);
+    });
+
+    expect(preventDefaultCalled).toBe(true);
+  });
+});

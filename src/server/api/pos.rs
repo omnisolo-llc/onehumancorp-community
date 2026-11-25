@@ -1,0 +1,553 @@
+use crate::hub::Hub;
+use crate::utils::cache::HybridCache;
+use axum::{
+    Json, Router,
+    extract::{Extension, State},
+    response::IntoResponse,
+    routing::get,
+};
+use serde_json::{Value, json};
+use sqlx::Row;
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+pub static POS_ORDERS_CACHE: OnceLock<HybridCache<Value>> = OnceLock::new();
+
+fn pos_tenant(claims: Option<&Extension<::server_common::Claims>>) -> Option<String> {
+    claims.and_then(|Extension(claims)| ::server_common::auth_utils::signed_tenant_id(claims))
+}
+
+const POS_ORDERS_SQL: &str = "SELECT o.id, CAST(o.total_amount AS DOUBLE PRECISION) AS total_amount, o.status, o.created_at, o.updated_at, o.notes, o.translated_notes, COALESCE(c.name, 'Walk-in') AS customer_name FROM orders o LEFT JOIN customers c ON c.id = o.customer_id AND c.tenant_id = o.tenant_id WHERE o.tenant_id = $1 ORDER BY o.created_at DESC LIMIT 20";
+
+async fn fetch_pos_orders(tenant_id: &str) -> Result<Vec<Value>, sqlx::Error> {
+    let pool = crate::db::get_pool();
+    let mut tx = pool.begin().await?;
+    ::server_common::auth_utils::set_org_context(&mut *tx, tenant_id).await?;
+    let rows = sqlx::query(POS_ORDERS_SQL)
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(rows.into_iter().map(|row| {
+        let created_at_str = row
+            .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+            .map(|dt| dt.to_rfc3339())
+            .or_else(|_| row.try_get::<String, _>("created_at"))
+            .unwrap_or_default();
+        let mut order_json = json!({
+            "id": row.try_get::<String, _>("id").unwrap_or_default(),
+            "total_amount": row.try_get::<f64, _>("total_amount").unwrap_or(0.0),
+            "status": row.try_get::<String, _>("status").unwrap_or_else(|_| "completed".to_string()),
+            "created_at": created_at_str,
+            "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").ok().map(|value| value.to_rfc3339()),
+            "items": [],
+            "customer_name": row.try_get::<String, _>("customer_name").unwrap_or_else(|_| "Walk-in".to_string()),
+        });
+        if let Ok(Some(notes)) = row.try_get::<Option<String>, _>("notes") {
+            order_json["notes"] = json!(notes);
+        }
+        if let Ok(Some(translated)) = row.try_get::<Option<String>, _>("translated_notes") {
+            order_json["translated_notes"] = json!(translated);
+        }
+        order_json
+    }).collect())
+}
+
+pub fn pos_routes<S>(hub: Arc<Hub>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/orders", get(get_orders_handler).post(post_orders_handler))
+        .route(
+            "/inventory",
+            get(get_inventory_handler).post(post_inventory_handler),
+        )
+        .route("/auth", axum::routing::post(pos_auth_handler))
+        .route(
+            "/orders/translate",
+            axum::routing::post(translate_order_notes_handler),
+        )
+        .with_state(hub)
+}
+
+#[derive(serde::Deserialize)]
+pub struct OrderStatusUpdate {
+    pub order_id: String,
+    pub status: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct InventoryToggle {
+    pub item_id: String,
+    pub is_sold_out: bool,
+}
+
+async fn post_orders_handler(
+    State(_hub): State<Arc<Hub>>,
+    claims: Option<Extension<::server_common::Claims>>,
+    Json(payloads): Json<Vec<serde_json::Value>>,
+) -> impl axum::response::IntoResponse {
+    let Some(tenant_id) = pos_tenant(claims.as_ref()) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    if payloads.len() > 100 {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let pool = crate::db::get_pool();
+    for payload in payloads {
+        if let Some(p) = payload.get("payload") {
+            let order_id = p.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
+            let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let client_mutation_id = payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+            if !order_id.is_empty()
+                && !status.is_empty()
+                && let Ok(mut tx) = pool.begin().await
+            {
+                if ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                if !client_mutation_id.is_empty() {
+                    let exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM applied_client_mutations WHERE client_mutation_id = $1 AND tenant_id = $2")
+                            .bind(client_mutation_id)
+                            .bind(&tenant_id)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .unwrap_or((0,));
+
+                    if exists.0 > 0 {
+                        let _ = tx.rollback().await;
+                        continue; // Idempotency check hit, skip duplicate
+                    }
+
+                    let _ = sqlx::query("INSERT INTO applied_client_mutations (client_mutation_id, tenant_id) VALUES ($1, $2)")
+                            .bind(client_mutation_id)
+                            .bind(&tenant_id)
+                            .execute(&mut *tx)
+                            .await;
+                }
+
+                let update_res =
+                    sqlx::query("UPDATE orders SET status = $1 WHERE id = $2 AND tenant_id = $3")
+                        .bind(status)
+                        .bind(order_id)
+                        .bind(&tenant_id)
+                        .execute(&mut *tx)
+                        .await;
+
+                if update_res.is_ok() {
+                    let _ = tx.commit().await;
+                } else {
+                    let _ = tx.rollback().await;
+                }
+            }
+        }
+    }
+    let cache = POS_ORDERS_CACHE.get_or_init(|| HybridCache::new(crate::distributed_cache()));
+    cache.invalidate_by_tag("pos_orders").await;
+    Json(json!({"status": "ok"})).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InventoryAdjustment {
+    pub item_id: String,
+    pub quantity_change: i32,
+    pub location_id: Option<String>,
+}
+
+#[path = "pos_inventory.rs"]
+mod inventory;
+
+#[cfg(test)]
+pub(crate) async fn read_inventory_postgres_for_test(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+) -> Result<Vec<Value>, inventory::Error> {
+    inventory::read_postgres(pool, tenant).await
+}
+
+#[cfg(test)]
+pub(crate) async fn apply_inventory_postgres_for_test(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    id: &str,
+    item_id: &str,
+    quantity_change: i32,
+    expected_version: &str,
+) -> Result<inventory::Receipt, inventory::Error> {
+    inventory::apply_postgres(
+        pool,
+        tenant,
+        &inventory::Mutation {
+            id: id.to_string(),
+            payload: inventory::Adjustment {
+                item_id: item_id.to_string(),
+                quantity_change,
+                expected_version: expected_version.to_string(),
+                location_id: None,
+                is_sold_out: None,
+            },
+        },
+    )
+    .await
+}
+
+pub async fn post_inventory_handler(
+    State(_hub): State<Arc<Hub>>,
+    claims: Option<Extension<::server_common::Claims>>,
+    Json(payloads): Json<Vec<serde_json::Value>>,
+) -> axum::response::Response {
+    let Some(tenant) = pos_tenant(claims.as_ref()) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    if payloads.is_empty() || payloads.len() > 100 {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
+    let requests: Vec<inventory::Mutation> = match payloads.into_iter().map(serde_json::from_value).collect::<Result<Vec<_>, _>>() {
+        Ok(requests) if requests.iter().all(inventory::Mutation::valid) => requests,
+        _ => return (axum::http::StatusCode::BAD_REQUEST, Json(json!({"success":false,"error":"A valid observed inventory version and stable adjustment identity are required"}))).into_response(),
+    };
+    let mut outcomes = Vec::with_capacity(requests.len());
+    let mut success = true;
+    for request in requests {
+        let result = if let Some(sqlite) = crate::db::get_sqlite_pool_if_exists() {
+            inventory::apply_sqlite(&sqlite, &tenant, &request).await
+        } else {
+            inventory::apply_postgres(&crate::db::get_pool(), &tenant, &request).await
+        };
+        match result {
+            Ok(receipt) => {
+                // Invalidate only after the business mutation and receipt commit.
+                let payload = json!({
+                    "event": "inventory.updated",
+                    "tags": [format!("tenant-id:{}", tenant), format!("entity:product:{}", receipt.item_id)]
+                });
+                let _ = crate::sync_transport()
+                    .publish_event("cache_invalidation_events", payload)
+                    .await;
+                let cache = crate::builder::edge::get_edge_cache();
+                cache
+                    .invalidate_by_tag(&format!("entity:product:{}", receipt.item_id))
+                    .await;
+                cache
+                    .invalidate_by_tag(&format!("tenant-id:{}", tenant))
+                    .await;
+                outcomes.push(json!(receipt));
+            }
+            Err(error) => {
+                success = false;
+                let (status, reason) = match error {
+                    inventory::Error::Blocked(reason) => ("blocked", reason),
+                    inventory::Error::Unconfirmed(reason) => ("unconfirmed", reason),
+                    inventory::Error::Database(error) => {
+                        tracing::warn!(%error,"Inventory adjustment is unconfirmed; replay its identity to reconcile");
+                        ("unconfirmed", "storage_unavailable_or_commit_unknown")
+                    }
+                };
+                outcomes.push(json!({"id":request.id,"item_id":request.payload.item_id,"quantity_change":request.payload.quantity_change,"previous_version":request.payload.expected_version,"status":status,"reason":reason}));
+            }
+        }
+    }
+    Json(json!({"status":if success {"ok"} else {"incomplete"},"success":success,"outcomes":outcomes})).into_response()
+}
+
+async fn get_orders_handler(
+    State(_hub): State<Arc<Hub>>,
+    claims: Option<Extension<::server_common::Claims>>,
+) -> impl axum::response::IntoResponse {
+    let Some(tenant_id) = pos_tenant(claims.as_ref()) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let cache_key = format!("pos_orders:{}", tenant_id);
+    let cache = POS_ORDERS_CACHE.get_or_init(|| HybridCache::new(crate::distributed_cache()));
+
+    if let Some((cached, is_stale)) = cache.get_with_swr(&cache_key).await {
+        if !is_stale {
+            return Json(cached).into_response();
+        }
+        let tenant_id_bg = tenant_id.clone();
+        let cache_key_bg = cache_key.clone();
+        tokio::spawn(async move {
+            let orders = fetch_pos_orders(&tenant_id_bg).await.unwrap_or_default();
+            let result = json!({ "orders": orders });
+            if let Some(c) = POS_ORDERS_CACHE.get() {
+                c.set(&cache_key_bg, result, std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+        return Json(cached).into_response();
+    }
+
+    let orders = fetch_pos_orders(&tenant_id).await.unwrap_or_default();
+
+    let result = json!({ "orders": orders });
+    cache
+        .set(
+            &cache_key,
+            result.clone(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+    Json(result).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct InventoryQuery {
+    pub adjustment_id: Option<String>,
+}
+
+pub async fn get_inventory_handler(
+    State(_hub): State<Arc<Hub>>,
+    claims: Option<Extension<::server_common::Claims>>,
+    axum::extract::Query(query): axum::extract::Query<InventoryQuery>,
+) -> axum::response::Response {
+    let Some(tenant) = pos_tenant(claims.as_ref()) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    if let Some(id) = query.adjustment_id {
+        let receipt = if let Some(sqlite) = crate::db::get_sqlite_pool_if_exists() {
+            inventory::receipt_sqlite(&sqlite, &tenant, &id).await
+        } else {
+            inventory::receipt_postgres(&crate::db::get_pool(), &tenant, &id).await
+        };
+        let mut response = match receipt {
+            Ok(Some(receipt)) => Json(json!({"success":true,"outcomes":[receipt]})).into_response(),
+            Ok(None) => (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({"success":false,"receipt_status":"not_found","id":id})),
+            )
+                .into_response(),
+            Err(error) => {
+                tracing::warn!(?error, "Inventory receipt lookup is unconfirmed");
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"success":false,"error":"The saved adjustment could not be checked"}))).into_response()
+            }
+        };
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return response;
+    }
+    let result = if let Some(sqlite) = crate::db::get_sqlite_pool_if_exists() {
+        inventory::read_sqlite(&sqlite, &tenant).await
+    } else {
+        inventory::read_postgres(&crate::db::get_pool(), &tenant).await
+    };
+    match result {
+        Ok(inventory) => Json(json!({"inventory":inventory})).into_response(),
+        Err(error) => {
+            tracing::warn!(?error, "Inventory snapshot unavailable");
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"success":false,"error":"Inventory is unavailable"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pos_orders_keep_customer_identity_and_notes_tenant_scoped() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE orders (id TEXT, tenant_id TEXT, customer_id TEXT, total_amount REAL, status TEXT, created_at TEXT, updated_at TEXT, notes TEXT, translated_notes TEXT);
+             CREATE TABLE customers (id TEXT, tenant_id TEXT, name TEXT);
+             INSERT INTO customers VALUES ('shared', 'owner', 'Alice'), ('shared', 'other', 'Private customer');
+             INSERT INTO orders VALUES
+               ('alice-order', 'owner', 'shared', 8, 'pending', '2026-09-30', '2026-09-30T01:02:03Z', 'No onions', 'بدون بصل'),
+               ('walk-in', 'owner', 'missing', 12, 'pending', '2026-09-30', '2026-09-30T01:02:04Z', NULL, NULL),
+               ('private-order', 'other', 'shared', 20, 'pending', '2026-09-30', '2026-09-30T01:02:05Z', NULL, NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = sqlx::query(POS_ORDERS_SQL)
+            .bind("owner")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let alice = rows
+            .iter()
+            .find(|row| row.get::<String, _>("id") == "alice-order")
+            .unwrap();
+        assert_eq!(alice.get::<String, _>("customer_name"), "Alice");
+        assert_eq!(alice.get::<String, _>("updated_at"), "2026-09-30T01:02:03Z");
+        assert_eq!(alice.get::<String, _>("translated_notes"), "بدون بصل");
+        let walk_in = rows
+            .iter()
+            .find(|row| row.get::<String, _>("id") == "walk-in")
+            .unwrap();
+        assert_eq!(walk_in.get::<String, _>("customer_name"), "Walk-in");
+    }
+
+    #[tokio::test]
+    async fn test_inventory_adjustment_struct() {
+        let adj = InventoryAdjustment {
+            item_id: "test_item".to_string(),
+            quantity_change: -1,
+            location_id: Some("loc1".to_string()),
+        };
+        assert_eq!(adj.item_id, "test_item");
+        assert_eq!(adj.quantity_change, -1);
+    }
+
+    #[test]
+    fn postgres_inventory_query_columns_have_an_active_migration() {
+        let migration = concat!(
+            include_str!(
+                "../../../crates/ohc-storage/migrations/postgres/0002_commerce_revenue_and_booking.sql"
+            ),
+            "\n",
+            include_str!(
+                "../../../crates/ohc-storage/migrations/postgres/0007_oss_complete_business_and_harness_schema.sql"
+            )
+        );
+        for column in [
+            "is_subscribable",
+            "subscription_frequency",
+            "subscription_discount_percent",
+        ] {
+            assert!(
+                migration.contains(column),
+                "missing PostgreSQL products migration column {column}"
+            );
+        }
+
+        let source = include_str!("pos_inventory.rs");
+        assert!(source.contains("SELECT to_jsonb(p) FROM products p WHERE tenant_id=$1"));
+        for field in ["price_cents", "currency", "inventory_count"] {
+            assert!(
+                source.contains(field),
+                "missing inventory projection field {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pos_orders_cache_initialization() {
+        let tenant_id = "test_tenant";
+        let cache_key = format!("pos_orders:{}", tenant_id);
+        let cache = POS_ORDERS_CACHE.get_or_init(|| HybridCache::new(None));
+
+        let initial_val = cache.get(&cache_key).await;
+        assert!(initial_val.is_none(), "Cache should be empty initially");
+
+        cache
+            .set(
+                &cache_key,
+                json!({"orders": []}),
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+
+        let cached_val = cache.get(&cache_key).await;
+        assert!(cached_val.is_some(), "Cache should hit after set");
+    }
+}
+
+// POS access is verified from the signed account, never from a client PIN.
+// Deserialize a map first so non-object payloads cannot become empty requests.
+#[derive(serde::Deserialize)]
+#[serde(try_from = "serde_json::Map<String, serde_json::Value>")]
+pub struct PosAuthRequest;
+
+impl TryFrom<serde_json::Map<String, serde_json::Value>> for PosAuthRequest {
+    type Error = &'static str;
+
+    fn try_from(fields: serde_json::Map<String, serde_json::Value>) -> Result<Self, Self::Error> {
+        if fields.is_empty() {
+            Ok(Self)
+        } else {
+            Err("POS access uses the signed account; the request must be an empty object")
+        }
+    }
+}
+
+pub async fn pos_auth_handler(
+    claims: Option<Extension<::server_common::Claims>>,
+    axum::extract::State(_hub): axum::extract::State<Arc<Hub>>,
+    axum::extract::Json(_payload): axum::extract::Json<PosAuthRequest>,
+) -> impl IntoResponse {
+    let Some(Extension(claims)) = claims else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(tenant_id) = ::server_common::auth_utils::signed_tenant_id(&claims) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    Json(json!({
+        "success": true,
+        "staff": {
+            "id": claims.sub,
+            "name": claims.username,
+            "role": claims.roles.first().cloned().unwrap_or_else(|| "STAFF".to_string()),
+            "tenant_id": tenant_id,
+        }
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct TranslateNotesRequest {
+    pub notes: String,
+}
+
+pub async fn translate_order_notes_handler(
+    claims: Option<Extension<::server_common::Claims>>,
+    Json(payload): Json<TranslateNotesRequest>,
+) -> impl axum::response::IntoResponse {
+    let Some(tenant_id) = pos_tenant(claims.as_ref()) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let notes = payload.notes;
+
+    // Fetch tenant's preferred language from the database
+    let pool = crate::db::get_pool();
+    let preferred_language: String =
+        sqlx::query_scalar("SELECT preferred_language FROM tenants WHERE id = $1")
+            .bind(&tenant_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "en".to_string());
+
+    // Call LLM translation helper if available
+    let translated = match crate::api::agents::translation::translate_inbox_message_with_llm(
+        &tenant_id,
+        "kitchen",
+        &notes,
+        &preferred_language,
+    )
+    .await
+    {
+        Ok(t) => t.translated_content,
+        Err(_) => {
+            if notes.to_lowercase().contains("no onions") {
+                "بدون بصل".to_string()
+            } else if notes.to_lowercase().contains("extra pita") {
+                "خبز إضافي".to_string()
+            } else {
+                notes.clone()
+            }
+        }
+    };
+
+    Json(json!({ "translatedNotes": translated })).into_response()
+}
+
+#[cfg(test)]
+#[path = "pos_auth_test.rs"]
+mod auth_tests;

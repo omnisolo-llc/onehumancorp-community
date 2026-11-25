@@ -1,0 +1,215 @@
+# Native development, testing and build caches
+
+## One-command initialization
+
+```sh
+make init                             # Install prerequisites, prompting before sudo/Homebrew changes
+make doctor                           # Check readiness without installing dependencies
+make lint                             # Complete Rust + Node quality gates
+make test                             # Complete workspace, unit, contract and real-stack browser tests
+```
+
+Bootstrap inputs: Git, GNU Make and Python, plus permission to install missing host packages. The Python environment used by release/test tools must be 3.11 or newer with venv support (Ubuntu 24.04+/Debian 12+ include a suitable default). On older Linux distributions, install a suitable Python first. macOS requires Homebrew and Xcode command-line tools; `xcode-select --install` is an interactive Apple installation and is not run silently. Native Windows release builds retain their own MSVC/WebView2 requirements; use WSL2 Ubuntu with Docker integration for the full POSIX test environment.
+
+The initializer reads the repository's Node and Rust pins, installs Rust with rustfmt/Clippy without changing the global default, and uses verified official Node archives when the matching Node version is absent. npm/npx and tool links live in ignored `target/dev-tools/`. All four locked npm trees are installed with development dependencies: repository root, Next, CLI and `.github/test-tools` (OpenCode). Installation stamps include both manifests, Node, OS and architecture. Python packages use an isolated venv; Cargo dependencies are fetched with `--locked`. The initializer installs Chromium and its Linux system libraries, then actually launches and closes the browser during readiness checks.
+
+```sh
+make init INIT_ARGS=--plan             # Print the plan; no network, installations or writes
+make init INIT_ARGS=--yes              # Approve the described host package installations
+make init INIT_ARGS=--no-system        # Never invoke sudo/Homebrew; host libraries must exist
+make init INIT_ARGS=--force            # Reinstall locked npm trees even if stamps match
+source target/dev-tools/env.sh         # Use local tools directly; required for Homebrew keg paths
+```
+
+Make targets already prepend project-local tool links to PATH. The generated shell snippet does not modify your profile; on macOS source it to expose keg-only PostgreSQL/coreutils/OpenSSL paths to direct commands and shell-based deployment tests. No `.env`, provider key, signing credential, user/group membership or Docker permission is created or modified.
+
+**Docker remains an explicit host prerequisite.** Install/start Docker Engine or Docker Desktop, including Compose v2 and Buildx, and select the intended local context before initialization. `make init` does not make a privileged daemon or change your Docker group membership. It fails if the daemon is unavailable or the effective context is remote; `DOCKER_CONTEXT` takes precedence over `DOCKER_HOST`. Tests create isolated local containers, not a production deployment. Android SDK/NDK, Apple device provisioning, signing/notarization and registry credentials remain release-specific prerequisites rather than requirements for the ordinary host build.
+
+A failed or interrupted install is not recorded as successful. Check an existing `target/dev-tools/.initializing` lock before removing it after an interrupted run; never remove active compiler caches or another user's files. Successful initialization proves environment readiness, **not that application tests pass**. Run the quality gates separately.
+
+The [2026-09-19 measured cleanup record](../research/native_build_measurements_2026-09-19.md) records an **8m 33.94s empty-output backend build**, **1.87s unchanged rerun**, and **31.40s fresh Node build**. Dependency downloads/toolchains were already available; this is not completely cold hosted CI. Keep the **10-minute core backend compilation goal** distinct from the **60-minute full required-CI ceiling**. Repository-wide lint and full execution gates remain mandatory.
+
+Use the same `CARGO_TARGET_DIR` with Cargo and `npm run test:e2e`; the browser runner honors custom output directories instead of using old default-directory binaries. Web output remains at `target/native-web` and must pass its source/platform/Node/lockfile checks.
+
+Updated 2026-09-19. The supported build is Cargo/Rust + Next.js/Node + Tauri, not Bazel. Root `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.node-version`, and the root/Next/CLI npm lockfiles are authoritative.
+
+## Canonical quality gates
+
+Run `make lint` and `make test` from the repository root before accepting an implementation. GNU Make invokes the native tools; failures stop the target and return a nonzero exit status, including with `make -j`. These targets never silently skip an unavailable tool or test lane.
+
+- `make test`: all Cargo workspace members (including Tauri), Node script tests, Next Vitest, CLI Vitest with coverage, desktop UI Vitest, native contracts and the complete real-stack Playwright discovery. E2E builds fresh Rust binaries and Next output first.
+- `make lint`: rustfmt check, Clippy for all workspace targets with warnings denied, ESLint for handwritten JS/TS, and Next/CLI TypeScript checks. Generated output and dependency directories are excluded from ESLint, not source tests. Existing lint debt is a failure, not an automatic exemption.
+- Focused lanes: `make test-rust`, `make test-backend`, `make test-node`, `make test-contracts`, `make test-e2e`, `make lint-rust`, `make lint-node`. `make test-backend` excludes Tauri and cannot certify the full suite.
+- `make test-e2e E2E_ARGS='--workers=1'` adjusts browser concurrency. Filters are diagnostic only; do not claim full acceptance for filtered runs. `make build-web` builds just the maintained web package.
+
+The Redis reconnect focused gate additionally requires `redis-server` and `redis-cli`
+on PATH (Debian/Ubuntu: `redis-server redis-tools`; macOS: `redis`). Its runner
+starts a disposable loopback process and verifies the server PID before destructive
+connection tests; shared Redis services and supplied URLs are rejected. Run
+`bash scripts/redis-reconnect/fetch.sh` then
+`python3 scripts/focused_ci_gate.py redis-reconnect`. Native contracts enforce the
+fixture ownership and required CI wiring without running those connection tests.
+
+Full gates require GNU Make, the pinned Rust/Node toolchains, Python 3 with PyYAML, native Tauri/WebKit/GTK development libraries for the host, a running Docker daemon and Playwright Chromium plus its OS dependencies (`npx --no-install playwright install --with-deps chromium`). Install locked npm dependencies at root, `src/ui/next`, and `src/cli`. See the native CI setup action for platform package lists. Mobile SDK, signing and physical-device checks remain separate release verification, not implied by a host workspace pass.
+
+## Setup and boundaries
+
+Install Rust with rustup and the pinned Node release. Ensure `$HOME/.cargo/bin` is on PATH on Unix. Use `npm ci` at the repository root, `npm --prefix src/ui/next ci` and `npm --prefix src/cli ci`; none should update a lockfile. Use `--locked` with Cargo in automation. Proto generation uses the workspace build scripts and vendored protoc; do not invoke deleted Bazel targets.
+
+Standalone backend startup requires explicitly supplied `OMNISOLO_AGENT_TOKEN` and `OMNISOLO_AGENT_AUTH_KEY` (at least 32 bytes), using the operator's existing secret-management mechanism. Missing or invalid configuration fails before database initialization; the server never inserts development credentials. `OMNISOLO_AGENT_AUTH_DISABLED` is rejected by production binaries, and SPIFFE mode remains unavailable until verified peer extraction is implemented. The isolated browser runner supplies its own test-only credentials. Cluster mode does not create or overwrite agent credentials.
+
+The default Cargo members are the backend and harness worker. `app` is the Tauri package and is excluded only from focused headless checks. Full `make test` and `make lint` include it and require native desktop dependencies.
+
+```sh
+cargo check --locked --workspace --exclude app --all-targets
+cargo test --locked -p ohc-core
+cargo test --locked -p ohc-storage
+cargo test --locked -p server_harness
+cargo test --locked -p server_integrations_stripe
+cargo test --locked --workspace --exclude app
+npm run test:contracts
+npm run typecheck:web
+npm run typecheck:e2e
+npm run test:web
+```
+
+`typecheck:e2e` checks every source included by `playwright.tsconfig.json`, including archived contract files. It is required by `make lint` and the Node CI job. Static checking does not change native browser discovery or certify archived mock contracts as runtime acceptance.
+
+Focused checks accelerate iteration; they do not replace the complete regression suite. Test output must include nonzero executed tests where tests are expected. No `--pass-with-no-tests`, hidden failures, disabled assertions or changed business expectations merely to obtain green output.
+
+## Build once, consume real artifacts
+
+```sh
+make build-e2e
+npm run desktop:build -- --debug --no-bundle
+npx --no-install playwright install chromium
+npm run test:e2e -- --workers=1
+```
+
+`build:web` compiles the maintained Next application and only then creates a source-bound proof and standalone package in `target/native-web`. Tauri owns a loopback Node server for this package. The authenticated Next server routes are retained; a static HTML export would remove necessary application behavior. The packaged executable is a separate official Node distribution, verified against the pinned release checksums and shipped with its license—not a copied CI `process.execPath` that might depend on shared host libraries.
+
+The package manifest binds source, dependency lock, build ID, Node version, OS and architecture. Packaging refuses stale output even when dependency locks are unchanged. Environment files and build caches are excluded from standalone, public and static content. Never merge old artifacts into a new bundle. `OMNISOLO_PREBUILT_WEB` may reuse a validated artifact from the same workflow/source/platform, not an arbitrary cached directory.
+
+`make build-e2e` also snapshots native producer source before Cargo and records the resulting server and agent hashes after Cargo succeeds. The proof lives beside those binaries in `${CARGO_TARGET_DIR:-target}/debug/native-binary-proof.json`. The configured checkout session tests require this proof and refuse stale or unproved binaries. A direct Cargo build alone does not produce it; use the maintained Make target before local E2E execution.
+
+The inventory session tests start a separate backend and Next process pair from the verified outputs, using the runner-owned database, fresh test tenants and an owned loopback provider. The provider accepts only registered checkout terms and returns an unpaid session. A browser proxy allows only the owned application, including Playwright API CONNECT tunnels to that exact host and port, and refuses every other CONNECT target, including the observed HTTPS Stripe redirect. These tests establish cash receipt versus online session/stock-hold exclusion. They do not exercise hosted payment or a paid webhook. The existing backend binds all interfaces inside the test runner; the provider, proxy and Next bind loopback. Global unconfigured-provider tests keep their original environment.
+
+The Rust API runs separately, either locally or on a configured HTTPS host. Desktop owns only its packaged Node process; it must not claim to provision or supervise a missing Rust backend. Mobile builds point at explicit HTTPS `OMNISOLO_MOBILE_WEB_URL` and do not bundle a desktop Node runtime. Platform SDKs, signing keys, store enrollment and actual device/install tests remain separate release prerequisites.
+
+## Action-owned CI setup
+
+`make init` and `make doctor` are local developer commands, not CI setup steps. GitHub Actions uses `.github/actions/setup-native` to compose `actions/setup-node`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache` and explicit `actions/cache/restore` / `actions/cache/save` steps. The redundant privileged `native-init` job has been removed. CI installs only each job's required host libraries and locked dependencies; it does not install a complete developer environment twice.
+
+The local initializer's regression tests remain in the inexpensive `check-changes` job and the normal script suite. `.github/scripts/check_native_cache_test.py` rejects any workflow/action invoking the initializer, checks scoped dependency installation with fake npm executables, verifies failure propagation and preserves every application/security gate. Existing ESLint/TypeScript, Rust, frontend/CLI/desktop unit, real-stack browser, deployment, security, release-matrix and timing requirements are unchanged. Tests of bootstrap functions are not a claim of performing a full hosted bootstrap.
+
+The headless Rust test job uses the shared setup action's `harness` Node scope, including the pinned OpenCode dependency. Its explicit version check and PATH setup still run before the real integration tests. Other jobs do not pay for this additional dependency tree.
+
+## CI cache design
+
+`.github/actions/setup-native/action.yml` configures **dependency-only** Rust caches by OS, architecture, runner image and job role; release roles include the target or matrix name. Rust-cache supplies the installed-compiler, Cargo manifest/lock, configuration and compiler-environment hashes, plus compatible dependency fallback behavior. Its environment fingerprint retains the default compiler inputs and also covers OpenSSL, pkg-config, vcpkg, SDKROOT and macOS deployment-target settings. A second manual manifest hash is not added to the job key. The `ohc-native-dependencies-v1` namespace retires previous caches containing workspace binaries. Source-bound workspace crates, installed toolchain executables, incremental graphs and failed builds are not saved; application/test binaries travel only as same-run artifacts. Cargo always revalidates fingerprints, and restored dependencies are not test results. Backend, desktop, release and cross-target jobs do not share incompatible target caches.
+
+This follows [rust-cache's documented dependency-cache behavior](https://github.com/Swatinem/rust-cache#cache-details) and avoids relying on updating an immutable cache with newer application binaries; [GitHub requires a new key to change cached contents](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching). The first run in the new namespace is expected to miss. Measure restore/save duration and total cache size before claiming a CI speedup.
+
+npm caches only its content-addressed `_cacache` downloads, not `node_modules`, npm logs, `.npmrc` or developer tool directories. The `npm-v2` key includes OS, architecture, the pinned Node version, dependency scope and **only that scope's lockfiles**. `root` installs the root tree; `web` installs root + Next; `all` installs root + Next + CLI; `harness` installs only `.github/test-tools`. Root jobs are not invalidated by unrelated Next/CLI changes, and harness caches include the previously omitted harness lockfile. Restore fallback remains inside the same OS/architecture/Node/scope. Every invocation runs `npm ci --include=dev` even on a cache hit, with install errors failing the job.
+
+The `next-v2` cache contains only `src/ui/next/.next/cache`, keyed by OS, architecture, runner image, Node/lock/config hashes and source revision, with fallback limited to the same build-environment prefix. The full application compiles on every run. Built executables and source-validated web output remain same-run artifacts, never accepted as build/test evidence merely because a cache was restored. Playwright still installs its pinned Chromium and required OS libraries instead of restoring an unbounded browser/profile cache.
+
+Rust dependency writes remain restricted to successful, positively allowed main/tag push or manual runs. npm downloads are saved only after successful locked installation on a main push/manual run; subsequent application tests can independently fail without invalidating those content-addressed downloads. Next compiler writes require a successful build on an allowed main push/manual run. PRs restore but do not write these caches; `pull_request_target` is not authorized by a negative-only event check. Automatic setup-node caching is disabled so there is no second writer outside this policy. The existing `cold_cache=true` input bypasses cache restores and saves, including the harness path. The first `npm-v2` / `next-v2` run is expected to miss; measure actual restoration/build times rather than claiming a speedup from configuration alone.
+
+Docker keeps its existing Buildx layer cache and source-verified same-run image artifacts. Signing material, provider keys, `.env`, test sessions and live databases must never enter caches or artifacts. Cache keys need version/role changes when the build contract changes; do not save failed compiled builds or entire shared host directories.
+
+## Disk, memory and iteration speed
+
+This migration review found a 16 GB `target/debug/incremental` directory on a full 244 GB host disk. Removing only that generated cache recovered space without deleting source or compiled dependencies. Never use a broad `git clean` or remove a whole worktree to address a build cache issue.
+
+Development incremental compilation stays available. Dev/test profiles explicitly share 256 codegen units and line-table debugging; test debug assertions and overflow checks remain enabled. Disabling incremental must not silently change a large crate to the non-incremental default codegen-unit count. The test profile disables incremental object graphs; the CI setup explicitly exports `CARGO_INCREMENTAL=0` because these graphs are not persisted. `CARGO_BUILD_JOBS=1` is useful on memory-constrained/shared hosts; `.cargo/config.toml` defaults to two jobs. Set `CARGO_INCREMENTAL=0` for bounded-space batch builds. A large native cold compile still has a real cost; this migration removes Bazel analysis and duplicate build plumbing, not all Rust compilation.
+
+Before deleting generated caches, confirm their exact project-relative path, that they contain no tracked files, and that no compiler owns them. Do not delete another project's caches. Keep test logs under `target/validation` and record elapsed time, toolchain, workload and whether a cache was warm. Do not claim a speedup from comparing a warm native run to a cold Bazel run.
+
+## CI critical path and measured time budget
+
+The safety ceiling is **X = 60 minutes for the complete Linux CI required gate**, with a **15-minute warm-cache stretch target**. A provisional **10-minute core-build target** covers backend, Next and Tauri compilation; it does not substitute for the complete test/security/deployment gate. These are acceptance targets, not achieved CI percentiles. Desktop/mobile signing, publishing and other release platforms are separate workflows and are not represented as fitting this budget.
+
+The complete-CI budget was initially relaxed from 30 to 35 minutes on 2026-10-04; the owner subsequently requested a one-hour ceiling for complete CI and browser execution. Normal browser work still targets 15–20 minutes per physical runner; the hour is a safety ceiling, not a performance target. Individual test limits, retries and required checks are unchanged. The final reporting job retains its separate five-minute timeout for report collection and upload; it does not run the preceding CI workloads. Historical measurements retain their original budgets.
+
+The CI graph now separates work that can run independently:
+
+- Rust executable build publishes this run's backend, agent, worker and mTLS probe. The headless test/lint job and desktop test/lint job partition the complete Rust workspace without making the desktop lane rebuild every backend crate.
+- The production Next build publishes promptly. Root/web/CLI/legacy-desktop Node tests, the complete Playwright TypeScript project, application typechecks and lint run in an independent **required** job; a passing build cannot bypass them.
+- Three browser runners reuse installed dependencies and source-validated web/binary artifacts, but execute the original twelve logical shards sequentially with fresh PostgreSQL, Valkey, backend, web, browser, credentials and session state for every logical unit. Groups `[1,5,7,11,12]`, `[2,3]`, and `[4,6,8,9,10]` balance actual logical wall times from four runs. Runs `37209169837`, `37218212302`, and `37220871509` project respectively 18.59/19.61/19.89, 19.32/17.50/19.62, and 17.36/19.48/17.97 active minutes, preserving the existing 15–20 minute and 130-second spread checks. The slower complete browser observation `37225051173` projects 19.88/23.32/19.98 minutes. Its 63.18 total active minutes cannot fit into three 20-minute bins. Among all partitions preserving both historical checks, this grouping minimizes its spread at 206.44 seconds (37% below the previous grouping), without reducing its longest runner. The 15–20 minute target is not a guaranteed upper bound. Failed-run measurements model timing variability only and do not certify correctness. Service startup is separate and must be measured in hosted CI; projections are not performance certification. Each physical runner rediscovers all twelve selections and the full inventory. Twelve mandatory source-bound receipts prove each logical assignment and exactly one terminal result for all discovered identities, including explicit skipped outcomes. Each logical unit has its own browser output and HTML report directory, so later units cannot erase earlier failure evidence. Caller filters remain forbidden.
+- The initial one-stack grouped run `37212397293` reduced summed setup from 18.16 to 5.29 minutes but exposed a shared churn seed. The journey now owns its canonical tenant/Leo/churn record and verifies persisted approval; it passed on run `37215209092`. That second run nevertheless failed three other assertions and one physical runner exhausted its 24-minute browser budget (16 missing results). It is not evidence of successful complete coverage or stable timing. Restoring original logical lifecycles is a scheduling/isolation repair, not a claim that those failures share a proven cause. Required acceptance remains all 1,828 identities, the original 22 explicit skips, zero retries, and every other CI gate.
+- Isolated-lifecycle run `37218212302` passed all 16 jobs: 1,806 browser passes, no failures, the same 22 skipped identities, and all 1,828 terminal receipts exactly once without retries. Its then-current bins measured 20.52/15.38/20.54 active minutes, motivating the revised grouping above. Shared setup plus per-logical service startup totaled 6.78 minutes versus the original twelve-runner setup total of 18.16 minutes (62.6% lower). Total browser runner time was 63.84 minutes versus 77.26 previously; the overall final gate took 28.15 minutes. These are single-run observations, not a stability percentile. Two independently reproduced readiness races in the crawl and help tooltip now wait on the actual resolved dashboard and local committed tooltip text, preserving their original response and UI assertions.
+- Run `37220871509` preserved all 1,828 terminal identities and the same 22 skips without retries, but failed the Swagger click-baseline readiness check and the crawl's strict savings-response check (1,804 passed, two failed). Its prior bins took 21.44/16.60/16.77 active minutes; logical shard 2 varied from 7.93 to 11.89 minutes, motivating the earlier three-observation grouping. Setup totaled 7.09 minutes and the complete gate took 29.07/60 minutes. Coverage correctly rejected the failures. Actual-component/browser diagnostics reproduced both: Swagger added 31 controls after premature discovery, and a same-owner identity recheck aborted a savings response body without navigation. The audit now waits for every operation identity from the actual API specification. The savings read keeps its original owner lease through transient verification while hiding private UI, preserving cancellation on actual invalidation, changed owner, failed verification, original expiry, and unmount. A later verified transition may start a new read; it cannot revive a retired response or extend the original lease. Run `37225051173` then passed all 1,806 browser tests with the exact 22 skips, all 1,828 terminal identities, twelve receipts and zero retries. Its previous bins measured 22.00/23.32/17.86 active minutes, setup totaled 7.58 minutes and the complete gate took 31.28/60 minutes. The workflow failed because incoming main moved Next.js into development dependencies. Reconciliation preserves Next 16.3.8 as a runtime dependency and removes an incoming Tailwind 4 plugin rejected by the existing Tailwind 3 guard; package versions and integrity metadata remain unchanged. Final-head hosted acceptance remains required.
+- Run `37227359246` passed every non-browser prerequisite but retained 1,651 browser passes, two UI failures, the same 22 skips and 153 unexecuted tests in logical shard 3. HTTP and gRPC were both assigned port 34539 because sequential free-port probes released each socket before selecting the next. The runner now reserves all three role ports together through provider startup, releases them only at each service handoff and closes reservations on cancellation or failure. The operations-checklist test uses a private canonical tenant and creates its task before the first dashboard read, preserving its UI checks and adding pending/approved database proofs. The exact hosted cache interleaving was not recorded; a controlled stale-fill regression demonstrates the fixture-ordering hazard. Real Next/Chromium reproduction proved that job-board hydration reset textarea selection before Delete, removing only the first character. The two controlled text fields now remain disabled until hydration commits; the browser assertion and timeout are unchanged. The failed run completed its gate in 28.82/60 minutes and remains incomplete coverage, not acceptance evidence.
+- Run `37230128007` completed all twelve logical units with 1,805 passes, one dashboard click-audit failure and the exact 22 skipped identities; all 1,828 selected identities reached terminal results without omissions, duplicates or retries. All non-browser prerequisites passed. The startup, checklist and hydration repairs passed this observation, and every service-port triplet was distinct. Actual browser times were 20.11/17.43/20.78 minutes, summed setup was 7.17 minutes and the complete gate took 29.43/60 minutes. The remaining failure was the referral-tier Share on X control: an isolated Chromium reproduction made the actual initial popup navigation while Playwright withheld its popup event until the first destination response. The audit now corroborates a live native popup opened by the same trusted click with its actual initial HTTP(S) navigation request, without waiting for the external response or extending any timeout. Blank, blocked, late, closed and unrelated windows do not satisfy this path; observation cleanup restores the native function and closes owned new windows. The original popup-document positive remains, and closed windows no longer qualify there. The failed run remains failed acceptance evidence.
+- There are at most seven concurrent workflow runners. Each browser job has a 65-minute outer timeout and a single cumulative 60-minute active-browser budget across its logical units; the budget never resets per unit. Service initialization and reporting use the remaining job headroom. Ordinary unit failures are retained while the remaining distinct units run for complete evidence; cancellation or exhausted browser budget prevents another unit from starting. The complete-CI acceptance limit is 60 minutes from the first job to the final gate, including build and dependency waits; a 60-minute browser run can therefore still fail the overall timing gate. The owning 65-minute job timeout allows setup and failure cleanup but does not extend that acceptance limit. Individual test timeouts and assertions are unchanged.
+- Browser execution waits for the artifact producers, dependency audit and desktop lane. Independent Node quality and PostgreSQL isolation checks may overlap it and remain required by the final gate. Docker's Node-completion dependency bounds runner overlap without hiding deployment tests after an independent Node failure.
+- One production Docker build produces the server/agent image layers. Kind and Compose both load that same run's archive and still execute their full deployment checks. `scripts/native-images.py` checks the source fingerprint, tar checksum, image tags and loaded image IDs; caches and arbitrary local images are not accepted as current build evidence. Both deployment suites reuse the compiled mTLS probe rather than installing another Rust toolchain and recompiling it.
+- PostgreSQL tenant-isolation tests remain independently required under the non-superuser application role. `CI Required` fails on failed/cancelled or unexpectedly skipped builds, tests, lint, dependency audit and security lanes.
+
+`workflow_dispatch` accepts `cold_cache: true`. It disables restored Rust, npm-download, Next and Docker build caches; freshly compiled layers may still be reused **within the same run**. Hosted toolchain downloads/base operating-system images are outside this project-cache definition. This input does not remove any acceptance check and is not an instruction to dispatch a workflow without authorization.
+
+The final gate fetches the complete job list for the **exact run attempt** with read-only Actions permission. `scripts/ci-performance.py` records elapsed time from the earliest job start to the final gate start, including waits between dependent jobs. It excludes the initial queue before the first job and the final reporting/upload itself. Missing/inconsistent pagination, wrong run/attempt, unfinished predecessor jobs and invalid timestamps fail closed. Runs above 60 minutes fail the performance check; failed functional jobs never become successful performance evidence. Markdown and JSON reports are uploaded as `ci-performance-<attempt>` and shown in the Actions summary. Cache mode is labeled as requested, not claimed to be a hit.
+
+### Local observations on 2026-09-19
+
+| Workload | Observed result | Cache and resource limits |
+|---|---|---|
+| Fresh Next production build and source-validated packaging | Passed, 54 seconds | `.next` absent; installed npm dependencies reused. Not a clean-runner CI measurement. |
+| Backend + agent + worker executable build | Passed, 220.72 seconds; peak process-group RSS 4,722.75 MiB | Dependency artifacts reused; main server artifact absent after a failed bounded attempt; Cargo jobs 1, incremental off, `MALLOC_ARENA_MAX=2`. |
+| Earlier dependency compilation attempt | Failed after 733 seconds at an imposed 6 GiB **virtual-address-space** ceiling | Not proof that resident memory exceeded 6 GiB. Replaced with measured RSS-based protection; do not report this failure as a passed cold baseline. |
+| Browser discovery | 1,688 tests across 453 files | Listing only, not execution; no Docker, model keys or running database required for discovery. |
+
+A clean build means a fresh source checkout can pass the full declared gates; a warm invocation, successful binary build or a configured timeout alone cannot certify that. See the remediation ledger for outstanding lint and runtime acceptance work.
+
+## Browser and provider verification
+
+Normal Rust and Next builds expose no demo-seeding, mock-inbox, approval simulation,
+or reputation simulation HTTP routes. This applies to debug builds as well as
+release builds; there is no environment variable or Cargo feature to re-enable them.
+The native browser runner applies explicit SQL fixtures only to the PostgreSQL
+container it just created. A private per-run proof binds fixture SQL helpers to
+that running container's ID, generated run label, database and loopback port;
+arbitrary `DATABASE_URL` values are rejected before any SQL connection. The runner
+then authenticates its fixture owner through the real login and requires HTTP 404
+for all 18 retired backend fixture routes before browser execution. Unit tests of
+the isolation helper and HTTP probe are not a substitute for that real-stack gate.
+
+Compose verification loads its explicit SQL fixture into its own project-verified
+PostgreSQL container, then checks exact record IDs through the real authenticated
+UI APIs. Kind verification creates and reloads a vendor through the real API in
+both database modes. Neither uses a production fixture endpoint. The retired
+operator seeder fails closed and never modifies an existing installation.
+
+Historical `*.mock-contract.ts` files remain as an inventory of unproven flows;
+they are not evidence of working production capabilities. This boundary repair
+does not claim to implement automatic review solicitation, referral checkout,
+newsletter generation, invoice drafting, or other simulated provider workflows.
+Those capabilities still require real implementations and their own acceptance.
+
+The native E2E runner starts isolated PostgreSQL/Valkey containers, the real Rust binaries and the newly built web package. It seeds only its own database and reconstructs an environment without production database or provider credentials. CI shards the complete browser-spec discovery. Per-test filters are available for local diagnosis without changing CI discovery.
+
+Provider-boundary test servers can supply deterministic external contracts; the internal UI/API/database must remain real. Label those results as contract verification, not live provider or customer evidence. Billing/provider failure tests must not make real charges. Signing, public publishing, infrastructure changes and customer actions require explicit applicable authority.
+
+## Migration status
+
+See `docs/research/native_migration_and_remediation.md` for the detailed finding-to-code-to-test ledger. A source fix, a passing unit test, a running sandbox flow and a live owner outcome are different evidence levels. Keep those distinctions in release notes and research.
+
+### Browser spec ownership
+
+The required native browser runner sets `PLAYWRIGHT_TEST_DIR=./src`; it includes
+Next's nested browser specs as well as `src/e2e`. Fresh discovery is partitioned
+into all twelve logical shards and the existing three physical groups.
+`native-discovery.test.mjs` compares every repository `*.spec.ts` path with that
+actual discovery result. A new spec outside the maintained scope, or a file that
+registers no browser test, fails the required Node gate instead of disappearing.
+
+Unit tests keep their explicit `*.test.ts`, `*.test.tsx` or `scripts/*.test.mjs`
+names and their Vitest/Node owners. Historical non-runnable browser contracts use
+`*.mock-contract.ts`. Those naming contracts are the explicit exclusions from
+browser-spec ownership, not directory-wide exceptions for new `*.spec.ts` files.
+
+The browser naming policy permits `.spec.ts` only. Other runnable spec suffixes
+(`.spec.tsx`, `.spec.js`, `.spec.jsx`, `.spec.mjs`, `.spec.cjs`, `.spec.mts`,
+`.spec.cts`) fail the ownership guard until an actual additional runner is wired
+and verified. They cannot silently fall between browser and unit discovery.

@@ -1,0 +1,202 @@
+import React from 'react';
+
+type ReplyContext = {
+  source?: string;
+  past_orders?: string;
+  context_used?: string;
+  original_message?: string;
+  generated_response?: string;
+  original_payload?: ReplyContext;
+};
+
+type ReplyApproval = {
+  lifecycle_state?: string;
+  payload?: ReplyContext;
+  proposed_action?: ReplyContext;
+  context_payload?: ReplyContext;
+};
+
+type AmbassadorReplyCardProps = {
+  approval: ReplyApproval;
+  onApprove?: () => void;
+  onDismiss?: () => void;
+  isEditing?: boolean;
+  editContent?: string;
+  onEdit?: () => void;
+  onCancelEdit?: () => void;
+  onSaveEdit?: () => void;
+  setEditContent?: (content: string) => void;
+};
+
+export const AmbassadorReplyCard: React.FC<AmbassadorReplyCardProps> = ({
+  approval,
+  onApprove,
+  onDismiss,
+  isEditing = false,
+  editContent = "",
+  onEdit,
+  onCancelEdit,
+  onSaveEdit,
+  setEditContent
+}) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const safeParse = (val: any): Record<string, any> => {
+    if (!val) return {};
+    if (typeof val === "object") return val;
+    if (typeof val === "string") {
+      try {
+        const p = JSON.parse(val);
+        return typeof p === "object" && p !== null ? p : {};
+      } catch {
+        return {};
+      }
+    }
+    return {};
+  };
+
+  const parsedPayload = safeParse(approval.payload);
+  const parsedProposed = safeParse(approval.proposed_action);
+  const parsedContext = safeParse(approval.context_payload);
+  const payloadSource = parsedPayload?.original_payload || parsedProposed?.original_payload || parsedContext?.original_payload || parsedProposed || parsedContext || parsedPayload || {};
+  const pastOrders = payloadSource.past_orders || parsedContext.past_orders || parsedProposed.past_orders || parsedPayload.past_orders;
+  const contextUsed = payloadSource.context_used || parsedContext.context_used || parsedProposed.context_used || parsedPayload.context_used;
+  const sourceName = (payloadSource.source || parsedProposed.source || parsedContext.source || parsedPayload.source || "unknown").replace("_", " ");
+  const originalMessage = payloadSource.original_message || parsedProposed.original_message || parsedContext.original_message || parsedPayload.original_message || "Customer message";
+
+  return (
+    <div className="app-list-item mb-4 p-4 bg-white/65 dark:bg-[#16161A]/70 backdrop-blur-[30px] saturate-[210%] border border-white/40 dark:border-white/10 rounded-[16px] flex flex-col gap-3" data-testid="ambassador-reply-card">
+      <div className="text-gray-900 dark:text-gray-100 font-bold mb-2">1 New Message from {sourceName}</div>
+
+      {(pastOrders || contextUsed) && (
+        <div className="bg-blue-50/50 dark:bg-blue-900/20 rounded-xl p-3 border border-blue-100 dark:border-blue-800/30">
+          <div className="flex items-center gap-2 mb-2">
+             <svg className="w-4 h-4 text-[#0066FF] dark:text-[#3388FF]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+             </svg>
+             <span className="text-xs font-semibold uppercase tracking-wider text-[#0066FF] dark:text-[#3388FF]">Customer Context</span>
+          </div>
+          <div className="flex flex-col gap-2 text-xs text-gray-700 dark:text-gray-300">
+             {pastOrders && (
+                <div className="flex items-start gap-2">
+                   <span className="text-lg leading-none">🛍️</span>
+                   <span>{pastOrders}</span>
+                </div>
+             )}
+             {contextUsed && (
+                <div className="flex items-start gap-2">
+                   <span className="text-lg leading-none">🧠</span>
+                   <span className="italic line-clamp-2">{contextUsed.substring(0, 150)}{contextUsed.length > 150 ? '...' : ''}</span>
+                </div>
+             )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-col sm:flex-row gap-2 sm:items-center text-[#0066FF] font-semibold text-sm">
+        {(approval.lifecycle_state === "PENDING_APPROVAL" || approval.lifecycle_state === "PENDING") && (
+          <span className="text-[10px] font-bold uppercase tracking-wider text-green-700 bg-green-100 px-2 py-1 rounded-[8px] self-start sm:self-center">
+            Action Required: Approve Reply
+          </span>
+        )}
+        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+        </svg>
+        Customer Inquiry
+      </div>
+      <div className="bg-white/50 dark:bg-black/20 p-3 rounded-[8px] text-xs text-[#1D1D1F] dark:text-[#F5F5F7] italic shadow-sm break-words">
+        "{originalMessage}"
+      </div>
+      <div className="text-[#0066FF] font-semibold text-sm mt-2 flex items-center gap-2">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500 bg-gray-100 px-2 py-1 rounded-[8px] mr-2">
+          AI Draft
+        </span>
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+        </svg>
+        Draft Reply
+      </div>
+      {isEditing ? (
+        <div className="flex flex-col gap-3 w-full mt-2">
+          <textarea
+            className="w-full min-h-[44px] p-3 rounded-[8px] border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-[#1D1D1F] dark:text-[#F5F5F7] text-sm focus:ring-2 focus:ring-[#0066FF] outline-none transition-all resize-none"
+            rows={4}
+            value={editContent}
+            onChange={(e) => setEditContent?.(e.target.value)}
+            data-testid="feed-edit-input"
+            autoFocus
+          />
+          <div className="flex flex-col sm:flex-row gap-3 w-full">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onSaveEdit?.();
+              }}
+              className="flex-1 min-h-[44px] min-w-[44px] px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+              aria-label="Save & Send Draft"
+              data-testid="feed-save-edit-btn"
+            >
+              Save & Send
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onCancelEdit?.();
+              }}
+              className="flex-1 min-h-[44px] min-w-[44px] px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+              aria-label="Cancel Edit"
+              data-testid="feed-cancel-edit-btn"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="bg-[#0066FF] p-3 rounded-[8px] text-xs text-white shadow-inner">
+            {approval.payload?.generated_response || (approval.proposed_action || approval.context_payload)?.generated_response || (approval.proposed_action || approval.context_payload)?.original_payload?.generated_response || approval.payload?.original_payload?.generated_response || "Ready to send."}
+          </div>
+          <div className="flex flex-col sm:flex-row gap-3 w-full mt-2">
+            {onApprove && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onApprove();
+                }}
+                className="flex-[2] min-h-[44px] min-w-[44px] px-4 rounded-[8px] bg-[#0066FF] text-white font-medium hover:bg-[#0052CC] transition-all duration-200 shadow-md flex items-center justify-center"
+                aria-label="Send Draft" data-testid="feed-approve-btn"
+              >
+                Send Draft
+              </button>
+            )}
+            {onEdit && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEdit();
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Edit"
+                data-testid="feed-edit-btn"
+              >
+                Edit
+              </button>
+            )}
+            {onDismiss && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDismiss();
+                }}
+                className="flex-1 min-h-[44px] min-w-[44px] px-4 rounded-[8px] border border-gray-300 dark:border-gray-600 text-[#1D1D1F] dark:text-[#F5F5F7] font-medium hover:bg-gray-100 dark:hover:bg-gray-800 transition-all duration-200 flex items-center justify-center"
+                aria-label="Dismiss"
+                data-testid="feed-dismiss-btn"
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};

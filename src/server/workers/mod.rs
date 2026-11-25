@@ -1,0 +1,37 @@
+pub mod agent_memory_pipeline;
+pub mod booking_reengagement;
+pub mod calendar_sync;
+pub mod competitor_audit;
+pub mod department_workers;
+pub mod memory;
+pub mod pos_sync_worker;
+
+pub mod daily_ops_routine_worker;
+pub mod deposit_follow_up_worker;
+pub mod invoice_followup_worker;
+pub mod lifecycle_engagement_worker;
+pub mod message_triage_worker;
+pub mod missed_lead_recovery_worker;
+pub mod pos_conflict_worker;
+pub mod pricing_analysis_worker;
+pub mod proactive_analysis_job;
+pub mod subscription_replenishment_job;
+pub mod subscription_replenishment_worker;
+pub mod subscription_retention_job;
+
+pub mod agent_action_worker;
+pub mod agent_catalog_dispatch;
+pub mod agent_feed_dispatch;
+pub mod booking_reengagement_job;
+#[cfg(test)]
+mod invoice_followup_worker_test;
+mod proactive_operations_polling;
+mod proactive_operations_storage;
+pub mod proactive_operations_worker;
+
+pub mod customer_memory_worker;
+pub mod subscription_health_job;
+pub mod subscription_health_worker;
+
+pub mod draft_quote_worker;
+pub mod inquiry_intake_worker;

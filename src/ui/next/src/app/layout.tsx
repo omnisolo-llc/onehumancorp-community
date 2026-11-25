@@ -1,0 +1,55 @@
+import './globals.css';
+import type { Metadata } from 'next';
+import { PRODUCT_NAME, PRODUCT_DESCRIPTION } from '../lib/branding';
+import { WalkthroughTarget } from '../components/Walkthrough';
+import { WalkthroughProvider, HelpWidget } from '../components/help';
+import { TooltipProvider } from '../components/TooltipRegistry';
+
+import { NetworkStatusIndicator } from "../components/NetworkStatusIndicator";
+import { SyncManagerInitializer } from "../components/SyncManagerInitializer";
+import { NotificationManager } from "../components/NotificationManager";
+import { ExtensionProviders } from '../components/ExtensionProviders';
+import { PublicAwareApplicationFrame } from './components/PublicAwareApplicationFrame';
+
+export const viewport = {
+  width: 'device-width',
+  initialScale: 1,
+};
+
+export const metadata: Metadata = {
+  title: PRODUCT_NAME,
+  description: PRODUCT_DESCRIPTION,
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body>
+        <ExtensionProviders>
+          <TooltipProvider>
+            <WalkthroughProvider>
+              <PublicAwareApplicationFrame
+                applicationWidgets={
+                  <>
+                    <WalkthroughTarget id="omnisolo-help-widget-target">
+                      <HelpWidget />
+                    </WalkthroughTarget>
+                    <NetworkStatusIndicator />
+                    <SyncManagerInitializer />
+                    <NotificationManager />
+                  </>
+                }
+              >
+                {children}
+              </PublicAwareApplicationFrame>
+            </WalkthroughProvider>
+          </TooltipProvider>
+        </ExtensionProviders>
+      </body>
+    </html>
+  );
+}

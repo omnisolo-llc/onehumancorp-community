@@ -1,0 +1,223 @@
+"use client";
+
+import React, { createContext, useContext, useState, ReactNode, useRef, useEffect } from 'react';
+import { motion, AnimatePresence } from "framer-motion";
+import { usePathname } from 'next/navigation';
+
+type TooltipContextType = {
+  activeTooltip: string | null;
+  setActiveTooltip: (id: string | null) => void;
+  tooltipRect: DOMRect | null;
+  setTooltipRect: (rect: DOMRect | null) => void;
+  setTooltipTarget: (target: HTMLElement | null) => void;
+  tooltipText: string;
+  setTooltipText: (text: string) => void;
+  getTooltip: (id: string) => string | undefined;
+};
+
+const TooltipContext = createContext<TooltipContextType | undefined>(undefined);
+
+declare global {
+  interface Window {
+    OMNISOLO_TOOLTIPS?: Record<string, string>;
+  }
+}
+
+export const DEFAULT_TOOLTIPS: Record<string, string> = {
+  "help-nav-tooltip": "Open the Help Center to find guides, videos, and contact support.",
+  "api-docs-tooltip": "Direct API access is only for custom integrations.",
+  "changelog-nav-tooltip": "See what's new in the latest OmniSolo updates.",
+  "dashboard-walkthrough-btn": "Take a quick tour of the dashboard.",
+  "help-advanced-toggle-tooltip": "Show advanced developer options.",
+  "help-btn-tooltip-appshell": "Need help? Click here to access our Help Center, Ask AI, Video Tutorials, and Release Notes.",
+  "checkout-pay-tooltip": "Click to process your payment.",
+  "dashboard-tooltip": "View your daily sales and overall business health.",
+  "inventory-tooltip": "Check and adjust your product inventory levels.",
+  "orders-tooltip": "View and manage incoming customer orders.",
+  "total-sales-tooltip": "Total gross revenue generated.",
+  "recent-orders-tooltip": "Recent customer transactions.",
+  "inbox-activity-tooltip": "Recent customer messages and inquiries.",
+  "help-search-tooltip": "Search for articles, videos, and guides",
+};
+
+export function TooltipProvider({ children }: { children: ReactNode }) {
+  const [activeTooltip, setActiveTooltip] = useState<string | null>(null);
+  const [tooltipRect, setTooltipRect] = useState<DOMRect | null>(null);
+  const [tooltipTarget, setTooltipTarget] = useState<HTMLElement | null>(null);
+  const [tooltipText, setTooltipText] = useState<string>("");
+  const [tooltips, setTooltips] = useState<Record<string, string>>(DEFAULT_TOOLTIPS);
+  const pathname = usePathname();
+
+  useEffect(() => {
+    // A share-card document is immediately replaced; load destination tooltips
+    // when the application route mounts instead of abandoning this read.
+    if (pathname === '/login' || pathname === '/share-card') return;
+
+    const abortController = new AbortController();
+    const fetchTooltips = async () => {
+      try {
+        const response = await fetch("/api/v1/tooltips", { signal: abortController.signal });
+        if (!response.ok) {
+          throw new Error(`Failed to load tooltips, status: ${response.status}`);
+        }
+        const data = await response.json();
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+          const safeTooltips = Object.fromEntries(
+            Object.entries(data).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+          );
+          setTooltips(prev => ({ ...prev, ...safeTooltips }));
+          window.OMNISOLO_TOOLTIPS = { ...(window.OMNISOLO_TOOLTIPS || {}), ...safeTooltips };
+        }
+      } catch {
+        // Built-in tooltip copy remains available while the optional service is offline.
+      }
+    };
+    fetchTooltips();
+    return () => { abortController.abort(); };
+  }, [pathname]);
+
+  const [windowWidth, setWindowWidth] = useState(1000);
+
+  useEffect(() => {
+    setWindowWidth(window.innerWidth);
+    let timeoutId: NodeJS.Timeout;
+    const handleResize = () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => setWindowWidth(window.innerWidth), 150);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => {
+      clearTimeout(timeoutId);
+      window.removeEventListener('resize', handleResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleScroll = () => {
+      if (!activeTooltip || !tooltipRect) return;
+      const currentRect = tooltipTarget?.isConnected ? tooltipTarget.getBoundingClientRect() : null;
+      // scrollIntoView can queue its scroll event until after pointer entry.
+      // Dismiss only when the anchor moved since this tooltip opened, not when
+      // an already-completed scroll or an unrelated panel delivers its event.
+      if (!currentRect || currentRect.top !== tooltipRect.top || currentRect.left !== tooltipRect.left) {
+        setActiveTooltip(null);
+      }
+    };
+    window.addEventListener('scroll', handleScroll, true);
+    return () => window.removeEventListener('scroll', handleScroll, true);
+  }, [activeTooltip, tooltipRect, tooltipTarget]);
+
+  return (
+    <TooltipContext.Provider value={{ activeTooltip, setActiveTooltip, tooltipRect, setTooltipRect, setTooltipTarget, tooltipText, setTooltipText, getTooltip: (id: string) => tooltips[id] }}>
+      {children}
+
+      <AnimatePresence>
+      {activeTooltip && tooltipRect && (
+        <motion.div
+          role="tooltip"
+          id={`${activeTooltip}-description`}
+          initial={{ opacity: 0, y: 5, x: "-50%" }}
+          animate={{ opacity: 1, y: 0, x: "-50%" }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className="fixed z-[100] backdrop-blur-[30px] backdrop-saturate-[210%] bg-white/65 dark:bg-[#16161a]/70 border border-white/40 dark:border-white/10 !rounded-[8px] text-gray-900 dark:text-gray-100 text-sm font-inter p-3 shadow-[0_4px_24px_rgba(0,0,0,0.04)] pointer-events-none w-auto max-w-[calc(100vw-32px)] md:max-w-xs mx-4 text-center leading-relaxed"
+          style={{
+            top: tooltipRect.top - 10,
+            left: Math.max(144, Math.min(windowWidth - 144, tooltipRect.left + tooltipRect.width / 2)),
+            transform: 'translate(-50%, -100%)',
+          }}
+        >
+          {tooltipText}
+          <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-solid border-t-white/90 dark:border-t-black/80 border-t-8 border-x-transparent border-x-8 border-b-0 backdrop-blur-[30px] backdrop-saturate-[210%] bg-white/65 dark:bg-[#16161a]/70"></div>
+        </motion.div>
+      )}
+      </AnimatePresence>
+
+
+    </TooltipContext.Provider>
+  );
+}
+
+export function useTooltip() {
+  const context = useContext(TooltipContext);
+  if (!context) {
+    throw new Error('useTooltip must be used within a TooltipProvider');
+  }
+  return context;
+}
+
+export function WithTooltip({ children, id, defaultText, className, tabIndex }: { children: ReactNode, id: string, defaultText?: string, className?: string, tabIndex?: number }) {
+  const { activeTooltip, setActiveTooltip, setTooltipRect, setTooltipTarget, setTooltipText, getTooltip } = useTooltip();
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const text = getTooltip(id) || defaultText || DEFAULT_TOOLTIPS[id] || id;
+
+  const handleMouseEnter = React.useCallback(() => {
+    if (wrapperRef.current) {
+      setTooltipTarget(wrapperRef.current);
+      setTooltipRect(wrapperRef.current.getBoundingClientRect());
+      setTooltipText(text);
+      setActiveTooltip(id);
+    }
+  }, [id, text, setActiveTooltip, setTooltipRect, setTooltipTarget, setTooltipText]);
+
+  const handleMouseLeave = React.useCallback(() => {
+    setActiveTooltip(null);
+  }, [setActiveTooltip]);
+
+  // Mobile support: Long press
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const handleTouchStart = () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      handleMouseEnter();
+    }, 500); // 500ms for long press
+  };
+
+  const handleTouchMove = () => {
+    // If the user scrolls, cancel the long press tooltip
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setActiveTooltip(null);
+  };
+
+  const handleTouchEnd = () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    const hideTimer = setTimeout(() => {
+        setActiveTooltip(null);
+    }, 2000); // Hide after 2 seconds on mobile
+    timerRef.current = hideTimer;
+  };
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  return (
+    <div
+      ref={wrapperRef}
+      tabIndex={tabIndex}
+      aria-describedby={activeTooltip === id ? `${id}-description` : undefined}
+      onFocus={handleMouseEnter}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) handleMouseLeave();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') handleMouseLeave();
+      }}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+      onTouchCancel={handleTouchEnd}
+      onContextMenu={(e) => e.preventDefault()}
+      id={id}
+      className={className ? `${className} relative cursor-help` : "inline-block relative cursor-help"}
+      data-tooltip-id={id}
+      data-tooltip={text}
+    >
+      {children}
+    </div>
+  );
+}

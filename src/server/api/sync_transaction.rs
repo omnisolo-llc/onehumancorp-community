@@ -1,0 +1,129 @@
+//! A lost COMMIT reply is not proof of rollback.
+#[derive(Debug)]
+pub(super) enum SyncError {
+    Rejected(&'static str),
+    Database(sqlx::Error),
+    Commit(sqlx::Error),
+}
+impl From<sqlx::Error> for SyncError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(reason) => write!(f, "transaction rejected: {reason}"),
+            Self::Database(e) => write!(f, "transaction: {e}"),
+            Self::Commit(e) => write!(f, "commit: {e}"),
+        }
+    }
+}
+impl SyncError {
+    pub(super) fn status(&self) -> &'static str {
+        match self {
+            Self::Commit(sqlx::Error::Database(error))
+                if error.code().is_some_and(|code| definite_rollback(&code)) =>
+            {
+                "blocked"
+            }
+            Self::Commit(_) => "reconciliation",
+            Self::Database(_) | Self::Rejected(_) => "blocked",
+        }
+    }
+    pub(super) fn reason(&self) -> &'static str {
+        if let Self::Rejected(reason) = self {
+            return reason;
+        }
+        if self.status() == "reconciliation" {
+            "commit_outcome_unknown"
+        } else {
+            "transaction_not_committed"
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn lost_commit_reply_requires_reconciliation() {
+        let error = SyncError::Commit(sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert_eq!(error.status(), "reconciliation");
+        assert_eq!(error.reason(), "commit_outcome_unknown");
+    }
+    #[test]
+    fn failure_before_commit_cannot_be_acknowledged() {
+        let error = SyncError::Database(sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert_eq!(error.status(), "blocked");
+    }
+}
+
+fn definite_rollback(code: &str) -> bool {
+    // Explicit constraint/serialization/deadlock/aborted-transaction failures
+    // prove rejection. Unknown completion, shutdown and all other codes do not.
+    code.starts_with("23") || matches!(code, "40001" | "40P01" | "25P02" | "P0001")
+}
+#[cfg(test)]
+mod commit_code_tests {
+    use super::*;
+    #[test]
+    fn statement_completion_unknown_and_shutdown_are_not_rollbacks() {
+        assert!(!definite_rollback("40003"));
+        assert!(!definite_rollback("57P01"));
+        assert!(definite_rollback("23514"));
+        assert!(definite_rollback("40001"));
+        assert!(definite_rollback("P0001"));
+    }
+}
+
+use server_auth::commit_authority::{AuthorityError, OwnerPgTransaction};
+pub(super) async fn commit_owner(tx: OwnerPgTransaction) -> Result<(), SyncError> {
+    tx.commit().await.map_err(|error| match error {
+        AuthorityError::Forbidden => SyncError::Rejected("current_owner_authority_required"),
+        AuthorityError::Database(error) => SyncError::Commit(error),
+        // Authority timeouts can occur while awaiting COMMIT. Never infer rollback.
+        AuthorityError::Unavailable => SyncError::Commit(sqlx::Error::PoolTimedOut),
+    })
+}
+
+/// SQLite COMMIT or post-COMMIT cleanup failures can leave an unknown durable
+/// result. Never apply PostgreSQL SQLSTATE rollback rules to SQLite error codes.
+pub(super) async fn commit_sqlite_owner(
+    tx: server_auth::commit_authority::OwnerSqliteTransaction,
+) -> Result<(), SyncError> {
+    tx.commit().await.map_err(sqlite_commit_error)
+}
+fn sqlite_commit_error(error: AuthorityError) -> SyncError {
+    match error {
+        AuthorityError::Forbidden => SyncError::Rejected("current_owner_authority_required"),
+        AuthorityError::Database(error) => {
+            SyncError::Commit(sqlx::Error::Io(std::io::Error::other(error)))
+        }
+        AuthorityError::Unavailable => SyncError::Commit(sqlx::Error::PoolTimedOut),
+    }
+}
+#[cfg(test)]
+mod sqlite_commit_tests {
+    use super::*;
+    #[test]
+    fn timeout_or_lost_sqlite_commit_reply_is_unconfirmed() {
+        for error in [
+            AuthorityError::Unavailable,
+            AuthorityError::Database(sqlx::Error::Io(std::io::ErrorKind::ConnectionReset.into())),
+        ] {
+            let error = sqlite_commit_error(error);
+            assert_eq!(error.status(), "reconciliation");
+            assert_eq!(error.reason(), "commit_outcome_unknown");
+        }
+    }
+    #[test]
+    fn sqlite_commit_authority_rejection_is_not_unknown() {
+        let error = sqlite_commit_error(AuthorityError::Forbidden);
+        assert_eq!(error.status(), "blocked");
+        assert_eq!(error.reason(), "current_owner_authority_required");
+    }
+}

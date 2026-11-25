@@ -1,0 +1,208 @@
+pub use ::server_integrations_core::{IntegrationProvider, ProviderMetadata};
+
+pub fn get_catalog() -> Vec<IntegrationProvider> {
+    vec![
+        metadata_provider(
+            "slack",
+            "Slack",
+            "messaging",
+            "https://slack.com/api".to_string(),
+        ),
+        metadata_provider(
+            "telegram",
+            "Telegram",
+            "messaging",
+            "https://api.telegram.org".to_string(),
+        ),
+        metadata_provider(
+            "discord",
+            "Discord Webhooks",
+            "messaging",
+            "https://discord.com/api/webhooks".to_string(),
+        ),
+        metadata_provider(
+            "taxjar",
+            "TaxJar",
+            "finance",
+            "https://api.taxjar.com/v2".to_string(),
+        ),
+        metadata_provider(
+            "twilio",
+            "Twilio SMS",
+            "sms",
+            "https://api.twilio.com".to_string(),
+        ),
+        metadata_provider(
+            "meta",
+            "Meta Graph API (Facebook, Instagram, WhatsApp)",
+            "social",
+            "https://graph.facebook.com/v19.0".to_string(),
+        ),
+        metadata_provider(
+            "whatsapp_cloud_api",
+            "WhatsApp Cloud API",
+            "social",
+            "https://graph.facebook.com/v19.0".to_string(),
+        ),
+        metadata_provider(
+            "google_workspace",
+            "Google Workspace",
+            "productivity",
+            "https://www.googleapis.com".to_string(),
+        ),
+        metadata_provider(
+            "google_calendar",
+            "Google Calendar",
+            "calendar",
+            "https://www.googleapis.com/calendar/v3".to_string(),
+        ),
+        metadata_provider(
+            "cal_com",
+            "Cal.com",
+            "calendar",
+            "https://api.cal.com/v1".to_string(),
+        ),
+        metadata_provider(
+            "resend",
+            "Resend Email Marketing",
+            "email_marketing",
+            "https://api.resend.com".to_string(),
+        ),
+        metadata_provider(
+            "sendgrid",
+            "SendGrid Email",
+            "email",
+            "https://api.sendgrid.com/v3".to_string(),
+        ),
+        metadata_provider(
+            "shippo",
+            "Shippo Logistics",
+            "shipping",
+            "https://api.goshippo.com".to_string(),
+        ),
+        metadata_provider(
+            "zoom",
+            "Zoom Video Conferencing",
+            "video",
+            "https://api.zoom.us/v2".to_string(),
+        ),
+        metadata_provider(
+            "mercadopago",
+            "Mercado Pago",
+            "payment",
+            "https://api.mercadopago.com".to_string(),
+        ),
+        metadata_provider(
+            "alipay",
+            "Alipay",
+            "payment",
+            "https://openapi.alipay.com".to_string(),
+        ),
+        metadata_provider(
+            "razorpay",
+            "Razorpay",
+            "payment",
+            "https://api.razorpay.com/v1".to_string(),
+        ),
+        metadata_provider(
+            "calendly",
+            "Calendly",
+            "calendar",
+            "https://api.calendly.com".to_string(),
+        ),
+        metadata_provider(
+            "mailchimp",
+            "Mailchimp",
+            "email_marketing",
+            "https://server.api.mailchimp.com/3.0".to_string(),
+        ),
+        metadata_provider(
+            "doordash",
+            "DoorDash Drive",
+            "delivery",
+            "https://openapi.doordash.com".to_string(),
+        ),
+        metadata_provider(
+            "shipday",
+            "Shipday Local Delivery",
+            "delivery",
+            "https://api.shipday.com".to_string(),
+        ),
+        metadata_provider(
+            "restic",
+            "Restic Local Backup MCP",
+            "backup",
+            "local://restic".to_string(),
+        ),
+        metadata_provider(
+            "google_analytics",
+            "Google Analytics",
+            "analytics",
+            "https://analyticsdata.googleapis.com/v1beta".to_string(),
+        ),
+        metadata_provider(
+            "github_api",
+            "GitHub API",
+            "code_management",
+            "https://api.github.com".to_string(),
+        ),
+        metadata_provider(
+            "outlook_calendar",
+            "Outlook Calendar",
+            "calendar",
+            "https://graph.microsoft.com/v1.0".to_string(),
+        ),
+        metadata_provider(
+            "trello",
+            "Trello",
+            "project_management",
+            "https://api.trello.com/1".to_string(),
+        ),
+    ]
+}
+
+fn metadata_provider(
+    id: &str,
+    name: &str,
+    category: &str,
+    base_url: String,
+) -> IntegrationProvider {
+    IntegrationProvider {
+        metadata: ProviderMetadata {
+            id: id.to_string(),
+            name: name.to_string(),
+            category: category.to_string(),
+            base_url,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_provider_identities_are_unique() {
+        let catalog = get_catalog();
+        let ids: std::collections::BTreeSet<_> = catalog.iter().map(|p| &p.metadata.id).collect();
+        assert_eq!(
+            ids.len(),
+            catalog.len(),
+            "each registry provider needs one catalog identity"
+        );
+    }
+
+    #[test]
+    fn google_workspace_has_one_consistent_catalog_entry() {
+        let catalog = get_catalog();
+        let entries: Vec<_> = catalog
+            .iter()
+            .filter(|p| p.metadata.id == "google_workspace")
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let metadata = &entries[0].metadata;
+        assert_eq!(metadata.name, "Google Workspace");
+        assert_eq!(metadata.category, "productivity");
+        assert_eq!(metadata.base_url, "https://www.googleapis.com");
+    }
+}

@@ -1,0 +1,429 @@
+syntax = "proto3";
+
+package ohc.api.v1;
+
+import "src/proto/agent.proto";
+import "src/proto/organization.proto";
+
+option go_package = "github.com/onehumancorp/mono/src/proto/ohc/api/v1;apiv1";
+
+message MeetingRoom {
+  string id = 1;
+  repeated string participants = 2;
+  repeated ohc.agent.AgentMessage transcript = 3;
+}
+
+message StatusCount {
+  string status = 1;
+  uint32 count = 2;
+}
+
+
+enum PaymentSource {
+  STRIPE_TERMINAL_TAP = 0;
+  ONLINE_CHECKOUT = 1;
+}
+
+message Order {
+  string id = 1;
+  string organization_id = 2;
+  string service_id = 3;
+  int64 amount_cents = 4;
+  string status = 5;
+  int64 created_at_unix = 6;
+  string currency = 7;
+}
+
+message Quote {
+  string id = 1;
+  string tenant_id = 2;
+  string status = 3;
+  int64 total_amount = 4;
+  int64 required_deposit = 5;
+  int64 expires_at_unix = 6;
+  string currency = 7;
+}
+
+message Invoice {
+  string id = 1;
+  string tenant_id = 2;
+  string type = 3;
+  int64 amount = 4;
+  string currency = 5;
+}
+
+message Booking {
+  string id = 1;
+  string organization_id = 2;
+  string customer_id = 3;
+  string service_id = 4;
+  int64 start_time_unix = 5;
+  int64 end_time_unix = 6;
+  string status = 7;
+}
+
+message DashboardSnapshot {
+
+  ohc.organization.Organization organization = 1;
+  repeated ohc.agent.Agent agents = 2;
+  repeated MeetingRoom meetings = 3;
+  reserved 4;
+  reserved "cost_summary";
+  repeated StatusCount statuses = 5;
+  string updated_at = 6;
+  repeated ohc.organization.Product products = 7;
+  repeated Order orders = 8;
+  repeated Booking bookings = 9;
+}
+
+message GetDashboardRequest {
+  string organization_id = 1;
+  bool mobile_optimized = 2;
+}
+
+// B2B Collaboration messages
+message TrustAgreement {
+  string id = 1;
+  string partner_org = 2;
+  string partner_jwks_url = 3;
+  repeated string allowed_roles = 4;
+  string status = 5; // PENDING, ACTIVE, REVOKED
+  int64 created_at_unix = 6;
+}
+
+message B2BHandshakeRequest {
+  string partner_org = 1;
+  string partner_jwks_url = 2;
+  repeated string allowed_roles = 3;
+}
+
+message SyncMissionStatus {
+  bool success = 1;
+}
+
+// Incident / SRE messages
+message Incident {
+  string id = 1;
+  string severity = 2; // P0, P1, P2
+  string summary = 3;
+  string root_cause_analysis = 4;
+  string resolution_plan_id = 5;
+  string status = 6; // INVESTIGATING, PROPOSED, RESOLVED
+  int64 created_at_unix = 7;
+}
+
+message IncidentStatusRequest {
+  string incident_id = 1;
+  string status = 2;
+  string resolution_plan_id = 3;
+}
+
+// Compute Optimization messages
+message ComputeProfile {
+  string role_id = 1;
+  int32 min_vram_gb = 2;
+  string preferred_gpu_type = 3; // "h100", "a10g"
+  int32 scheduling_priority = 4;
+}
+
+message ClusterStatus {
+  string region = 1;
+  string status = 2; // healthy, degraded, offline
+  int32 latency_ms = 3;
+  int32 available_nodes = 4;
+}
+
+// Pipeline / SDLC messages
+message Pipeline {
+  string id = 1;
+  string name = 2;
+  string status = 3; // PENDING, IMPLEMENTING, TESTING, STAGING, PROMOTED, FAILED
+  string branch = 4;
+  string staging_url = 5;
+  string initiated_by = 6;
+  int64 created_at_unix = 7;
+  int64 updated_at_unix = 8;
+}
+
+message PipelinePromoteRequest {
+  string pipeline_id = 1;
+  string approved_by = 2;
+}
+
+service DashboardService {
+  rpc GetDashboard(GetDashboardRequest) returns (DashboardSnapshot);
+  rpc GetOnboardingState(GetOnboardingStateRequest) returns (GetOnboardingStateResponse);
+  rpc UpdateOnboardingState(UpdateOnboardingStateRequest) returns (UpdateOnboardingStateResponse);
+  rpc GetVideoTutorials(GetVideoTutorialsRequest) returns (GetVideoTutorialsResponse);
+}
+
+// Onboarding State
+message OnboardingState {
+  string organization_id = 1;
+  string user_id = 2;
+  int32 current_step = 3;
+  string state_json = 4;
+}
+
+message GetOnboardingStateRequest {
+  string organization_id = 1;
+}
+
+message GetOnboardingStateResponse {
+  OnboardingState state = 1;
+}
+
+message UpdateOnboardingStateRequest {
+  OnboardingState state = 1;
+}
+
+message UpdateOnboardingStateResponse {
+  bool success = 1;
+}
+
+// Video Tutorial messages
+message VideoMetadata {
+  string title = 1;
+  string description = 2;
+  int32 duration_sec = 3;
+  string url = 4;
+  string thumbnail_url = 5;
+}
+
+message GetVideoTutorialsRequest {
+  bool mobile_optimized = 1;
+}
+
+message GetVideoTutorialsResponse {
+  repeated VideoMetadata videos = 1;
+}
+service BookingEngineService {
+  rpc GetResources(GetResourcesRequest) returns (GetResourcesResponse);
+  rpc GetServices(GetServicesRequest) returns (GetServicesResponse);
+  rpc CreateUnifiedBooking(CreateUnifiedBookingRequest) returns (CreateUnifiedBookingResponse);
+  rpc CheckAvailability(CheckAvailabilityRequest) returns (CheckAvailabilityResponse);
+  rpc ReserveTimeSlot(ReserveTimeSlotRequest) returns (ReserveTimeSlotResponse);
+  rpc CreateConversationalCheckout(CreateConversationalCheckoutRequest) returns (ConversationalCheckoutSession);
+  rpc SyncCalendar(SyncCalendarRequest) returns (SyncCalendarResponse);
+  rpc CreateQuote(CreateQuoteRequest) returns (QuoteResponse);
+  rpc FetchQuote(FetchQuoteRequest) returns (QuoteResponse);
+}
+
+message CheckAvailabilityRequest {
+  string tenant_id = 1;
+  string service_id = 2;
+  string date = 3; // YYYY-MM-DD
+}
+
+message TimeSlot {
+  string start_time = 1; // RFC3339
+  string end_time = 2; // RFC3339
+}
+
+message CheckAvailabilityResponse {
+  repeated TimeSlot available_slots = 1;
+}
+
+message ReserveTimeSlotRequest {
+  string tenant_id = 1;
+  string customer_id = 2;
+  string service_id = 3;
+  string start_time = 4; // RFC3339
+  string end_time = 5; // RFC3339
+  bool requires_deposit = 6;
+  string timezone = 7;
+}
+
+message ReserveTimeSlotResponse {
+  string booking_id = 1;
+  string deposit_stripe_link = 2;
+}
+
+message CreateConversationalCheckoutRequest {
+  string tenant_id = 1;
+  string customer_id = 2;
+  int64 amount_cents = 3;
+  string service_id = 4;
+}
+
+message ConversationalCheckoutSession {
+  string session_id = 1;
+  string tenant_id = 2;
+  string customer_id = 3;
+  int64 amount_cents = 4;
+  string inventory_lock_id = 5;
+  string checkout_url = 6;
+  string status = 7;
+  int64 expires_at_unix = 8;
+}
+
+
+// POS Engine messages
+message PosOfflineTransaction {
+  string id = 1;
+  string tenant_id = 2;
+  string client_id = 3;
+  int64 amount_cents = 4;
+  string currency = 5;
+  string payload = 6; // JSON detailing the items bought
+  string status = 7; // PENDING, SYNCED, FAILED
+  int64 created_at_unix = 8;
+  optional string terminal_id = 9;
+}
+
+message SyncOfflineTransactionsRequest {
+  string tenant_id = 1;
+  string client_id = 2;
+  repeated PosOfflineTransaction transactions = 3;
+  optional string session_id = 4;
+}
+
+message SyncOfflineTransactionsResponse {
+  bool success = 1;
+  int32 synced_count = 2;
+  repeated string failed_transaction_ids = 3;
+  string pending_reconciliation = 4;
+}
+
+message StartTerminalSessionRequest {
+  string tenant_id = 1;
+  string device_id = 2;
+}
+
+message StartTerminalSessionResponse {
+  string session_id = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+message UpdateTerminalSessionStatusRequest {
+  string tenant_id = 1;
+  string session_id = 2;
+  string status = 3; // ACTIVE, PAUSED, OFFLINE, RECONCILED
+}
+
+message UpdateTerminalSessionStatusResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message EndTerminalSessionRequest {
+  string tenant_id = 1;
+  string session_id = 2;
+}
+
+message EndTerminalSessionResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+service PosService {
+  rpc SyncOfflineTransactions(SyncOfflineTransactionsRequest) returns (SyncOfflineTransactionsResponse);
+  rpc StartTerminalSession(StartTerminalSessionRequest) returns (StartTerminalSessionResponse);
+  rpc UpdateTerminalSessionStatus(UpdateTerminalSessionStatusRequest) returns (UpdateTerminalSessionStatusResponse);
+  rpc EndTerminalSession(EndTerminalSessionRequest) returns (EndTerminalSessionResponse);
+}
+
+
+message SyncCalendarRequest {
+  string tenant_id = 1;
+}
+
+message SyncCalendarResponse {
+  string status = 1;
+}
+
+message QuoteLineItem {
+  string description = 1;
+  int64 unit_price_cents = 2;
+  int32 quantity = 3;
+  bool is_optional = 4;
+  string currency = 5;
+}
+
+message CreateQuoteRequest {
+  string tenant_id = 1;
+  string customer_id = 2;
+  repeated QuoteLineItem line_items = 3;
+  int64 required_deposit = 4;
+  optional string service_id = 5;
+  optional string proposed_slot_id = 6;
+  string currency = 7;
+}
+
+message FetchQuoteRequest {
+  string quote_id = 1;
+}
+
+message QuoteResponse {
+  string quote_id = 1;
+  string tenant_id = 2;
+  string status = 3;
+  int64 total_amount_cents = 4;
+  int64 required_deposit = 5;
+  repeated QuoteLineItem line_items = 6;
+  optional string service_id = 7;
+  optional string proposed_slot_id = 8;
+  string currency = 9;
+}
+
+message BookingResource {
+    string id = 1;
+    string name = 2;
+    string resource_type = 3;
+    string availability_schedule = 4;
+}
+
+message ServiceResourceRequirement {
+    string resource_type = 1;
+    int32 quantity = 2;
+}
+
+message ServiceDefinition {
+    string id = 1;
+    string title = 2;
+    string description = 3;
+    int64 price_cents = 4;
+    repeated ServiceResourceRequirement resource_requirements = 5;
+  string currency = 6;
+}
+
+message UnifiedBooking {
+    string id = 1;
+    string customer_id = 2;
+    string service_id = 3;
+    string start_time = 4;
+    string end_time = 5;
+    string status = 6;
+    repeated string locked_resource_ids = 7;
+}
+
+message GetResourcesRequest {
+    string tenant_id = 1;
+}
+
+message GetResourcesResponse {
+    repeated BookingResource resources = 1;
+}
+
+message GetServicesRequest {
+    string tenant_id = 1;
+}
+
+message GetServicesResponse {
+    repeated ServiceDefinition services = 1;
+}
+
+message CreateUnifiedBookingRequest {
+    string tenant_id = 1;
+    string service_id = 2;
+    string start_time = 3;
+    string end_time = 4;
+    string customer_id = 5;
+}
+
+message CreateUnifiedBookingResponse {
+    bool success = 1;
+    UnifiedBooking booking = 2;
+    string error = 3;
+}

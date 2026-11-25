@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ohc-standalone"
+version = "0.4.47"
+edition = "2024"
+license = "Apache-2.0"
+description = "Single-tenant open-source Community Edition standalone server binary for OneHumanCorp."
+
+[[bin]]
+name = "ohc-standalone"
+path = "src/main.rs"
+
+[dependencies]
+ohc_core = { path = "../ohc-core" }
+server_lib = { package = "omnisolo", path = "../.." }
+tokio = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

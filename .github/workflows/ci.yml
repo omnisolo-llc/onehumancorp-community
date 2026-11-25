@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Community CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: community-ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rust-quality:
+    name: Rust fmt, Clippy & workspace tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      MALLOC_ARENA_MAX: "2"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev sqlite3
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ohc-community-rust-v1
+          shared-key: community-${{ runner.os }}-${{ runner.arch }}-rust-quality
+          cache-on-failure: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint Rust workspace with Clippy
+        run: cargo clippy --locked --workspace --exclude app --all-targets -- -D warnings
+
+      - name: Run headless Rust workspace tests
+        run: cargo test --locked --workspace --exclude app
+
+  standalone-sqlite:
+    name: Standalone SQLite & deployment verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      MALLOC_ARENA_MAX: "2"
+      OMNISOLO_STANDALONE_MODE: "true"
+      OMNISOLO_SOURCE_MODE: "standalone"
+      OMNISOLO_TELEMETRY_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev sqlite3 python3-yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ohc-community-rust-v1
+          shared-key: community-${{ runner.os }}-${{ runner.arch }}-standalone-sqlite
+          cache-on-failure: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+
+      - name: Verify standalone deployment manifests and scripts
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml; yaml.safe_load(open('deploy/docker-compose.yml'))"
+          for script in deploy/scripts/*.sh; do
+            bash -n "$script"
+          done
+          bash deploy/tests/deploy_artifacts_test.sh
+          bash deploy/tests/test_omnisolo_mode.sh
+          bash deploy/tests/operational_api_contract_test.sh deploy/scripts/omnisolo-agent-wizard.sh
+
+      - name: Verify standalone SQLite runtime and persistence tests
+        run: |
+          set -euo pipefail
+          TMP_SQLITE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_SQLITE_DIR"' EXIT
+          export OMNISOLO_RUNTIME_DIR="$TMP_SQLITE_DIR"
+          export OMNISOLO_SQLITE_KEY="$(openssl rand -hex 32)"
+          export DATABASE_URL="sqlite://${TMP_SQLITE_DIR}/omnisolo-standalone.db?mode=rwc"
+          cargo test --locked -p omnisolo --lib sqlite
+          cargo build --locked -p omnisolo --bin server
+
+  web-and-cli:
+    name: Next.js web & TypeScript CLI gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/ui/next/package-lock.json
+            src/cli/package-lock.json
+
+      - name: Install locked Node dependencies
+        run: |
+          set -euo pipefail
+          npm ci --include=dev --no-audit --no-fund
+          npm --prefix src/ui/next ci --include=dev --no-audit --no-fund
+          npm --prefix src/cli ci --include=dev --no-audit --no-fund
+
+      - name: Lint JavaScript and TypeScript
+        run: npm run lint:node
+
+      - name: Typecheck web and CLI
+        run: |
+          set -euo pipefail
+          npm run typecheck:web
+          npm --prefix src/cli run typecheck
+
+      - name: Run web, desktop UI, and CLI unit tests
+        run: |
+          set -euo pipefail
+          npm run test:web
+          npm run test:desktop-ui
+          npm --prefix src/cli test
+
+      - name: Build production Next.js standalone bundle
+        run: npm run build:web
+
+      - name: Upload built Next.js bundle for desktop check
+        uses: actions/upload-artifact@v6
+        with:
+          name: community-native-web
+          path: target/native-web
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  desktop-check:
+    name: Tauri desktop check & tests
+    needs: [web-and-cli]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: "2"
+      MALLOC_ARENA_MAX: "2"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Tauri native system libraries
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ohc-community-desktop-v1
+          shared-key: community-${{ runner.os }}-${{ runner.arch }}-desktop
+          cache-on-failure: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install root Node dependencies
+        run: npm ci --include=dev --no-audit --no-fund
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: community-native-web
+          path: target/native-web
+
+      - name: Lint and test Tauri desktop crate
+        env:
+          OMNISOLO_PREBUILT_WEB: target/native-web
+        run: |
+          set -euo pipefail
+          npm run desktop:prepare
+          cargo clippy --locked -p app --all-targets -- -D warnings
+          cargo test --locked -p app
+
+  community-ci-required:
+    name: Community CI Required
+    needs: [rust-quality, standalone-sqlite, web-and-cli, desktop-check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all required Community CI jobs passed
+        env:
+          RUST_QUALITY: ${{ needs.rust-quality.result }}
+          STANDALONE_SQLITE: ${{ needs.standalone-sqlite.result }}
+          WEB_AND_CLI: ${{ needs.web-and-cli.result }}
+          DESKTOP_CHECK: ${{ needs.desktop-check.result }}
+        run: |
+          set -euo pipefail
+          for status in "$RUST_QUALITY" "$STANDALONE_SQLITE" "$WEB_AND_CLI" "$DESKTOP_CHECK"; do
+            if [[ "$status" != "success" ]]; then
+              echo "Required Community CI gate did not succeed." >&2
+              exit 1
+            fi
+          done
+          echo "All required Community CI gates passed."

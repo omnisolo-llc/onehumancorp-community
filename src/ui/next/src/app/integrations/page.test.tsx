@@ -1,0 +1,83 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Integrations from "./page";
+
+const push = vi.fn();
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push }),
+  usePathname: () => "/integrations",
+}));
+
+vi.mock('../../components/TooltipRegistry', () => ({
+  TooltipProvider: ({ children }: { children?: import('react').ReactNode }) => children,
+  WithTooltip: ({ children }: { children?: import('react').ReactNode }) => children,
+}));
+
+describe("Integrations", () => {
+  beforeEach(() => {
+    global.fetch = vi.fn();
+    push.mockClear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does not call an unimplemented OAuth contract or mark it connected", async () => {
+    vi.mocked(global.fetch, { partial: true }).mockImplementation((url: string) => {
+      if (url === '/api/v1/integrations') return Promise.resolve(Response.json({ success: true, integrations: [] }));
+      return Promise.resolve(Response.json({}, { status: 503 }));
+    });
+
+    render(<Integrations />);
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/v1/integrations'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Connect' })[0]);
+
+    expect(await screen.findByText('Ayrshare connection is unavailable until secure provider verification is configured.')).toBeDefined();
+    expect(global.fetch).not.toHaveBeenCalledWith('/api/v1/integrations/ayrshare/connect', expect.anything());
+    expect(screen.getByText('Ayrshare').closest('div')).not.toHaveTextContent('Connected');
+  });
+
+  it('requires Twilio credentials and explicit backend connection confirmation', async () => {
+    vi.mocked(global.fetch, { partial: true }).mockImplementation((url: string) => {
+      if (url === '/api/v1/integrations') return Promise.resolve(Response.json({ success: true, integrations: [] }));
+      if (url === '/api/v1/integrations/twilio/connect') return Promise.resolve(Response.json({ success: true, status: 'pending' }));
+      return Promise.resolve(Response.json({}, { status: 503 }));
+    });
+    render(<Integrations />);
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/v1/integrations'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Connect' })[6]);
+
+    const connect = screen.getByRole('button', { name: 'Save & Connect' });
+    expect(connect).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Twilio Account SID'), { target: { value: 'AC123' } });
+    fireEvent.change(screen.getByLabelText('Twilio Auth Token'), { target: { value: 'secret' } });
+    fireEvent.click(connect);
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/v1/integrations/twilio/connect', expect.objectContaining({
+      method: 'POST',
+      body: expect.stringContaining('"bot_token":"AC123"'),
+    })));
+    expect(await screen.findByText('Twilio Conversations connection could not be confirmed.')).toBeDefined();
+    expect(screen.getByText('Twilio Conversations').closest('div')).not.toHaveTextContent('Connected');
+  });
+
+  it('marks Twilio connected only when the backend confirms it is usable', async () => {
+    vi.mocked(global.fetch, { partial: true }).mockImplementation((url: string) => {
+      if (url === '/api/v1/integrations') return Promise.resolve(Response.json({ success: true, integrations: [] }));
+      if (url === '/api/v1/integrations/twilio/connect') return Promise.resolve(Response.json({ success: true, status: 'connected', usable: true }));
+      return Promise.resolve(Response.json({}, { status: 503 }));
+    });
+    render(<Integrations />);
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledWith('/api/v1/integrations'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Connect' })[6]);
+    fireEvent.change(screen.getByLabelText('Twilio Account SID'), { target: { value: 'AC123' } });
+    fireEvent.change(screen.getByLabelText('Twilio Auth Token'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Connect' }));
+
+    expect(await screen.findByText('Twilio Conversations connected.')).toBeDefined();
+    expect(push).toHaveBeenCalledWith('/inbox');
+  });
+});

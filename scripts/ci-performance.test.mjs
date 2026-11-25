@@ -1,0 +1,172 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const script = fileURLToPath(new URL('./ci-performance.py', import.meta.url));
+const job = (id, name, start, end, extra = {}) => ({ id, name, run_id: 42, run_attempt: 2,
+  status: 'completed', conclusion: 'success', started_at: `2026-09-19T10:${start}:00Z`,
+  completed_at: `2026-09-19T10:${end}:00Z`, ...extra });
+const fixture = () => [{ total_count: 4, jobs: [
+  job(1, 'Native backend binaries', '00', '10'), job(2, 'Native Next production build', '00', '03'),
+  job(3, 'Native browser suite', '12', '20'),
+  job(4, 'CI Required', '21', '21', { status: 'in_progress', conclusion: null }),
+] }];
+async function run(pages, budget = null, prefix = '') {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ohc-ci-time-'));
+  try {
+    const input = path.join(dir, 'jobs.json'); await writeFile(input, JSON.stringify(pages));
+    const result = spawnSync('python3', [script, '--jobs', input, '--run-id', '42', '--attempt', '2',
+      ...(budget === null ? [] : ['--budget-minutes', budget]), '--job-prefix', prefix, '--cold', '--output', path.join(dir, 'report')], { encoding: 'utf8', timeout: 15000 });
+    assert.ifError(result.error);
+    let report;
+    try { report = JSON.parse(await readFile(path.join(dir, 'report/performance.json'), 'utf8')); }
+    catch { /* Invalid input must not generate success evidence. */ }
+    return { ...result, report };
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}
+test('CI wall time includes dependent-job waits and is not the sum of parallel runtimes', async () => {
+  const result = await run(fixture()); assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.report.elapsed_seconds, 1260);
+  assert.equal(result.report.cache_mode_requested, 'disabled');
+  assert.equal(result.report.cache_hit_proven, false);
+  assert.equal(result.report.within_budget, true);
+});
+test('the default budget accepts exactly 60 minutes and rejects the next second', async () => {
+  const pages = fixture();
+  pages[0].jobs[3].started_at = '2026-09-19T11:00:00Z';
+  const boundary = await run(pages);
+  assert.equal(boundary.status, 0, boundary.stderr);
+  assert.equal(boundary.report.budget_seconds, 3600);
+  assert.equal(boundary.report.elapsed_seconds, 3600);
+  assert.equal(boundary.report.within_budget, true);
+  pages[0].jobs[3].started_at = '2026-09-19T11:00:01Z';
+  const exceeded = await run(pages);
+  assert.equal(exceeded.status, 1);
+  assert.equal(exceeded.report.elapsed_seconds, 3601);
+  assert.equal(exceeded.report.within_budget, false);
+});
+test('core build timing includes Tauri and dependency waits without replacing the full gate', async () => {
+  const pages = fixture();
+  pages[0].total_count = 5;
+  pages[0].jobs.push(job(5, 'Native Tauri compile', '04', '12'));
+  const result = await run(pages);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.report.core_build.elapsed_seconds, 720);
+  assert.equal(result.report.core_build.within_target, false);
+  assert.equal(result.report.core_build.enforced, false);
+  assert.equal(result.report.core_build.all_builds_succeeded, true);
+  assert.equal(result.report.elapsed_seconds, 1260);
+});
+test('missing or skipped core builds do not become zero-minute success', async () => {
+  const missing = await run(fixture());
+  assert.equal(missing.report.core_build.elapsed_seconds, null);
+  assert.deepEqual(missing.report.core_build.missing_jobs, ['Native Tauri compile']);
+  const pages = fixture();
+  pages[0].total_count = 5;
+  pages[0].jobs.push(job(5, 'Native Tauri compile', '04', '12', { conclusion: 'skipped' }));
+  const skipped = await run(pages);
+  assert.equal(skipped.report.core_build.elapsed_seconds, null);
+  assert.equal(skipped.report.core_build.all_builds_succeeded, false);
+});
+
+test('reused CI timing is scoped without counting concurrently running release jobs', async () => {
+  const pages = fixture();
+  const prefix = 'Release qualification / ';
+  for (const row of pages[0].jobs) row.name = prefix + row.name;
+  pages[0].jobs.push(job(99, 'Build signed desktop packages', '00', '59', { status: 'in_progress', conclusion: null }));
+  pages[0].total_count++;
+  const result = await run(pages, '30', prefix);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.report.elapsed_seconds, 1260);
+  assert.equal(result.report.jobs.length, 3);
+  assert.equal((await run(pages, '30', 'Wrong caller / ')).status, 1);
+  pages[0].total_count++;
+  assert.equal((await run(pages, '30', prefix)).status, 1, 'prefix filtering cannot bypass pagination validation');
+});
+
+test('an over-budget run fails while preserving measured evidence', async () => {
+  const result = await run(fixture(), '20'); assert.equal(result.status, 1);
+  assert.equal(result.report.within_budget, false);
+});
+test('a failed build cannot become successful performance evidence', async () => {
+  const pages = fixture(); pages[0].jobs[0].conclusion = 'failure';
+  const result = await run(pages); assert.equal(result.status, 1);
+  assert.equal(result.report.all_executed_jobs_succeeded, false);
+});
+for (const budget of ['NaN', 'Infinity', '0', '-1']) {
+  test(`CI performance rejects invalid budget ${budget}`, async () => {
+    const result = await run(fixture(), budget);
+    assert.equal(result.status, 1);
+    assert.equal(result.report, undefined);
+  });
+}
+
+for (const [name, mutate] of [
+  ['partial pagination', pages => { pages[0].total_count = 5; }],
+  ['previous attempt', pages => { pages[0].jobs[0].run_attempt = 1; }],
+  ['unknown outcome', pages => { pages[0].jobs[0].status = 'in_progress'; }],
+  ['missing timestamps', pages => { pages[0].jobs[0].started_at = null; }],
+  ['duplicate records', pages => { pages[0].jobs.push(pages[0].jobs[0]); }],
+]) {
+  test(`CI performance rejects ${name}`, async () => {
+    const pages = fixture(); mutate(pages); const result = await run(pages);
+    assert.equal(result.status, 1); assert.equal(result.report, undefined);
+  });
+}
+
+function browserOverlapFixture() {
+  const jobs = [job(1, 'Native backend binaries', '00', '04'), job(2, 'Native Next production build', '00', '03'),
+    job(3, 'PostgreSQL tenant isolation', '00', '16'),
+    ...Array.from({ length: 12 }, (_, index) => job(10 + index, `Native real-stack Playwright ${index + 1}/12`, index % 2 ? '06' : '05', index % 2 ? '18' : '15')),
+    job(99, 'CI Required', '21', '21', { status: 'in_progress', conclusion: null })];
+  return [{ total_count: jobs.length, jobs }];
+}
+test('actual PostgreSQL/browser overlap is measured once across all twelve shards', async () => {
+  const result = await run(browserOverlapFixture());
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.report.browser_postgres, {
+    measurement_complete: true, browser_shards: 12, missing_shards: [],
+    postgres_browser_overlap_seconds: 660, first_browser_after_postgres_seconds: -660,
+    browser_wait_after_artifacts_seconds: 60,
+  });
+});
+test('missing or skipped browser shards never become a complete scheduling measurement', async () => {
+  const missing = browserOverlapFixture(); missing[0].jobs = missing[0].jobs.filter(row => row.id !== 21); missing[0].total_count--;
+  const result = await run(missing);
+  assert.deepEqual(result.report.browser_postgres, {
+    measurement_complete: false, browser_shards: 11, missing_shards: [12],
+    postgres_browser_overlap_seconds: null, first_browser_after_postgres_seconds: null,
+    browser_wait_after_artifacts_seconds: null,
+  });
+  const skipped = browserOverlapFixture(); skipped[0].jobs.find(row => row.id === 21).conclusion = 'skipped';
+  const held = await run(skipped);
+  assert.equal(held.report.browser_postgres.measurement_complete, false);
+  assert.equal(held.report.browser_postgres.postgres_browser_overlap_seconds, null);
+});
+test('sequential browser scheduling records zero overlap rather than implying a speedup', async () => {
+  const input = browserOverlapFixture(); input[0].jobs.find(row => row.id === 3).completed_at = '2026-09-19T10:04:00Z';
+  const result = await run(input);
+  assert.equal(result.report.browser_postgres.postgres_browser_overlap_seconds, 0);
+  assert.equal(result.report.browser_postgres.first_browser_after_postgres_seconds, 60);
+});
+test('duplicate scheduling identities cannot produce timing evidence', async () => {
+  const input = browserOverlapFixture(); input[0].jobs.push(job(100, 'PostgreSQL tenant isolation', '00', '16')); input[0].total_count++;
+  assert.equal((await run(input)).status, 1);
+});
+
+test('three grouped runners retain complete timing and reject inconsistent denominators', async () => {
+  const pages=browserOverlapFixture();
+  pages[0].jobs=pages[0].jobs.filter(row=>!row.name.startsWith('Native real-stack Playwright ') || row.id<13);
+  for(const row of pages[0].jobs) row.name=row.name.replace(/\/12$/, '/3');
+  pages[0].total_count=pages[0].jobs.length;
+  const result=await run(pages);
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(result.report.browser_postgres.measurement_complete,true);
+  assert.equal(result.report.browser_postgres.browser_shards,3);
+  pages[0].jobs.find(row=>row.id===12).name='Native real-stack Playwright 3/4';
+  assert.equal((await run(pages)).status,1);
+});

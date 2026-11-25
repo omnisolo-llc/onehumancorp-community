@@ -1,0 +1,1956 @@
+use axum::{Json, extract::Query};
+
+use serde::{Deserialize, Serialize};
+
+fn docs_tenant(claims: &::server_common::Claims) -> Result<String, axum::http::StatusCode> {
+    ::server_common::auth_utils::signed_tenant_id(claims)
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)
+}
+
+fn optional_docs_tenant(claims: Option<&::server_common::Claims>) -> String {
+    claims
+        .and_then(::server_common::auth_utils::signed_tenant_id)
+        .unwrap_or_else(|| "default".to_string())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct HelpArticle {
+    pub category: String,
+    pub title: String,
+    pub desc: String,
+    pub link: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct VideoTutorial {
+    pub id: i32,
+    pub title: String,
+    pub duration: String,
+    pub video_url: String,
+}
+
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub mobile_optimized: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct DocsQuery {
+    pub mobile_optimized: Option<bool>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WalkthroughStep {
+    #[serde(rename = "targetId")]
+    pub target_id: String,
+    pub title: String,
+    pub content: String,
+}
+
+pub async fn get_walkthrough(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+    axum::extract::Path(page): axum::extract::Path<String>,
+) -> Result<Json<Vec<WalkthroughStep>>, axum::http::StatusCode> {
+    let tenant_id = docs_tenant(&claims)?;
+
+    let steps = match &db.store {
+        crate::db::DbStore::Postgres => {
+            let mut tx = match db.pool.begin().await {
+                Ok(tx) => tx,
+                Err(_) => return Ok(Json(vec![])),
+            };
+            if ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .is_err()
+            {
+                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            let result = sqlx::query("SELECT selector, title, text FROM walkthrough_steps WHERE tenant_id = $1 AND page = $2 ORDER BY step_order ASC")
+                .bind(tenant_id.to_string())
+                .bind(page.clone())
+                .fetch_all(&mut *tx)
+                .await;
+            let _ = tx.commit().await;
+            match result {
+                Ok(rows) => {
+                    rows.into_iter().map(|row| {
+                        use sqlx::Row;
+                        WalkthroughStep {
+                            target_id: row.get("selector"),
+                            title: row.get("title"),
+                            content: row.get("text"),
+                        }
+                    }).collect()
+                }
+                Err(_) => vec![]
+            }
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            match sqlx::query("SELECT selector, title, text FROM walkthrough_steps WHERE tenant_id = ? AND page = ? ORDER BY step_order ASC")
+                .bind(tenant_id.to_string())
+                .bind(page.clone())
+                .fetch_all(pool)
+                .await
+            {
+                Ok(rows) => {
+                    rows.into_iter().map(|row| {
+                        use sqlx::Row;
+                        WalkthroughStep {
+                            target_id: row.get("selector"),
+                            title: row.get("title"),
+                            content: row.get("text"),
+                        }
+                    }).collect()
+                }
+                Err(_) => vec![]
+            }
+        }
+    };
+
+    if steps.is_empty() {
+        let fb = match page.as_str() {
+            "store-setup" => vec![
+                WalkthroughStep {
+                    target_id: "dashboard-title".to_string(),
+                    title: "Set up your store".to_string(),
+                    content: "Learn how to easily set up your store and accept your first payment."
+                        .to_string(),
+                },
+                WalkthroughStep {
+                    target_id: "bio-input-tooltip".to_string(),
+                    title: "Describe your business".to_string(),
+                    content:
+                        "Tell us what you sell so we can create the perfect storefront for you."
+                            .to_string(),
+                },
+                WalkthroughStep {
+                    target_id: "generate-btn-tooltip".to_string(),
+                    title: "Generate Store".to_string(),
+                    content: "Click here and watch our AI build your store from scratch."
+                        .to_string(),
+                },
+            ],
+            "dashboard" => vec![
+                WalkthroughStep {
+                    target_id: "dashboard-title".to_string(),
+                    title: "Business Analytics".to_string(),
+                    content: "Welcome to your dashboard! This is your control center.".to_string(),
+                },
+                WalkthroughStep {
+                    target_id: "operations-map".to_string(),
+                    title: "Operations Map".to_string(),
+                    content: "Here you can see the time and effort your agents have saved you."
+                        .to_string(),
+                },
+            ],
+            _ => vec![],
+        };
+        Ok(Json(fb))
+    } else {
+        Ok(Json(steps))
+    }
+}
+
+pub async fn get_tooltips(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+) -> Result<Json<std::collections::HashMap<String, String>>, axum::http::StatusCode> {
+    let tenant_id = docs_tenant(&claims)?;
+    let mut tooltips = std::collections::HashMap::from([
+        (
+            "dashboard-walkthrough-btn".to_string(),
+            "Take a tour of the dashboard".to_string(),
+        ),
+        (
+            "api-docs-tooltip".to_string(),
+            "Direct API access is only for custom integrations.".to_string(),
+        ),
+        (
+            "kairos-nav-link-tooltip".to_string(),
+            "Click here to see what your AI helpers are working on and how they plan.".to_string(),
+        ),
+        (
+            "voice-assistant-tooltip".to_string(),
+            "Hold to speak a command to your AI Assistant.".to_string(),
+        ),
+        (
+            "rate-limit-close-tooltip".to_string(),
+            "Dismiss this warning.".to_string(),
+        ),
+        (
+            "dashboard-tooltip".to_string(),
+            "View your daily sales and overall business health.".to_string(),
+        ),
+        (
+            "generate-link-btn".to_string(),
+            "Click here to share access with a team member.".to_string(),
+        ),
+        (
+            "ask-ai-tooltip".to_string(),
+            "Open AI Help Chat to get answers instantly.".to_string(),
+        ),
+        (
+            "settings-delivery-tooltip".to_string(),
+            "Turn this on to offer local delivery to your customers.".to_string(),
+        ),
+        (
+            "help-btn-tooltip".to_string(),
+            "Need help? Click here to access our Help Center, Ask AI, Video Tutorials, and Release Notes.".to_string(),
+        ),
+        (
+            "help-search-tooltip".to_string(),
+            "Search for help articles and videos...".to_string(),
+        ),
+        (
+            "inventory-tooltip".to_string(),
+            "Manage your inventory, prices, and stock levels.".to_string(),
+        ),
+        (
+            "orders-tooltip".to_string(),
+            "See what customers bought and track order fulfillment.".to_string(),
+        ),
+        (
+            "total-sales-tooltip".to_string(),
+            "Total revenue generated from your orders.".to_string(),
+        ),
+        (
+            "recent-orders-tooltip".to_string(),
+            "View the latest orders placed by your customers.".to_string(),
+        ),
+        (
+            "inbox-activity-tooltip".to_string(),
+            "Keep track of recent customer messages.".to_string(),
+        ),
+        (
+            "help-advanced-toggle-tooltip".to_string(),
+            "Show advanced developer options.".to_string(),
+        ),
+        (
+            "help-btn-tooltip-appshell".to_string(),
+            "Need help? Click here to access our Help Center, Ask AI, Video Tutorials, and Release Notes.".to_string(),
+        ),
+        (
+            "checkout-pay-tooltip".to_string(),
+            "Click to process your payment.".to_string(),
+        ),
+    ]);
+    match &db.store {
+        crate::db::DbStore::Postgres => {
+            let mut tx = db.pool.begin().await.map_err(|e| {
+                tracing::error!("Failed to start tooltip transaction: {}", e);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to set tooltip tenant context: {}", e); // pii-safe
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            let result = sqlx::query("SELECT id, text FROM tooltips WHERE tenant_id = $1")
+                .bind(tenant_id.to_string())
+                .fetch_all(&mut *tx)
+                .await;
+            let _ = tx.commit().await;
+            match result {
+                Ok(rows) => {
+                    for row in rows {
+                        use sqlx::Row;
+                        let id: String = row.get("id");
+                        let text: String = row.get("text");
+                        tooltips.insert(id, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fetch tooltips: {}", e);
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            match sqlx::query("SELECT id, text FROM tooltips WHERE tenant_id = ?")
+                .bind(tenant_id.to_string())
+                .fetch_all(pool)
+                .await
+            {
+                Ok(rows) => {
+                    for row in rows {
+                        use sqlx::Row;
+                        let id: String = row.get("id");
+                        let text: String = row.get("text");
+                        tooltips.insert(id, text);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to fetch tooltips: {}", e);
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+    }
+
+    Ok(Json(tooltips))
+}
+
+#[derive(Deserialize)]
+pub struct TooltipPayload {
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Serialize)]
+pub struct SuccessResponse {
+    pub success: bool,
+}
+
+pub async fn update_tooltip(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+    axum::extract::Json(payload): axum::extract::Json<TooltipPayload>,
+) -> Result<Json<SuccessResponse>, axum::http::StatusCode> {
+    let tenant_id = docs_tenant(&claims)?;
+    match &db.store {
+        crate::db::DbStore::Postgres => {
+            let mut tx = db.pool.begin().await.map_err(|e| {
+                tracing::error!("Failed to start tooltip transaction: {}", e);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to set tooltip tenant context: {}", e); // pii-safe
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            let result = sqlx::query("INSERT INTO tooltips (id, tenant_id, text) VALUES ($1, $2, $3) ON CONFLICT (tenant_id, id) DO UPDATE SET text = EXCLUDED.text")
+                .bind(payload.id)
+                .bind(tenant_id)
+                .bind(payload.text)
+                .execute(&mut *tx)
+                .await;
+            match result {
+                Ok(_) => {
+                    tx.commit().await.map_err(|e| {
+                        tracing::error!("Failed to commit tooltip update: {}", e);
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                    Ok(Json(SuccessResponse { success: true }))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update tooltip: {}", e);
+                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        },
+        crate::db::DbStore::Sqlite(pool) => {
+            match sqlx::query("INSERT INTO tooltips (id, tenant_id, text) VALUES (?, ?, ?) ON CONFLICT (tenant_id, id) DO UPDATE SET text = excluded.text").bind(payload.id).bind(tenant_id).bind(payload.text)
+                .execute(pool)
+                .await
+            {
+                Ok(_) => Ok(Json(SuccessResponse { success: true })),
+                Err(e) => {
+                    tracing::error!("Failed to update tooltip: {}", e);
+                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+    }
+}
+
+pub async fn delete_tooltip(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+) -> Result<Json<SuccessResponse>, axum::http::StatusCode> {
+    let tenant_id = docs_tenant(&claims)?;
+    match &db.store {
+        crate::db::DbStore::Postgres => {
+            let mut tx = db.pool.begin().await.map_err(|e| {
+                tracing::error!("Failed to start tooltip transaction: {}", e);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to set tooltip tenant context: {}", e); // pii-safe
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            let result = sqlx::query("DELETE FROM tooltips WHERE id = $1 AND tenant_id = $2")
+                .bind(id.clone())
+                .bind(tenant_id)
+                .execute(&mut *tx)
+                .await;
+            match result {
+                Ok(_) => {
+                    tx.commit().await.map_err(|e| {
+                        tracing::error!("Failed to commit tooltip deletion: {}", e);
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                    Ok(Json(SuccessResponse { success: true }))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to delete tooltip: {}", e);
+                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            match sqlx::query("DELETE FROM tooltips WHERE id = ? AND tenant_id = ?")
+                .bind(id.clone())
+                .bind(tenant_id)
+                .execute(pool)
+                .await
+            {
+                Ok(_) => Ok(Json(SuccessResponse { success: true })),
+                Err(e) => {
+                    tracing::error!("Failed to delete tooltip: {}", e);
+                    Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+    }
+}
+
+pub fn get_articles() -> Vec<HelpArticle> {
+    vec![
+        HelpArticle {
+            category: "Getting Started".to_string(),
+            title: "Getting Started with Your Store".to_string(),
+            desc: "Welcome to OmniSolo! Let's get your business online in under 10 minutes."
+                .to_string(),
+            link: "/help/getting-started-1".to_string(),
+        },
+        HelpArticle {
+            category: "My Store".to_string(),
+            title: "Adding Products".to_string(),
+            desc: "Add products, track what's in stock, and change how your store looks."
+                .to_string(),
+            link: "/help/add-products".to_string(),
+        },
+        HelpArticle {
+            category: "Payments".to_string(),
+            title: "Accepting Payments".to_string(),
+            desc: "Learn how to accept credit cards and manage your payouts.".to_string(),
+            link: "/help/accept-payments".to_string(),
+        },
+        HelpArticle {
+            category: "Proposals & Invoicing".to_string(),
+            title: "How to Send Proposals and Collect Payments Securely".to_string(),
+            desc: "Generate accurate quotes from inquiries, secure owner approvals, and send verifiable checkout links.".to_string(),
+            link: "/help/proposals-payments".to_string(),
+        },
+        HelpArticle {
+            category: "AI Agents".to_string(),
+            title: "Activate AI Support".to_string(),
+            desc: "Let our AI handle customer inquiries and triage your inbox.".to_string(),
+            link: "/help/ai-support".to_string(),
+        },
+        HelpArticle {
+            category: "Marketing".to_string(),
+            title: "Grow Your Audience".to_string(),
+            desc: "Use our built-in tools to run promotions and track performance.".to_string(),
+            link: "/help/marketing-tools".to_string(),
+        },
+        HelpArticle {
+            category: "Getting Started".to_string(),
+            title: "Setup, Connected Accounts, and Standing Authority".to_string(),
+            desc: "Learn how to configure connected accounts, set up standing authority, and review evidence.".to_string(),
+            link: "/help/setup-accounts-authority".to_string(),
+        },
+        HelpArticle {
+            category: "Account & Billing".to_string(),
+            title: "Manage Billing".to_string(),
+            desc: "Update your subscription and payment methods.".to_string(),
+            link: "/help/billing-settings".to_string(),
+        },
+        HelpArticle {
+            category: "Account & Billing".to_string(),
+            title: "Connected Accounts and Standing Authority".to_string(),
+            desc:
+                "Set up your connected accounts and establish standing authority for your AI team."
+                    .to_string(),
+            link: "/help/connected-accounts".to_string(),
+        },
+        HelpArticle {
+            category: "Advanced".to_string(),
+            title: "API Documentation (for Advanced Users)".to_string(),
+            desc: "Interactive API reference for connecting external services to your workspace."
+                .to_string(),
+            link: "/api-docs".to_string(),
+        },
+        HelpArticle {
+            category: "Sales & Checkout".to_string(),
+            title: "How to Send Proposals and Collect Payments Securely".to_string(),
+            desc: "Learn how to generate accurate proposals, securely collect payments, and manage invoice drafts.".to_string(),
+            link: "/help/proposals-payments".to_string(),
+        },
+    ]
+}
+
+pub fn get_videos() -> Vec<VideoTutorial> {
+    vec![
+        VideoTutorial {
+            id: 1,
+            title: "How to set up your first store easily".to_string(),
+            duration: "1:20".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 2,
+            title: "Connecting a bank account to accept payments".to_string(),
+            duration: "0:45".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 3,
+            title: "Activating your AI Support Agent".to_string(),
+            duration: "1:25".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 4,
+            title: "Adding a new product to your inventory".to_string(),
+            duration: "0:50".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 5,
+            title: "Managing staff and user permissions".to_string(),
+            duration: "1:10".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 6,
+            title: "Creating a marketing campaign".to_string(),
+            duration: "1:20".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 7,
+            title: "Using the Analytics Dashboard".to_string(),
+            duration: "1:20".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 8,
+            title: "How to handle refunds and returns".to_string(),
+            duration: "1:05".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 9,
+            title: "Customizing your storefront design".to_string(),
+            duration: "1:20".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+        VideoTutorial {
+            id: 10,
+            title: "Setting up automated email receipts".to_string(),
+            duration: "0:55".to_string(),
+            video_url: "https://www.w3schools.com/html/mov_bbb.mp4".to_string(),
+        },
+    ]
+}
+
+#[allow(unused_macros)]
+macro_rules! with_cache_fallback {
+    ($cache:expr, $cache_key:expr, $fetch_fn:expr) => {{
+        let cache_key_str = $cache_key.to_string();
+        if let Some((cached, is_stale)) = $cache.get_with_swr(&cache_key_str).await {
+            if !is_stale {
+                // Ignore the early return since we map manually afterwards
+                // The macro shouldn't return Json directly since we change the types
+            } else {
+                let cache_key_bg = cache_key_str.clone();
+                tokio::spawn(async move {
+                    let items = $fetch_fn();
+                    let _ = $cache
+                        .set(&cache_key_bg, items, std::time::Duration::from_secs(3600))
+                        .await;
+                });
+            }
+            (cached, true)
+        } else {
+            let items = $fetch_fn();
+            let _ = $cache
+                .set(
+                    &cache_key_str,
+                    items.clone(),
+                    std::time::Duration::from_secs(3600),
+                )
+                .await;
+            (items, false)
+        }
+    }};
+}
+
+static DOCS_ARTICLES_CACHE: std::sync::OnceLock<
+    ::server_utils::cache::HybridCache<Vec<HelpArticle>>,
+> = std::sync::OnceLock::new();
+static DOCS_VIDEOS_CACHE: std::sync::OnceLock<
+    ::server_utils::cache::HybridCache<Vec<VideoTutorial>>,
+> = std::sync::OnceLock::new();
+
+pub async fn list_articles(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    claims: Option<axum::extract::Extension<::server_common::Claims>>,
+    Query(query): Query<DocsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, axum::http::StatusCode> {
+    let tenant_id = optional_docs_tenant(claims.as_ref().map(|c| &c.0));
+
+    let cache = DOCS_ARTICLES_CACHE
+        .get_or_init(|| ::server_utils::cache::HybridCache::new(crate::distributed_cache()));
+    let cache_key = format!("docs:articles:all:{}", tenant_id);
+    let mut articles: Vec<HelpArticle> = vec![];
+    if let Some((cached, _is_stale)) = cache.get_with_swr(&cache_key).await {
+        articles = cached;
+    } else {
+        let db_clone = db.clone();
+        let t_id = tenant_id.to_string();
+        articles = match &db_clone.store {
+            crate::db::DbStore::Postgres => {
+                let mut tx = match db_clone.pool.begin().await {
+                    Ok(tx) => tx,
+                    Err(_) => return Ok(Json(vec![])),
+                };
+                if ::server_common::auth_utils::set_org_context(&mut *tx, &t_id)
+                    .await
+                    .is_err()
+                {
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                let result = sqlx::query("SELECT category, title, desc_text, link FROM help_articles WHERE tenant_id = $1")
+                    .bind(t_id.clone())
+                    .fetch_all(&mut *tx)
+                    .await;
+                let _ = tx.commit().await;
+                match result {
+                    Ok(rows) => {
+                        rows.into_iter().map(|row| {
+                            use sqlx::Row;
+                            HelpArticle {
+                                category: row.get("category"),
+                                title: row.get("title"),
+                                desc: row.get("desc_text"),
+                                link: row.get("link"),
+                            }
+                        }).collect()
+                    }
+                    Err(_) => vec![]
+                }
+            }
+            crate::db::DbStore::Sqlite(pool) => {
+                match sqlx::query("SELECT category, title, desc_text as text, link FROM help_articles WHERE tenant_id = ?")
+                    .bind(t_id.clone())
+                    .fetch_all(pool)
+                    .await
+                {
+                    Ok(rows) => {
+                        rows.into_iter().map(|row| {
+                            use sqlx::Row;
+                            HelpArticle {
+                                category: row.get("category"),
+                                title: row.get("title"),
+                                desc: row.get("text"),
+                                link: row.get("link"),
+                            }
+                        }).collect()
+                    }
+                    Err(_) => vec![]
+                }
+            }
+        };
+        if articles.is_empty() {
+            articles = get_articles();
+        }
+        let _ = cache
+            .set(
+                &cache_key,
+                articles.clone(),
+                std::time::Duration::from_secs(3600),
+            )
+            .await;
+    }
+
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+    let json_articles = articles
+        .into_iter()
+        .map(|a| {
+            if mobile_optimized {
+                serde_json::json!({
+                    "category": a.category,
+                    "title": a.title,
+                    "link": a.link
+                })
+            } else {
+                serde_json::json!({
+                    "category": a.category,
+                    "title": a.title,
+                    "desc": a.desc,
+                    "link": a.link
+                })
+            }
+        })
+        .collect();
+    Ok(Json(json_articles))
+}
+
+pub async fn search_articles(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    claims: Option<axum::extract::Extension<::server_common::Claims>>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, axum::http::StatusCode> {
+    let tenant_id = optional_docs_tenant(claims.as_ref().map(|c| &c.0));
+
+    let q = query.q.to_lowercase();
+    let cache_key = format!("docs:articles:search:{}:{}", tenant_id, q);
+    let cache = DOCS_ARTICLES_CACHE
+        .get_or_init(|| ::server_utils::cache::HybridCache::new(crate::distributed_cache()));
+
+    let mut articles: Vec<HelpArticle> = vec![];
+    if let Some((cached, _is_stale)) = cache.get_with_swr(&cache_key).await {
+        articles = cached;
+    } else {
+        let db_clone = db.clone();
+        let t_id = tenant_id.to_string();
+        let query_str = format!("%{}%", q);
+        articles = match &db_clone.store {
+            crate::db::DbStore::Postgres => {
+                let mut tx = match db_clone.pool.begin().await {
+                    Ok(tx) => tx,
+                    Err(_) => return Ok(Json(vec![])),
+                };
+                if ::server_common::auth_utils::set_org_context(&mut *tx, &t_id)
+                    .await
+                    .is_err()
+                {
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                let result = sqlx::query("SELECT category, title, desc_text, link FROM help_articles WHERE tenant_id = $1 AND (category ILIKE $2 OR title ILIKE $2 OR desc_text ILIKE $2)")
+                    .bind(t_id.clone())
+                    .bind(query_str.clone())
+                    .fetch_all(&mut *tx)
+                    .await;
+                let _ = tx.commit().await;
+                match result {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|row| {
+                            use sqlx::Row;
+                            HelpArticle {
+                                category: row.get("category"),
+                                title: row.get("title"),
+                                desc: row.get("desc_text"),
+                                link: row.get("link"),
+                            }
+                        })
+                        .collect(),
+                    Err(_) => vec![],
+                }
+            }
+            crate::db::DbStore::Sqlite(pool) => {
+                match sqlx::query("SELECT category, title, desc_text as text, link FROM help_articles WHERE tenant_id = ? AND (category LIKE ? OR title LIKE ? OR desc_text LIKE ?)")
+                    .bind(t_id.clone())
+                    .bind(query_str.clone())
+                    .bind(query_str.clone())
+                    .bind(query_str.clone())
+                    .fetch_all(pool)
+                    .await
+                {
+                    Ok(rows) => {
+                        rows.into_iter().map(|row| {
+                            use sqlx::Row;
+                            HelpArticle {
+                                category: row.get("category"),
+                                title: row.get("title"),
+                                desc: row.get("text"), // Sqlite might alias desc_text
+                                link: row.get("link"),
+                            }
+                        }).collect()
+                    }
+                    Err(_) => vec![]
+                }
+            }
+        };
+        if articles.is_empty() {
+            articles = get_articles()
+                .into_iter()
+                .filter(|a| {
+                    a.category.to_lowercase().contains(&q)
+                        || a.title.to_lowercase().contains(&q)
+                        || a.desc.to_lowercase().contains(&q)
+                })
+                .collect();
+        }
+        let _ = cache
+            .set(
+                &cache_key,
+                articles.clone(),
+                std::time::Duration::from_secs(3600),
+            )
+            .await;
+    }
+
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    let json_articles = articles
+        .into_iter()
+        .map(|a| {
+            if mobile_optimized {
+                serde_json::json!({
+                    "category": a.category,
+                    "title": a.title,
+                    "link": a.link
+                })
+            } else {
+                serde_json::json!({
+                    "category": a.category,
+                    "title": a.title,
+                    "desc": a.desc,
+                    "link": a.link
+                })
+            }
+        })
+        .collect();
+    Ok(Json(json_articles))
+}
+
+pub async fn list_videos(
+    axum::extract::Extension(db): axum::extract::Extension<std::sync::Arc<crate::db::DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+    Query(query): Query<DocsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, axum::http::StatusCode> {
+    let tenant_id = docs_tenant(&claims)?;
+
+    let cache = DOCS_VIDEOS_CACHE
+        .get_or_init(|| ::server_utils::cache::HybridCache::new(crate::distributed_cache()));
+    let cache_key = format!("docs:videos:all:{}", tenant_id);
+    let mut videos: Vec<VideoTutorial> = vec![];
+    if let Some((cached, _is_stale)) = cache.get_with_swr(&cache_key).await {
+        videos = cached;
+    } else {
+        let db_clone = db.clone();
+        let t_id = tenant_id.to_string();
+        videos = match &db_clone.store {
+            crate::db::DbStore::Postgres => {
+                let mut tx = match db_clone.pool.begin().await {
+                    Ok(tx) => tx,
+                    Err(_) => return Ok(Json(vec![])),
+                };
+                if ::server_common::auth_utils::set_org_context(&mut *tx, &t_id)
+                    .await
+                    .is_err()
+                {
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                let result = sqlx::query("SELECT id, title, duration, video_url FROM video_tutorials WHERE tenant_id = $1 ORDER BY id ASC")
+                    .bind(t_id.clone())
+                    .fetch_all(&mut *tx)
+                    .await;
+                let _ = tx.commit().await;
+                match result {
+                    Ok(rows) => {
+                        rows.into_iter().map(|row| {
+                            use sqlx::Row;
+                            let id_val: i32 = row.get("id");
+                            VideoTutorial {
+                                id: id_val,
+                                title: row.get("title"),
+                                duration: row.get("duration"),
+                                video_url: row.get("video_url"),
+                            }
+                        }).collect()
+                    }
+                    Err(_) => vec![]
+                }
+            }
+            crate::db::DbStore::Sqlite(pool) => {
+                match sqlx::query("SELECT id, title, duration, video_url FROM video_tutorials WHERE tenant_id = ? ORDER BY id ASC")
+                    .bind(t_id.clone())
+                    .fetch_all(pool)
+                    .await
+                {
+                    Ok(rows) => {
+                        rows.into_iter().map(|row| {
+                            use sqlx::Row;
+                            let id_val: i32 = row.get("id");
+                            VideoTutorial {
+                                id: id_val,
+                                title: row.get("title"),
+                                duration: row.get("duration"),
+                                video_url: row.get("video_url"),
+                            }
+                        }).collect()
+                    }
+                    Err(_) => vec![]
+                }
+            }
+        };
+        if videos.is_empty() {
+            videos = get_videos();
+        }
+        let _ = cache
+            .set(
+                &cache_key,
+                videos.clone(),
+                std::time::Duration::from_secs(3600),
+            )
+            .await;
+    }
+
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    if mobile_optimized {
+        let json_videos = videos
+            .into_iter()
+            .map(|v| {
+                serde_json::json!({
+                    "id": v.id,
+                    "title": v.title,
+                    "duration": v.duration,
+                    "video_url": v.video_url
+                })
+            })
+            .collect();
+        return Ok(Json(json_videos));
+    }
+    let json_videos = videos
+        .into_iter()
+        .map(|v| {
+            serde_json::json!({
+                "id": v.id,
+                "title": v.title,
+                "duration": v.duration,
+                "video_url": v.video_url
+            })
+        })
+        .collect();
+    Ok(Json(json_videos))
+}
+
+#[derive(Serialize, Clone)]
+pub struct HelpArticleDetail {
+    #[serde(rename = "title")]
+    pub title: String,
+    #[serde(rename = "contentHtml")]
+    pub content_html: String,
+}
+
+pub fn get_article(id: &str) -> Option<HelpArticleDetail> {
+    match id {
+        "getting-started-1" => Some(HelpArticleDetail {
+            title: "Getting Started with Your Store".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Welcome to OmniSolo! Setting up your store is quick and easy. Our app helps you get everything ready to sell online.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Step 1: Tell us about your business</h2>
+      <p class="text-gray-700 mb-4">
+        Start by telling us what you sell and who your customers are. Keep it simple! Just describe what makes your shop special.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Step 2: Let AI build your store</h2>
+      <p class="text-gray-700 mb-4">
+        Once you tell us about your business, click the "Generate" button. Our AI will build your store for you. It will pick a design and write some text to get you started.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Step 3: Launch to the world</h2>
+      <p class="text-gray-700 mb-4">
+        When you are happy with how your store looks, click the "Launch" button. This makes your store live on the internet so customers can visit and buy from you!
+      </p>
+      <div class="mt-8 bg-blue-50 p-4 rounded-lg border border-blue-100">
+        <p class="text-blue-800 font-medium">Need more help? Click the chat button to ask our AI assistant any questions you have.</p>
+      </div>
+            "#.to_string()
+        }),
+        "add-products" => Some(HelpArticleDetail {
+            title: "Managing My Store".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Your store is where you show off what you sell. You can easily add new items, keep track of what you have in stock, and change how your store looks.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Adding Products</h2>
+      <p class="text-gray-700 mb-4">
+        To add a new item, go to the products page and click "Add Product". You can upload a picture, type in a name and description, and set the price. Our AI can even help you write a catchy description!
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Tracking Your Stock</h2>
+      <p class="text-gray-700 mb-4">
+        When you add a product, you can tell the app how many you have to sell. When someone buys it, the number goes down on its own. This helps you know when you need to make or buy more.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Changing How Your Store Looks</h2>
+      <p class="text-gray-700 mb-4">
+        You can pick different colors, fonts, and layouts to make your store match your brand. Just go to the Storefront Builder to try out different styles.
+      </p>
+            "#.to_string()
+        }),
+        "marketing-tools" => Some(HelpArticleDetail {
+            title: "Finding Customers".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        To grow your business, you need people to know about it. We have tools to help you find and talk to customers.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Sending Emails</h2>
+      <p class="text-gray-700 mb-4">
+        You can send emails to people who have bought from you before or signed up on your store. You can use this to tell them about new products or special sales. Our AI can even help you write the emails!
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Running Promos and Sales</h2>
+      <p class="text-gray-700 mb-4">
+        Everyone loves a good deal. You can easily set up a weekend sale or a holiday promotion. You can choose to give a percentage off or a set amount of money off.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Sharing Your Store</h2>
+      <p class="text-gray-700 mb-4">
+        Don't forget to share your store link on social media or with your friends and family. You can find your store's link on your Dashboard.
+      </p>
+            "#.to_string()
+        }),
+        "billing-settings" => Some(HelpArticleDetail {
+            title: "Account & Billing".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Manage your monthly plan, view your past bills, and invite people to help run your business.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Managing Your Plan</h2>
+      <p class="text-gray-700 mb-4">
+        You can check what plan you are on by going to the Billing page. If your business is growing and you need more features, you can upgrade your plan at any time.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Viewing Your Bills</h2>
+      <p class="text-gray-700 mb-4">
+        You can see a history of all the payments you have made to OmniSolo. This makes it easy to keep track of your expenses for your own records.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Inviting Team Members</h2>
+      <p class="text-gray-700 mb-4">
+        If you have business partners or staff who need to access your store settings, you can invite them to your team. Just enter their email address and they will get an invite to join.
+      </p>
+            "#.to_string()
+        }),
+        "accept-payments" => Some(HelpArticleDetail {
+            title: "Getting Paid".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Getting paid is the most exciting part! We make it secure and easy for your customers to pay you.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Connecting Your Bank Account</h2>
+      <p class="text-gray-700 mb-4">
+        To start taking money, you need to connect a bank account. We use Stripe, a safe and trusted system. Just click the "Connect Stripe" button in your setup to securely link your bank.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Viewing Your Deposits</h2>
+      <p class="text-gray-700 mb-4">
+        When a customer buys something, the money goes into your connected bank account. You can check the Dashboard to see your recent sales and see when the money will arrive in your bank.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Taxes and Fees</h2>
+      <p class="text-gray-700 mb-4">
+        We help handle simple taxes for you at checkout. A small fee is taken out of each sale to cover the cost of securely moving the money from the customer's card to your bank.
+      </p>
+            "#.to_string()
+        }),
+
+        "proposals-payments" => Some(HelpArticleDetail {
+            title: "How to Send Proposals and Collect Payments Securely".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Sending a proposal and getting paid should be easy and safe. OmniSolo makes sure your quotes are accurate and your payment links work.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Accurate Proposals</h2>
+      <p class="text-gray-700 mb-4">
+        OmniSolo builds quotes based on exactly what your customer asks for and the rules you set. We check the math for you.
+      </p>
+      <ul class="list-disc pl-6 mb-4 text-gray-700 space-y-2">
+        <li>If any prices are missing, the app marks them as <code>NEEDS_PRICING</code> so you can fill them in.</li>
+        <li>The app will not guess prices for you.</li>
+        <li>Optional items are left out of the total until the customer selects them.</li>
+      </ul>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Secure Payment Links</h2>
+      <p class="text-gray-700 mb-4">
+        When you make an invoice, OmniSolo connects directly to your payment provider (like Stripe) to create a real, secure checkout link. If there is a problem connecting to your provider, the app will let you know so you never send a broken link.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Drafts vs. Sent Reminders</h2>
+      <p class="text-gray-700 mb-4">
+        OmniSolo saves your drafts so you can review them. Once an invoice is paid or canceled, old drafts are removed automatically. This way, you won't ask a customer to pay twice by mistake.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">You Are in Control</h2>
+      <p class="text-gray-700 mb-4">
+        Your AI team only takes actions you approve. You set the rules and limits, and you can stop or change them at any time.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">How to Send a Proposal</h2>
+      <ol class="list-decimal pl-6 mb-4 text-gray-700 space-y-2">
+        <li>Open a Lead or Inquiry in the OmniSolo app.</li>
+        <li>Click <strong>Generate Proposal</strong>. Review the items. If any say <code>NEEDS_PRICING</code>, add the correct prices.</li>
+        <li>Approve the proposal to lock in the final price.</li>
+        <li>Click <strong>Create Invoice</strong>. OmniSolo will securely connect to your payment provider to make a checkout link.</li>
+        <li>The email or SMS draft will go to your outbox for one last check before you send it.</li>
+      </ol>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Cost</h2>
+      <p class="text-gray-700 mb-4">
+        These features are included in your regular subscription. We do not add any hidden markup fees to your customer's invoice. Standard fees from your payment provider still apply.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">What If Something Goes Wrong?</h2>
+      <p class="text-gray-700 mb-4">
+        If your payment provider disconnects and cannot make a link, the invoice will say "Draft/Pending Provider". Just try again later. The app will safely try again without charging anyone twice.
+      </p>
+            "#.to_string()
+        }),
+        "setup-accounts-authority" => Some(HelpArticleDetail {
+            title: "Setup, Connected Accounts, and Standing Authority".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Welcome to OmniSolo! Getting your business up and running involves setting up your connected accounts and establishing the standing authority of your AI team.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Setup</h2>
+      <p class="text-gray-700 mb-4">
+        To set up your business, you need to configure your connected accounts and establish your standing authority. This ensures that the AI team can operate safely and securely on your behalf.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Connected Accounts</h2>
+      <ul class="list-disc pl-5 mb-4 text-gray-700">
+        <li><strong>Link Accounts</strong>: Connect your Google Workspace and Stripe accounts.</li>
+        <li><strong>Verify Settings</strong>: Verify your connection settings to ensure the AI team can access your tools to act on your behalf.</li>
+      </ul>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Standing Authority</h2>
+      <ul class="list-disc pl-5 mb-4 text-gray-700">
+        <li><strong>Define Scope</strong>: Define the scope of the AI team's authority.</li>
+        <li><strong>Set Rules</strong>: Set specific rules for external actions, such as sending emails or making payments.</li>
+        <li><strong>Establish Limits</strong>: Establish a budget and spending limits for the AI team.</li>
+      </ul>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Evidence</h2>
+      <ul class="list-disc pl-5 mb-4 text-gray-700">
+        <li><strong>Maintain Records</strong>: Maintain a record of all actions taken by the AI team.</li>
+        <li><strong>Review Feed</strong>: Review the evidence feed to verify that the team is completing work as expected.</li>
+      </ul>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Cost</h2>
+      <ul class="list-disc pl-5 mb-4 text-gray-700">
+        <li><strong>Monitor Cost</strong>: Monitor the cost of the AI team's operations.</li>
+        <li><strong>Understand Pricing</strong>: Understand the pricing structure and how usage is billed. Note that your AI usage uses your regular OHC subscription without any hidden markup fees on your customer's invoice.</li>
+      </ul>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Exceptions and Recovery</h2>
+      <ul class="list-disc pl-5 mb-4 text-gray-700">
+        <li><strong>Handle Exceptions</strong>: Learn how to handle exceptions and errors that may occur during execution. </li>
+        <li><strong>Recovery Process</strong>: Understand the recovery process and how to resume work after a failure. If an action fails, you can simply retry without the system creating duplicate charges.</li>
+      </ul>
+            "#.to_string()
+        }),
+        "ai-support" => Some(HelpArticleDetail {
+            title: "Your AI Helpers".to_string(),
+            content_html: r#"
+      <p class="text-gray-700 mb-4 leading-relaxed text-lg">
+        Running a business takes a lot of work. That's why we give you AI helpers—smart computer programs that can do tasks for you, like a real team!
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Hiring AI Helpers</h2>
+      <p class="text-gray-700 mb-4">
+        Go to the AI Departments page to see all the helpers you can hire. Some helpers are good at marketing, some are good at writing, and others are good at keeping track of numbers.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Giving Them Tasks</h2>
+      <p class="text-gray-700 mb-4">
+        Once you hire a helper, you can tell them what to do. You just type what you need in plain English. For example, "Write an email to my customers about a summer sale." The helper will do the work and show it to you.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Approving Their Work</h2>
+      <p class="text-gray-700 mb-4">
+        Helpers are smart, but you are the boss. Before they send an email or change your store, they will ask for your permission. You can check your Inbox to review and approve their tasks.
+      </p>
+            "#.to_string()
+        }),
+        "connected-accounts" => Some(HelpArticleDetail {
+            title: "Connected Accounts and Standing Authority".to_string(),
+            content_html: r#"
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Setup</h2>
+      <p class="text-gray-700 mb-4">
+        To let your AI team help your business, you need to connect your accounts and tell the team what they are allowed to do. This keeps your business safe and in your control.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Connected Accounts</h2>
+      <p class="text-gray-700 mb-4">
+        You can connect tools you already use, like Google Workspace for emails and files, and Stripe for payments. When you link these accounts, your AI team can use them to work for you. Always check your connection settings so your team has the right access.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Standing Authority</h2>
+      <p class="text-gray-700 mb-4">
+        Standing authority is like giving your team a rulebook. You tell them what they can do on their own and what they need to ask you first. You set rules for sending emails or making payments. You set hard spending limits so the team never spends more than you want. You can change these rules or stop the team at any time.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Evidence</h2>
+      <p class="text-gray-700 mb-4">
+        You will always know what your AI team is doing. The app keeps a clear record of all their work. You can check the evidence feed to see the emails they sent, the payments they collected, and the tasks they finished.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Cost</h2>
+      <p class="text-gray-700 mb-4">
+        We want you to understand exactly what you pay for. You pay for the computer power and AI tools the team uses. You will see an estimated cost before a task starts, and a detailed bill when it finishes. There are no hidden fees. Any standard fees from your payment provider still apply.
+      </p>
+      <h2 class="text-2xl font-bold font-outfit text-gray-800 mt-8 mb-4">Exceptions and Recovery</h2>
+      <p class="text-gray-700 mb-4">
+        Sometimes things go wrong, like a payment link failing to send. If this happens, your AI team will stop and let you know. The app saves their progress, so you can easily try again later without starting over or paying twice.
+      </p>
+            "#.to_string()
+        }),
+        _ => None,
+    }
+}
+
+pub async fn get_article_handler(
+    axum::extract::Path(article_id): axum::extract::Path<String>,
+) -> Result<Json<HelpArticleDetail>, axum::http::StatusCode> {
+    if let Some(article) = get_article(&article_id) {
+        Ok(Json(article))
+    } else {
+        Err(axum::http::StatusCode::NOT_FOUND)
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub struct ChangelogSection {
+    pub version: String,
+    #[serde(rename = "contentLines")]
+    pub content_lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_url: Option<String>,
+}
+
+pub fn get_changelog_data() -> Vec<ChangelogSection> {
+    let mut sections = vec![ChangelogSection {
+        version: "Version 1.1 (Latest)".to_string(),
+        screenshot_url: None,
+        content_lines: vec![
+            "### 🌟 New Features".to_string(),
+            "- **Help Center:** Fully searchable help center with video tutorials and articles."
+                .to_string(),
+            "- **Contextual Tooltips:** Added plain language tooltips across the app to guide you."
+                .to_string(),
+        ],
+    }];
+    let content = std::include_str!("../../../CHANGELOG.md");
+
+    let mut current_version = String::new();
+    let mut current_lines = Vec::new();
+
+    let mut current_screenshot: Option<String> = None;
+
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            if !current_version.is_empty() {
+                sections.push(ChangelogSection {
+                    version: current_version.clone(),
+                    screenshot_url: current_screenshot.clone(),
+                    content_lines: current_lines.clone(),
+                });
+            }
+            current_version = line.trim_start_matches("## ").trim().to_string();
+            current_lines = Vec::new();
+            current_screenshot = None;
+        } else if !current_version.is_empty() && !line.trim().is_empty() {
+            // Check for markdown image format: ![alt text](url)
+            if line.starts_with("![")
+                && let Some(start_idx) = line.find("](")
+                && let Some(end_idx) = line.find(")")
+            {
+                if current_screenshot.is_none() {
+                    let url = &line[start_idx + 2..end_idx];
+                    current_screenshot = Some(url.to_string());
+                }
+                continue; // Skip adding image line to content_lines
+            }
+            current_lines.push(line.to_string());
+        }
+    }
+
+    if !current_version.is_empty() {
+        sections.push(ChangelogSection {
+            version: current_version,
+            screenshot_url: current_screenshot,
+            content_lines: current_lines,
+        });
+    }
+
+    sections
+}
+
+pub async fn get_changelog() -> Json<Vec<ChangelogSection>> {
+    Json(get_changelog_data())
+}
+
+pub async fn get_api_docs_spec() -> Json<serde_json::Value> {
+    let spec = serde_json::json!({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "API Documentation (for Advanced Users)",
+            "version": "1.0.0",
+            "description": "OmniSolo Advanced API Reference integrating with OmniSolo.",
+        },
+        "servers": [
+            {
+                "url": "http://localhost:8080",
+                "description": "Backend Server"
+            }
+        ],
+        "paths": {
+            "/api/v1/help": {
+                "get": {
+                    "summary": "Get Help Articles",
+                    "description": "Retrieves a list of available help articles for the Help Center.",
+                    "tags": ["Documentation"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "title": { "type": "string" },
+                                                "desc": { "type": "string" },
+                                                "link": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/tooltips": {
+                "get": {
+                    "summary": "Get Tooltips Registry",
+                    "description": "Retrieves the key-value dictionary of all UI tooltips.",
+                    "tags": ["Documentation"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "additionalProperties": { "type": "string" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
+            "/api/v1/tooltips/{id}": {
+                "delete": {
+                    "summary": "Delete a Tooltip",
+                    "description": "Deletes a tooltip by its element ID.",
+                    "tags": ["Documentation"],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "schema": {
+                                "type": "string"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "success": { "type": "boolean" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/help/search": {
+                "get": {
+                    "summary": "Search Help Articles",
+                    "description": "Searches for help articles by query.",
+                    "tags": ["Documentation"],
+                    "parameters": [
+                        {
+                            "name": "q",
+                            "in": "query",
+                            "description": "Search query",
+                            "required": true,
+                            "schema": {
+                                "type": "string"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "title": { "type": "string" },
+                                                "desc": { "type": "string" },
+                                                "link": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/videos": {
+                "get": {
+                    "summary": "Get Video Tutorials",
+                    "description": "Retrieves a list of available video tutorials.",
+                    "tags": ["Documentation"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "id": { "type": "integer" },
+                                                "title": { "type": "string" },
+                                                "duration": { "type": "string" },
+                                                "video_url": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/changelog": {
+                "get": {
+                    "summary": "Get Release Notes and Changelog",
+                    "description": "Retrieves the release notes and changelog.",
+                    "tags": ["Documentation"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "version": { "type": "string" },
+                                            "features": {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            },
+                                            "fixes": {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/catalog/product": {
+                "post": {
+                    "summary": "Create a Product",
+                    "description": "Creates a new product or service in the catalog.",
+                    "tags": ["Catalog"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string", "example": "Vegan Birthday Cake" },
+                                        "price": { "type": "string", "example": "45.00" },
+                                        "duration": { "type": "integer", "example": 60 },
+                                        "description": { "type": "string", "example": "Delicious plant-based cake." },
+                                        "item_type": { "type": "string", "example": "physical" },
+                                        "is_subscription": { "type": "boolean", "example": false },
+                                        "subscription_interval": { "type": "string", "example": "month" },
+                                        "subscription_discount": { "type": "integer", "example": 10 }
+                                    },
+                                    "required": ["name", "price", "description", "item_type"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "success": { "type": "boolean" },
+                                            "message": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/builder/generate": {
+                "post": {
+                    "summary": "Generate a Storefront",
+                    "description": "Generates a new storefront draft using AI.",
+                    "tags": ["Builder"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "description": { "type": "string", "example": "A boutique pet bakery" }
+                                    },
+                                    "required": ["description"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "domain": { "type": "string", "nullable": true },
+                                            "theme": { "type": "string" },
+                                            "pages": { "type": "array", "items": { "type": "object" } },
+                                            "sample_products": { "type": "array", "items": { "type": "object" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/builder/publish_draft": {
+                "post": {
+                    "summary": "Publish Storefront Draft",
+                    "description": "Publishes a storefront draft.",
+                    "tags": ["Builder"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "domain": { "type": "string", "nullable": true },
+                                        "draft": { "type": "object" }
+                                    },
+                                    "required": ["draft"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "domain": { "type": "string", "nullable": true }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/catalog/generate-offering": {
+                "post": {
+                    "summary": "Generate an Offering",
+                    "description": "Generates a product offering using AI based on a prompt.",
+                    "tags": ["Catalog"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "prompt": { "type": "string", "example": "A weekly coffee bean subscription" }
+                                    },
+                                    "required": ["prompt"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "title": { "type": "string" },
+                                            "description": { "type": "string" },
+                                            "price": { "type": "string" },
+                                            "item_type": { "type": "string" },
+                                            "is_subscription": { "type": "boolean" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/orgs/register": {
+                "post": {
+                    "summary": "Register an Organization",
+                    "description": "Registers a new tenant organization in the multi-tenant OmniSolo environment.",
+                    "tags": ["Tenants"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": { "type": "string", "example": "acme" },
+                                        "name": { "type": "string", "example": "Acme Corp" },
+                                        "domain": { "type": "string", "example": "acme.com" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "success": { "type": "boolean" },
+                                            "tenant_id": { "type": "string" },
+                                            "message": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/agents/task": {
+                "post": {
+                    "summary": "Dispatch a task",
+                    "description": "Dispatches a new task to the AI Swarm Orchestrator.",
+                    "tags": ["Agents"],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_description": { "type": "string", "example": "Build a landing page for a dog groomer" },
+                                        "priority": { "type": "string", "example": "high" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "202": {
+                            "description": "Accepted",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "task_id": { "type": "string" },
+                                            "status": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/videos": {
+                "get": {
+                    "summary": "Get video tutorials",
+                    "description": "Retrieves a list of video tutorial metadata for the Help Center.",
+                    "tags": ["Documentation"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "id": { "type": "integer" },
+                                                "title": { "type": "string" },
+                                                "duration": { "type": "string" },
+                                                "video_url": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/v1/agents/status": {
+                "get": {
+                    "summary": "Get workforce status",
+                    "description": "Retrieves the current status of the agent swarm workforce.",
+                    "tags": ["Agents"],
+                    "parameters": [
+                        {
+                            "name": "tenant_id",
+                            "in": "query",
+                            "description": "Optional. Filter by organization.",
+                            "required": false,
+                            "schema": {
+                                "type": "string"
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "active_agents": { "type": "integer" },
+                                            "queued_tasks": { "type": "integer" },
+                                            "system_health": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Json(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Json as AxumJson;
+
+    fn claims(tenant_id: &str) -> ::server_common::Claims {
+        ::server_common::Claims {
+            sub: "test-user".to_string(),
+            exp: 0,
+            iat: 0,
+            organization_id: Some(tenant_id.to_string()),
+            username: String::new(),
+            email: String::new(),
+            roles: vec![],
+            session_id: None,
+            jti: String::new(),
+        }
+    }
+
+    async fn docs_test_db() -> std::sync::Arc<crate::db::DB> {
+        let sqlite = crate::db::create_sqlite_pool_for_test().await;
+        std::sync::Arc::new(crate::db::DB {
+            pool: crate::db::create_dummy_pg_pool().await,
+            store: crate::db::DbStore::Sqlite(sqlite),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_list_articles() {
+        let db = docs_test_db().await;
+        let res = list_articles(
+            axum::extract::Extension(db),
+            Some(axum::extract::Extension(claims("default"))),
+            axum::extract::Query(DocsQuery {
+                mobile_optimized: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!res.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_articles_found() {
+        let db = docs_test_db().await;
+        let res = search_articles(
+            axum::extract::Extension(db),
+            Some(axum::extract::Extension(claims("default"))),
+            axum::extract::Query(SearchQuery {
+                q: "getting".to_string(),
+                mobile_optimized: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!res.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_articles_not_found() {
+        let db = docs_test_db().await;
+        let res = search_articles(
+            axum::extract::Extension(db),
+            Some(axum::extract::Extension(claims("default"))),
+            axum::extract::Query(SearchQuery {
+                q: "unlikelysearchterm123".to_string(),
+                mobile_optimized: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(res.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_videos() {
+        let db = docs_test_db().await;
+        let res = list_videos(
+            axum::extract::Extension(db),
+            axum::extract::Extension(claims("default")),
+            axum::extract::Query(DocsQuery {
+                mobile_optimized: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!res.0.is_empty());
+    }
+
+    #[test]
+    fn test_get_changelog_data_with_screenshots() {
+        // We will indirectly test it since get_changelog_data pulls directly from CHANGELOG.md via include_str!
+        // but for now let's just make sure it parses properly.
+        let data = get_changelog_data();
+        assert!(!data.is_empty());
+        assert!(data.iter().all(|section| {
+            section
+                .screenshot_url
+                .as_deref()
+                .map(|url| !url.contains("via.placeholder.com"))
+                .unwrap_or(true)
+        }));
+    }
+
+    #[tokio::test]
+
+    async fn test_tooltips_api() {
+        let db_pool = crate::db::create_sqlite_pool_for_test().await;
+        let pg_pool = crate::db::create_dummy_pg_pool().await;
+        sqlx::query("CREATE TABLE IF NOT EXISTS tooltips (id TEXT, tenant_id TEXT, text TEXT, PRIMARY KEY (tenant_id, id))").execute(&db_pool).await.unwrap();
+        let db = std::sync::Arc::new(crate::db::DB {
+            pool: pg_pool,
+            store: crate::db::DbStore::Sqlite(db_pool),
+        });
+
+        // Prepare the payload to update a tooltip
+        let payload = TooltipPayload {
+            id: "test-tooltip-id".to_string(),
+            text: "This is a test tooltip".to_string(),
+        };
+
+        // Update the tooltip
+        let res = update_tooltip(
+            axum::extract::Extension(db.clone()),
+            axum::extract::Extension(claims("test-tenant")),
+            AxumJson(payload),
+        )
+        .await
+        .unwrap();
+        assert!(res.0.success);
+
+        // Fetch tooltips and verify the update
+        let tooltips_res = get_tooltips(
+            axum::extract::Extension(db.clone()),
+            axum::extract::Extension(claims("test-tenant")),
+        )
+        .await
+        .unwrap();
+        let tooltips = tooltips_res.0;
+
+        assert_eq!(
+            tooltips.get("test-tooltip-id").map(|s| s.as_str()),
+            Some("This is a test tooltip")
+        );
+        assert_eq!(
+            tooltips.get("help-search-tooltip").map(|s| s.as_str()),
+            Some("Search for help articles and videos...")
+        );
+        assert!(tooltips.contains_key("help-btn-tooltip"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_tooltip_api() {
+        let db_pool = crate::db::create_sqlite_pool_for_test().await;
+        let pg_pool = crate::db::create_dummy_pg_pool().await;
+        sqlx::query("CREATE TABLE IF NOT EXISTS tooltips (id TEXT, tenant_id TEXT, text TEXT, PRIMARY KEY (tenant_id, id))").execute(&db_pool).await.unwrap();
+        let db = std::sync::Arc::new(crate::db::DB {
+            pool: pg_pool,
+            store: crate::db::DbStore::Sqlite(db_pool),
+        });
+
+        // Insert a tooltip manually
+        sqlx::query("INSERT INTO tooltips (id, tenant_id, text) VALUES ('delete-test-id', 'test-tenant', 'Tooltip to delete')")
+            .execute(match &db.store { crate::db::DbStore::Sqlite(p) => p, _ => unreachable!() })
+            .await
+            .unwrap();
+
+        // Verify it exists
+        let tooltips_res = get_tooltips(
+            axum::extract::Extension(db.clone()),
+            axum::extract::Extension(claims("test-tenant")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tooltips_res.0.get("delete-test-id").map(|s| s.as_str()),
+            Some("Tooltip to delete")
+        );
+
+        // Delete the tooltip
+        let res = delete_tooltip(
+            axum::extract::Extension(db.clone()),
+            axum::extract::Path("delete-test-id".to_string()),
+            axum::extract::Extension(claims("test-tenant")),
+        )
+        .await
+        .unwrap();
+        assert!(res.0.success);
+
+        // Fetch tooltips and verify the deletion
+        let tooltips_res_after = get_tooltips(
+            axum::extract::Extension(db.clone()),
+            axum::extract::Extension(claims("test-tenant")),
+        )
+        .await
+        .unwrap();
+        assert!(!tooltips_res_after.0.contains_key("delete-test-id"));
+    }
+}

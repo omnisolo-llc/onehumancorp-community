@@ -1,0 +1,794 @@
+use async_trait::async_trait;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::LlmClient;
+use super::circuit_breaker::CircuitBreaker;
+use omnisolo_builtin_agent_core::types::{
+    ChatRequest, ChatResponse, Message, Role, ToolCall, Usage,
+};
+
+use std::time::Duration;
+
+fn request_timeout() -> Duration {
+    let secs = std::env::var("OMNISOLO_LLM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+pub struct OpenAIClient {
+    api_key: String,
+    base_url: String,
+    default_model: Option<String>,
+    embedding_model: String,
+    embedding_format: EmbeddingRequestFormat,
+    organization: Option<String>,
+    project: Option<String>,
+    client: Client,
+    circuit_breaker: CircuitBreaker,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EmbeddingRequestFormat {
+    OpenAI,
+    Minimax,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAIClientConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub default_model: Option<String>,
+    pub embedding_model: String,
+    pub embedding_format: EmbeddingRequestFormat,
+    pub organization: Option<String>,
+    pub project: Option<String>,
+    pub timeout: Duration,
+}
+
+impl OpenAIClientConfig {
+    pub fn openai(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            default_model: None,
+            embedding_model: std::env::var("OMNISOLO_OPENAI_EMBEDDING_MODEL")
+                .or_else(|_| std::env::var("OMNISOLO_EMBEDDING_MODEL"))
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string()),
+            embedding_format: EmbeddingRequestFormat::OpenAI,
+            organization: std::env::var("OPENAI_ORGANIZATION")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            project: std::env::var("OPENAI_PROJECT")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            timeout: request_timeout(),
+        }
+    }
+
+    pub fn openai_compatible(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        default_model: Option<String>,
+    ) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
+            default_model,
+            embedding_model: std::env::var("OMNISOLO_OPENAI_COMPATIBLE_EMBEDDING_MODEL")
+                .or_else(|_| std::env::var("OMNISOLO_EMBEDDING_MODEL"))
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string()),
+            embedding_format: EmbeddingRequestFormat::OpenAI,
+            organization: None,
+            project: None,
+            timeout: request_timeout(),
+        }
+    }
+
+    pub fn minimax(api_key: impl Into<String>, base_url: Option<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            base_url: base_url.unwrap_or_else(|| "https://api.minimax.chat/v1".to_string()),
+            default_model: Some(
+                std::env::var("MINIMAX_MODEL").unwrap_or_else(|_| "MiniMax-M2.7".to_string()),
+            ),
+            embedding_model: std::env::var("MINIMAX_EMBEDDING_MODEL")
+                .unwrap_or_else(|_| "embo-01".to_string()),
+            embedding_format: EmbeddingRequestFormat::Minimax,
+            organization: None,
+            project: None,
+            timeout: request_timeout(),
+        }
+    }
+}
+
+impl OpenAIClient {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self::from_config(OpenAIClientConfig::openai(api_key))
+    }
+
+    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::from_config(OpenAIClientConfig::openai_compatible(
+            api_key, base_url, None,
+        ))
+    }
+
+    pub fn from_config(mut config: OpenAIClientConfig) -> Self {
+        config.base_url = normalize_api_base_url(&config.base_url);
+        Self {
+            api_key: config.api_key,
+            base_url: config.base_url,
+            default_model: config.default_model,
+            embedding_model: config.embedding_model,
+            embedding_format: config.embedding_format,
+            organization: config.organization,
+            project: config.project,
+            client: Client::builder()
+                .timeout(config.timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            circuit_breaker: CircuitBreaker::new(3, Duration::from_secs(60)),
+        }
+    }
+
+    pub fn minimax(api_key: impl Into<String>, base_url: Option<String>) -> Self {
+        Self::from_config(OpenAIClientConfig::minimax(api_key, base_url))
+    }
+
+    fn chat_completions_url(&self) -> String {
+        endpoint_url(&self.base_url, "chat/completions")
+    }
+
+    fn embeddings_url(&self) -> String {
+        endpoint_url(&self.base_url, "embeddings")
+    }
+
+    fn request_with_auth(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json");
+
+        if !self.api_key.trim().is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+
+        if let Some(org) = &self.organization {
+            request = request.header("OpenAI-Organization", org);
+        }
+
+        if let Some(project) = &self.project {
+            request = request.header("OpenAI-Project", project);
+        }
+
+        request
+    }
+}
+
+fn normalize_api_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/').to_string();
+    for suffix in ["/chat/completions", "/embeddings"] {
+        if let Some(root) = trimmed.strip_suffix(suffix) {
+            return root.trim_end_matches('/').to_string();
+        }
+    }
+    trimmed
+}
+
+fn endpoint_url(base_url: &str, endpoint: &str) -> String {
+    format!("{}/{}", base_url.trim_end_matches('/'), endpoint)
+}
+
+// ── Wire types ────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct OpenAIMessage {
+    #[allow(dead_code)]
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAIToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OpenAIToolCall {
+    id: String,
+    r#type: &'static str,
+    function: OpenAIFunction,
+}
+
+#[derive(Serialize)]
+struct OpenAIFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Serialize)]
+struct OpenAIToolDef {
+    r#type: &'static str,
+    function: OpenAIFunctionDef,
+}
+
+#[derive(Serialize)]
+struct OpenAIFunctionDef {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+#[derive(Serialize)]
+struct OpenAIRequest {
+    model: String,
+    messages: Vec<OpenAIMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<OpenAIToolDef>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIResponse {
+    id: Option<String>,
+    choices: Vec<OpenAIChoice>,
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIChoice {
+    message: OpenAIResponseMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIResponseMessage {
+    #[allow(dead_code)]
+    role: String,
+    content: Option<String>,
+    tool_calls: Option<Vec<OpenAIResponseToolCall>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIResponseToolCall {
+    id: String,
+    function: OpenAIResponseFunction,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIResponseFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIUsage {
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: i32,
+}
+
+#[derive(Serialize)]
+struct OpenAIEmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Serialize)]
+struct MinimaxEmbeddingRequest<'a> {
+    model: &'a str,
+    r#type: &'static str,
+    texts: [&'a str; 1],
+}
+
+#[derive(Deserialize, Debug)]
+pub struct MinimaxBaseResp {
+    pub status_code: i32,
+    pub status_msg: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAIEmbeddingResponse {
+    #[serde(default)]
+    base_resp: Option<MinimaxBaseResp>,
+    #[serde(default)]
+    data: Vec<OpenAIEmbeddingData>,
+    #[serde(default)]
+    vectors: Vec<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIEmbeddingData {
+    embedding: Vec<f32>,
+}
+
+#[async_trait]
+impl LlmClient for OpenAIClient {
+    async fn chat(
+        &self,
+        req: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.chat_prepared(super::minify_chat_request(req)).await
+    }
+    async fn chat_prepared(
+        &self,
+        req: ChatRequest,
+    ) -> Result<ChatResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let cb = &self.circuit_breaker;
+        if !cb.allow() {
+            return Err("Circuit breaker is open: Too many consecutive LLM failures".into());
+        }
+
+        let mut messages = Vec::new();
+
+        if !req.system.is_empty() {
+            messages.push(OpenAIMessage {
+                role: "system".to_string(),
+                content: Some(req.system.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+
+        for m in &req.messages {
+            if m.role == Role::System {
+                continue;
+            }
+
+            // Tool results
+            for tr in &m.tool_results {
+                let content = if !tr.error.is_empty() {
+                    format!("Error: {}", tr.error)
+                } else {
+                    tr.content.clone()
+                };
+                messages.push(OpenAIMessage {
+                    role: "tool".to_string(),
+                    content: Some(content),
+                    tool_calls: None,
+                    tool_call_id: Some(tr.tool_call_id.clone()),
+                });
+            }
+
+            // Assistant with tool calls
+            if !m.tool_calls.is_empty() {
+                let calls: Vec<OpenAIToolCall> = m
+                    .tool_calls
+                    .iter()
+                    .map(|tc| OpenAIToolCall {
+                        id: tc.id.clone(),
+                        r#type: "function",
+                        function: OpenAIFunction {
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.to_string(),
+                        },
+                    })
+                    .collect();
+                messages.push(OpenAIMessage {
+                    role: "assistant".to_string(),
+                    content: if m.content.is_empty() {
+                        None
+                    } else {
+                        Some(m.content.clone())
+                    },
+                    tool_calls: Some(calls),
+                    tool_call_id: None,
+                });
+            } else {
+                messages.push(OpenAIMessage {
+                    role: m.role.to_string(),
+                    content: Some(m.content.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+
+        let tools: Vec<OpenAIToolDef> = req
+            .tools
+            .iter()
+            .map(|t| OpenAIToolDef {
+                r#type: "function",
+                function: OpenAIFunctionDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                },
+            })
+            .collect();
+
+        let model = if req.model.trim().is_empty() {
+            match self.default_model.clone() {
+                Some(model) => model,
+                None => {
+                    cb.record_non_failure();
+                    return Err(
+                        "missing model: set OMNISOLO_LLM_MODEL or provider-specific model env var"
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            req.model.clone()
+        };
+
+        let payload = OpenAIRequest {
+            model,
+            messages,
+            max_tokens: Some(req.max_tokens),
+            temperature: Some(req.temperature),
+            tools,
+        };
+
+        // OpenAI prompt caching is provider-managed. Keeping stable system content
+        // first allows provider-side reuse without caching complete responses here.
+
+        let url = self.chat_completions_url();
+        let resp = match self.request_with_auth(&url).json(&payload).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                cb.record_transport_error(&error);
+                return Err(error.into());
+            }
+        };
+
+        if !resp.status().is_success() {
+            cb.record_http_status(resp.status());
+            let status = resp.status().as_u16();
+            return Err(format!("openai api error (status {status})").into());
+        }
+
+        let result = super::read_provider_json::<OpenAIResponse>(resp).await;
+        if let Err(e) = result {
+            cb.record_non_failure();
+            return Err(format!("api error: failed to parse response: {:?}", e).into());
+        }
+        let result = result.unwrap();
+
+        let choice = match result.choices.into_iter().next() {
+            Some(choice) => choice,
+            None => {
+                cb.record_non_failure();
+                return Err("no choices".into());
+            }
+        };
+        let finish_reason = choice.finish_reason.unwrap_or_default();
+
+        let text = choice.message.content.unwrap_or_default();
+
+        let tool_calls: Vec<ToolCall> = choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| {
+                let arguments: Value = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or(Value::Object(Default::default()));
+                ToolCall {
+                    id: tc.id,
+                    name: tc.function.name,
+                    arguments,
+                }
+            })
+            .collect();
+
+        let usage = result
+            .usage
+            .map(|u| Usage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cache_read_input_tokens: u
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cached_tokens)
+                    .unwrap_or(0),
+                cache_creation_input_tokens: 0,
+            })
+            .unwrap_or_default();
+
+        cb.record_success();
+
+        Ok(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: text,
+                tool_calls,
+                tool_results: vec![],
+                response_id: result.id.clone(),
+                previous_response_id: None,
+            },
+            usage,
+            stop_reason: finish_reason,
+            response_id: result.id.clone(),
+        })
+    }
+
+    async fn generate_embedding(
+        &self,
+        text: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        if text.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cb = &self.circuit_breaker;
+        if !cb.allow() {
+            return Err("Circuit breaker is open: Too many consecutive LLM failures".into());
+        }
+
+        let url = self.embeddings_url();
+        let resp_result = match self.embedding_format {
+            EmbeddingRequestFormat::OpenAI => {
+                let payload = OpenAIEmbeddingRequest {
+                    model: &self.embedding_model,
+                    input: text,
+                };
+                self.request_with_auth(&url).json(&payload).send().await
+            }
+            EmbeddingRequestFormat::Minimax => {
+                let payload = MinimaxEmbeddingRequest {
+                    model: &self.embedding_model,
+                    r#type: "db",
+                    texts: [text],
+                };
+                self.request_with_auth(&url).json(&payload).send().await
+            }
+        };
+        let resp = match resp_result {
+            Ok(response) => response,
+            Err(error) => {
+                cb.record_transport_error(&error);
+                return Err(error.into());
+            }
+        };
+
+        if !resp.status().is_success() {
+            cb.record_http_status(resp.status());
+            let status = resp.status().as_u16();
+            return Err(format!("openai-compatible embeddings error (status {status})").into());
+        }
+
+        let result: OpenAIEmbeddingResponse = match super::read_provider_json(resp).await {
+            Ok(result) => result,
+            Err(error) => {
+                cb.record_non_failure();
+                return Err(error);
+            }
+        };
+
+        // Handle Minimax base_resp wrapper which always returns HTTP 200 OK
+        if let Some(base_resp) = result.base_resp
+            && base_resp.status_code != 0
+            && base_resp.status_code != 1000
+        {
+            cb.record_non_failure();
+            return Err(format!(
+                "minimax embeddings error (status {}): {}",
+                base_resp.status_code, base_resp.status_msg
+            )
+            .into());
+        }
+
+        if let Some(item) = result.data.into_iter().next() {
+            cb.record_success();
+            return Ok(item.embedding);
+        }
+
+        if let Some(vector) = result.vectors.into_iter().next() {
+            cb.record_success();
+            return Ok(vector);
+        }
+
+        cb.record_non_failure();
+        Err("openai-compatible embeddings response did not include a vector".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Value {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let mut expected_len = None;
+
+        loop {
+            let bytes_read = stream.read(&mut buffer).await.unwrap();
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+
+            if expected_len.is_none()
+                && let Some(header_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(header_end + 4 + content_length);
+            }
+
+            if expected_len.is_some_and(|len| request.len() >= len) {
+                break;
+            }
+        }
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        serde_json::from_slice(&request[header_end + 4..expected_len.unwrap()]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn generated_array_schema_survives_openai_and_minimax_wire_roundtrip() {
+        use omnisolo_builtin_agent_core::output_parser::{
+            AdvancedPydanticOutputParser, OutputParser,
+        };
+        for minimax in [false, true] {
+            let request = super::super::structured_output_test::array_request().await;
+            let expected = request.tools[0].parameters.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let body = read_http_request(&mut stream).await;
+                write_json_response(&mut stream, r#"{"id":"schema-receipt","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-schema","type":"function","function":{"name":"structured_output","arguments":"{\"data\":[{\"tool\":\"lookup\",\"args\":{}}]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#).await;
+                body
+            });
+            let endpoint = format!("http://{address}/v1");
+            let mut client = if minimax {
+                OpenAIClient::minimax("fixture", Some(endpoint))
+            } else {
+                OpenAIClient::with_base_url("fixture", endpoint)
+            };
+            // Fixture-only proxy isolation; no external request is made.
+            client.client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(3), client.chat(request))
+                .await
+                .unwrap()
+                .unwrap();
+            let body = server.await.unwrap();
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(body["tools"][0]["function"]["parameters"], expected);
+            assert_eq!(
+                body["tools"][0]["function"]["parameters"]["properties"]["data"]["type"],
+                "array"
+            );
+            assert!(body["tools"][0]["function"].get("strict").is_none());
+            let parsed: Vec<Value> = AdvancedPydanticOutputParser::new()
+                .parse_message(&response.message)
+                .unwrap();
+            assert_eq!(parsed, vec![serde_json::json!({"tool":"lookup","args":{}})]);
+        }
+    }
+
+    async fn write_json_response(stream: &mut tokio::net::TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn colliding_request(final_user_content: &str) -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_string(),
+            system: "shared-prefix-".to_string() + &"x".repeat(9_000),
+            messages: vec![Message::user(final_user_content)],
+            tools: vec![],
+            max_tokens: 64,
+            temperature: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_prompt_prefixes_do_not_share_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = request_count.clone();
+        let server = tokio::spawn(async move {
+            let responses = [
+                r#"{"id":"response-1","choices":[{"message":{"role":"assistant","content":"first response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                r#"{"id":"response-2","choices":[{"message":{"role":"assistant","content":"second response","tool_calls":[{"id":"call-2","type":"function","function":{"name":"Lookup","arguments":"{\"id\":\"42\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            ];
+
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                server_count.fetch_add(1, Ordering::SeqCst);
+                write_json_response(&mut stream, body).await;
+            }
+        });
+
+        let client = OpenAIClient::with_base_url("test-key", format!("http://{address}/v1"));
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.chat(colliding_request("first tail")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.chat(colliding_request("second tail")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(first.message.content, "first response");
+        assert_eq!(second.message.content, "second response");
+        assert_eq!(second.message.tool_calls.len(), 1);
+        assert_eq!(second.message.tool_calls[0].name, "Lookup");
+        assert_eq!(
+            second.message.tool_calls[0].arguments,
+            serde_json::json!({"id": "42"})
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn normalizes_chat_completion_url_to_api_root() {
+        assert_eq!(
+            normalize_api_base_url("https://example.test/v1/chat/completions"),
+            "https://example.test/v1"
+        );
+    }
+
+    #[test]
+    fn builds_chat_completion_endpoint_from_base_url() {
+        let client = OpenAIClient::with_base_url("key", "https://example.test/v1/");
+        assert_eq!(
+            client.chat_completions_url(),
+            "https://example.test/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn minimax_uses_openai_compatible_api_root() {
+        let client = OpenAIClient::minimax("key", None);
+        assert_eq!(
+            client.chat_completions_url(),
+            "https://api.minimax.chat/v1/chat/completions"
+        );
+    }
+}

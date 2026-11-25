@@ -1,0 +1,503 @@
+use async_trait::async_trait;
+use dashmap::DashMap;
+use dashmap::DashSet;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CacheItem<T> {
+    value: T,
+    tags: Vec<String>,
+    #[serde(default)]
+    ttl_secs: u64,
+}
+
+/// Optional L2 distributed cache backend injected by Cloud runtime extensions.
+#[async_trait]
+pub trait DistributedCacheBackend: Send + Sync {
+    async fn get_raw(&self, key: &str) -> Option<String>;
+    async fn set_raw(&self, key: &str, value: String, tags: &[String], ttl_secs: u64);
+    async fn del_raw(&self, key: &str);
+    async fn del_by_tag(&self, tag: &str);
+}
+
+use std::sync::atomic::Ordering;
+
+struct CacheValue<T> {
+    val: T,
+    expiry: std::time::Instant,
+    access_count: std::sync::atomic::AtomicU64,
+}
+
+pub struct HybridCacheInner<T> {
+    local: OnceLock<DashMap<String, CacheValue<T>>>,
+    local_tags: OnceLock<DashMap<String, DashSet<String>>>,
+    flight_group: OnceLock<DashMap<String, tokio::sync::watch::Sender<Option<T>>>>,
+    l2_backend: Option<Arc<dyn DistributedCacheBackend>>,
+    max_local_capacity: usize,
+}
+
+#[derive(Clone)]
+pub struct HybridCache<T> {
+    inner: Arc<HybridCacheInner<T>>,
+}
+
+struct FlightGuard<T> {
+    inner: Arc<HybridCacheInner<T>>,
+    key: String,
+}
+
+impl<T> Drop for FlightGuard<T> {
+    fn drop(&mut self) {
+        if let Some(flight_group) = self.inner.flight_group.get() {
+            flight_group.remove(&self.key);
+        }
+    }
+}
+
+impl<T> HybridCache<T>
+where
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    pub fn new(l2_backend: Option<Arc<dyn DistributedCacheBackend>>) -> Self {
+        Self {
+            inner: Arc::new(HybridCacheInner {
+                local: OnceLock::new(),
+                local_tags: OnceLock::new(),
+                flight_group: OnceLock::new(),
+                l2_backend,
+                max_local_capacity: 1000,
+            }),
+        }
+    }
+
+    pub fn with_capacity(
+        l2_backend: Option<Arc<dyn DistributedCacheBackend>>,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(HybridCacheInner {
+                local: OnceLock::new(),
+                local_tags: OnceLock::new(),
+                flight_group: OnceLock::new(),
+                l2_backend,
+                max_local_capacity: capacity,
+            }),
+        }
+    }
+
+    fn get_local(&self) -> &DashMap<String, CacheValue<T>> {
+        self.inner.local.get_or_init(DashMap::new)
+    }
+
+    fn get_local_tags(&self) -> &DashMap<String, DashSet<String>> {
+        self.inner.local_tags.get_or_init(DashMap::new)
+    }
+
+    fn get_flight_group(&self) -> &DashMap<String, tokio::sync::watch::Sender<Option<T>>> {
+        self.inner.flight_group.get_or_init(DashMap::new)
+    }
+
+    pub async fn get(&self, key: &str) -> Option<T> {
+        self.get_with_swr(key).await.map(|(v, _)| v)
+    }
+
+    /// Gets the value from the cache or fetches it using the provided future.
+    /// Ensures that only one fetch happens concurrently for a given key.
+    pub async fn get_or_fetch_with_tags_swr<F, Fut>(
+        &self,
+        key: &str,
+        tags: Vec<String>,
+        ttl: Duration,
+        fetch: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Option<T>> + Send + 'static,
+    {
+        let res = self.get_with_swr(key).await;
+        if let Some((v, is_stale)) = &res
+            && !*is_stale
+        {
+            return Some(v.clone());
+        }
+
+        let flight_group = self.get_flight_group();
+
+        let (tx_opt, mut rx) = match flight_group.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                if let Some((v, true)) = res {
+                    return Some(v);
+                }
+                (None, entry.get().subscribe())
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                entry.insert(tx.clone());
+                (Some(tx), rx)
+            }
+        };
+
+        if let Some(tx) = tx_opt {
+            // Leader
+            if let Some((v, true)) = res {
+                // Stale hit: return immediately, fetch in background
+                let cache_clone = self.clone();
+                let key_clone = key.to_string();
+                tokio::spawn(async move {
+                    let _guard = FlightGuard {
+                        inner: cache_clone.inner.clone(),
+                        key: key_clone.clone(),
+                    };
+                    if let Some(val) = fetch().await {
+                        cache_clone
+                            .set_with_tags(&key_clone, val.clone(), tags, ttl)
+                            .await;
+                        let _ = tx.send(Some(val));
+                    }
+                });
+                return Some(v);
+            } else {
+                // Cache miss: fetch now
+                let _guard = FlightGuard {
+                    inner: self.inner.clone(),
+                    key: key.to_string(),
+                };
+                if let Some(val) = fetch().await {
+                    self.set_with_tags(key, val.clone(), tags, ttl).await;
+                    let _ = tx.send(Some(val.clone()));
+                    return Some(val);
+                }
+                return None;
+            }
+        }
+
+        // Follower: wait for leader
+        if let Some(val) = rx.borrow().clone() {
+            return Some(val);
+        }
+
+        if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(5), rx.changed()).await
+            && let Some(val) = rx.borrow().clone()
+        {
+            return Some(val);
+        }
+
+        // Fallback: check cache in case leader updated cache or completed
+        if let Some(val) = self.get(key).await {
+            return Some(val);
+        }
+
+        // If leader failed/cancelled and cache is still empty, fetch ourselves
+        if let Some(val) = fetch().await {
+            self.set_with_tags(key, val.clone(), tags, ttl).await;
+            return Some(val);
+        }
+        None
+    }
+
+    pub async fn get_or_fetch_with_swr<F, Fut>(
+        &self,
+        key: &str,
+        ttl: Duration,
+        fetch: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Option<T>> + Send + 'static,
+    {
+        self.get_or_fetch_with_tags_swr(key, Vec::new(), ttl, fetch)
+            .await
+    }
+
+    pub async fn get_with_swr(&self, key: &str) -> Option<(T, bool)> {
+        // Try local cache first, allowing slightly stale reads
+        if let Some(entry) = self.get_local().get(key) {
+            let now = std::time::Instant::now();
+            entry.access_count.fetch_add(1, Ordering::Relaxed);
+            if now < entry.expiry {
+                return Some((entry.val.clone(), false)); // Fresh
+            } else if now < entry.expiry + Duration::from_secs(86400) {
+                // Stale but within SWR window (1 day)
+                return Some((entry.val.clone(), true));
+            }
+        }
+
+        // Then optional L2 distributed backend
+        if let Some(l2) = &self.inner.l2_backend
+            && let Some(data) = l2.get_raw(key).await
+        {
+            if let Ok(item) = serde_json::from_str::<CacheItem<T>>(&data) {
+                let ttl_secs = if item.ttl_secs > 0 { item.ttl_secs } else { 60 };
+                self.set_local(
+                    key,
+                    item.value.clone(),
+                    &item.tags,
+                    Duration::from_secs(ttl_secs),
+                );
+                return Some((item.value, false));
+            } else if let Ok(val) = serde_json::from_str::<T>(&data) {
+                self.set_local(key, val.clone(), &[], Duration::from_secs(60));
+                return Some((val, false));
+            }
+        }
+        None
+    }
+
+    pub async fn set(&self, key: &str, value: T, ttl: Duration) {
+        self.set_with_tags(key, value, vec![], ttl).await;
+    }
+
+    pub async fn set_with_tags(&self, key: &str, value: T, tags: Vec<String>, ttl: Duration) {
+        // 1. Set local cache
+        self.set_local(key, value.clone(), &tags, ttl);
+
+        // 2. Set optional L2 backend
+        if let Some(l2) = &self.inner.l2_backend {
+            let item = CacheItem {
+                value,
+                tags: tags.clone(),
+                ttl_secs: ttl.as_secs(),
+            };
+            if let Ok(data) = serde_json::to_string(&item) {
+                l2.set_raw(key, data, &tags, ttl.as_secs()).await;
+            }
+        }
+    }
+
+    fn set_local(&self, key: &str, value: T, tags: &[String], ttl: Duration) {
+        let local = self.get_local();
+        let now = std::time::Instant::now();
+
+        if local.len() >= self.inner.max_local_capacity && !local.contains_key(key) {
+            let mut removed_keys = Vec::new();
+            let mut has_expired = false;
+
+            let mut least_accessed_key = None;
+            let mut lowest_access_count = u64::MAX;
+
+            for item in local.iter() {
+                if item.expiry <= now {
+                    removed_keys.push(item.key().clone());
+                    has_expired = true;
+                } else {
+                    let count = item.access_count.load(Ordering::Relaxed);
+                    if count < lowest_access_count {
+                        lowest_access_count = count;
+                        least_accessed_key = Some(item.key().clone());
+                    }
+                }
+            }
+
+            if has_expired {
+                for k in &removed_keys {
+                    local.remove(k);
+                }
+            } else {
+                if local.len() >= self.inner.max_local_capacity {
+                    if let Some(key_to_remove) = least_accessed_key {
+                        local.remove(&key_to_remove);
+                        removed_keys.push(key_to_remove);
+                    }
+
+                    // LFU decay: halve all access counts
+                    for item in local.iter() {
+                        let current = item.access_count.load(Ordering::Relaxed);
+                        item.access_count.store(current / 2, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // Clean up tags
+            if !removed_keys.is_empty() {
+                let tags_map = self.get_local_tags();
+                for mut entry in tags_map.iter_mut() {
+                    let keys: &mut dashmap::DashSet<String> = entry.value_mut();
+                    for k in &removed_keys {
+                        keys.remove(k);
+                    }
+                }
+                tags_map.retain(|_, keys| !keys.is_empty());
+            }
+        }
+
+        local.insert(
+            key.to_string(),
+            CacheValue {
+                val: value,
+                expiry: std::time::Instant::now() + ttl,
+                access_count: std::sync::atomic::AtomicU64::new(0),
+            },
+        );
+
+        if !tags.is_empty() {
+            let tags_map = self.get_local_tags();
+            for tag in tags {
+                tags_map
+                    .entry(tag.to_string())
+                    .or_default()
+                    .insert(key.to_string());
+            }
+        }
+    }
+
+    pub async fn invalidate(&self, key: &str) {
+        self.get_local().remove(key);
+        let tags_map = self.get_local_tags();
+        for mut entry in tags_map.iter_mut() {
+            let keys = entry.value_mut();
+            keys.remove(key);
+        }
+        tags_map.retain(|_, keys| !keys.is_empty());
+
+        if let Some(l2) = &self.inner.l2_backend {
+            l2.del_raw(key).await;
+        }
+    }
+
+    pub async fn invalidate_by_tag(&self, tag: &str) {
+        let tags_map = self.get_local_tags();
+
+        if let Some((_, keys)) = tags_map.remove(tag) {
+            let local = self.get_local();
+            for key in keys.iter() {
+                local.remove(key.key());
+            }
+        }
+
+        if let Some(l2) = &self.inner.l2_backend {
+            l2.del_by_tag(tag).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_hybrid_cache_capacity_eviction() {
+        let cache = HybridCache::<String>::with_capacity(None, 2);
+        cache
+            .set("k1", "v1".to_string(), Duration::from_secs(60))
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        cache
+            .set("k2", "v2".to_string(), Duration::from_secs(60))
+            .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Access k1 so k2 becomes the LRU
+        let _ = cache.get("k1").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        cache
+            .set("k3", "v3".to_string(), Duration::from_secs(60))
+            .await;
+
+        let local = cache.get_local();
+        assert_eq!(local.len(), 2);
+        assert!(local.contains_key("k1") || local.contains_key("k2"));
+        assert!(local.contains_key("k3"));
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_cache_tags() {
+        let cache = HybridCache::<String>::with_capacity(None, 10);
+        cache
+            .set_with_tags(
+                "k1",
+                "v1".to_string(),
+                vec!["tag1".to_string()],
+                Duration::from_secs(60),
+            )
+            .await;
+        cache
+            .set_with_tags(
+                "k2",
+                "v2".to_string(),
+                vec!["tag1".to_string(), "tag2".to_string()],
+                Duration::from_secs(60),
+            )
+            .await;
+
+        assert_eq!(cache.get("k1").await, Some("v1".to_string()));
+        cache.invalidate_by_tag("tag1").await;
+        assert_eq!(cache.get("k1").await, None);
+        assert_eq!(cache.get("k2").await, None);
+    }
+}
+
+#[cfg(test)]
+mod tests_singleflight {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::Duration;
+
+    #[tokio::test]
+    async fn test_hybrid_cache_singleflight() {
+        let cache = Arc::new(HybridCache::<String>::with_capacity(None, 10));
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let cache_clone = cache.clone();
+            let count_clone = fetch_count.clone();
+            handles.push(tokio::spawn(async move {
+                cache_clone
+                    .get_or_fetch_with_swr(
+                        "test_key",
+                        Duration::from_secs(60),
+                        move || async move {
+                            count_clone.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Some("test_val".to_string())
+                        },
+                    )
+                    .await
+            }));
+        }
+
+        let mut results = vec![];
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        for res in results {
+            assert_eq!(res, Some("test_val".to_string()));
+        }
+
+        // Fetch should only have been called once despite 10 concurrent requests
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_cache_singleflight_cancelled_leader() {
+        let cache = HybridCache::<String>::with_capacity(None, 10);
+        let cache_clone = cache.clone();
+
+        let handle = tokio::spawn(async move {
+            cache_clone
+                .get_or_fetch_with_swr("cancel_key", Duration::from_secs(60), || async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Some("val".to_string())
+                })
+                .await
+        });
+
+        // Give time for handle to become leader
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle.abort(); // Cancel leader!
+
+        // Second caller should not hang forever
+        let res = cache
+            .get_or_fetch_with_swr("cancel_key", Duration::from_secs(60), || async {
+                Some("recovered".to_string())
+            })
+            .await;
+        assert_eq!(res, Some("recovered".to_string()));
+    }
+}

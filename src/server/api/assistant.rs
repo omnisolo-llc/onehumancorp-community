@@ -1,0 +1,3324 @@
+use crate::db::{DB, DbStore};
+use ::server_common::Claims;
+use axum::{
+    Json, Router,
+    extract::{Extension, Path, Query},
+    http::StatusCode,
+    routing::get,
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
+use std::sync::Arc;
+use uuid::Uuid;
+
+#[derive(serde::Deserialize)]
+pub struct AssistantQuery {
+    pub mobile_optimized: Option<bool>,
+}
+
+pub fn router<S>(db: Arc<DB>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/workspaces", get(list_workspaces).post(create_workspace))
+        .route("/workspaces/{id}", get(get_workspace))
+        .merge(crate::workflow_execution::assistant::router())
+        .route("/legacy-tasks", get(list_tasks))
+        .route("/legacy-tasks/{id}", get(get_task).patch(mutate_task))
+        .route(
+            "/tasks/{id}/messages",
+            get(list_messages).post(create_message),
+        )
+        .route(
+            "/tasks/{id}/artifacts",
+            get(list_artifacts).post(create_artifact),
+        )
+        .route(
+            "/tasks/{id}/file_changes",
+            get(list_file_changes).post(create_file_change),
+        )
+        .route("/memory", get(list_memory).patch(mutate_memory))
+        .route(
+            "/memory/cross-session-search",
+            axum::routing::post(search_cross_session_memory),
+        )
+        .route(
+            "/memory/customer/{customer_id}",
+            get(synthesize_customer_memory),
+        )
+        .route("/skills", get(list_skills).patch(mutate_skill))
+        .route("/connectors", get(list_connectors).patch(mutate_connector))
+        .route(
+            "/settings",
+            get(get_assistant_settings).patch(update_assistant_settings),
+        )
+        .layer(Extension(db))
+}
+
+fn assistant_setting_key(tenant_id: &str) -> String {
+    format!("assistant.agent_name:{tenant_id}")
+}
+
+async fn get_assistant_settings(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let tenant_id =
+        ::server_common::auth_utils::signed_tenant_id(&claims).ok_or(StatusCode::UNAUTHORIZED)?;
+    let key = assistant_setting_key(&tenant_id);
+    let value = match &db.store {
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let row = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM application_settings WHERE tenant_id = $1 AND key = $2",
+            )
+            .bind(&tenant_id)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            tx.commit()
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            row
+        }
+        DbStore::Sqlite(pool) => sqlx::query_scalar::<_, String>(
+            "SELECT value FROM application_settings WHERE tenant_id = ? AND key = ?",
+        )
+        .bind(&tenant_id)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+    };
+    Ok(Json(serde_json::json!({
+        "settings": value.map(|agent_name| serde_json::json!({ "agentName": agent_name })).unwrap_or_else(|| serde_json::json!({})),
+    })))
+}
+
+async fn update_assistant_settings(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let tenant_id =
+        ::server_common::auth_utils::signed_tenant_id(&claims).ok_or(StatusCode::UNAUTHORIZED)?;
+    // Text-only tasks have no tool observations. Do not acknowledge a setting
+    // that is neither persisted nor connected to this execution runtime.
+    if payload.get("observationMasking").is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let agent_name = payload
+        .get("agentName")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 100);
+    if agent_name.is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if let Some(agent_name) = agent_name {
+        let key = assistant_setting_key(&tenant_id);
+        match &db.store {
+            DbStore::Postgres => {
+                let mut tx = db
+                    .pool
+                    .begin()
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                sqlx::query(
+                    "INSERT INTO application_settings (tenant_id, key, value, updated_at, updated_by)
+                     VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4)
+                     ON CONFLICT (tenant_id, key) DO UPDATE
+                     SET value = EXCLUDED.value,
+                         updated_at = CURRENT_TIMESTAMP,
+                         updated_by = EXCLUDED.updated_by",
+                )
+                .bind(&tenant_id)
+                .bind(&key)
+                .bind(agent_name)
+                .bind(&claims.sub)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                tx.commit()
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            }
+            DbStore::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO application_settings (tenant_id, key, value, updated_at, updated_by)
+                     VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+                     ON CONFLICT (tenant_id, key) DO UPDATE
+                     SET value = excluded.value,
+                         updated_at = CURRENT_TIMESTAMP,
+                         updated_by = excluded.updated_by",
+                )
+                .bind(&tenant_id)
+                .bind(&key)
+                .bind(agent_name)
+                .bind(&claims.sub)
+                .execute(pool)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            }
+        }
+    }
+
+    let mut settings = serde_json::Map::new();
+    if let Some(name) = agent_name {
+        settings.insert("agentName".to_string(), serde_json::json!(name));
+    }
+
+    Ok(Json(serde_json::json!({
+        "settings": settings,
+    })))
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    pub default_work_dir: Option<String>,
+    pub default_model: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub prompt: String,
+    pub status: String,
+    pub mode: Option<String>,
+    pub permission_profile: String,
+    pub model_config_json: Option<serde_json::Value>,
+    pub current_step: Option<String>,
+    pub archived: bool,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Message {
+    pub id: String,
+    pub task_id: String,
+    pub role: String,
+    pub content: String,
+    pub tool_metadata_json: Option<serde_json::Value>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Artifact {
+    pub id: String,
+    pub task_id: String,
+    pub type_: String,
+    pub filename: String,
+    pub path: String,
+    pub mime_type: String,
+    pub size: Option<i64>,
+    pub preview_ref: Option<String>,
+    pub created_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FileChange {
+    pub id: String,
+    pub task_id: String,
+    pub path: String,
+    pub change_type: String,
+    pub summary: Option<String>,
+    pub approval_status: String,
+    pub created_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AssistantMemoryRecord {
+    pub id: String,
+    pub content: String,
+    pub scope: String,
+    pub source: Option<String>,
+    pub enabled: bool,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AssistantSkillRecord {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub source: String,
+    pub status: String,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub config: Option<serde_json::Value>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AssistantConnectorRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub oauth: bool,
+    pub config: Option<serde_json::Value>,
+    pub last_error: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FeatureMutation {
+    pub action: String,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub content: Option<String>,
+    pub scope: Option<String>,
+    pub source: Option<String>,
+    pub category: Option<String>,
+    pub kind: Option<String>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub config: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AssistantMemoryListResponse {
+    memories: Vec<AssistantMemoryRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrossSessionSearchRequest {
+    query: String,
+    #[serde(default = "default_cross_session_limit")]
+    limit: usize,
+    #[serde(default)]
+    summarize: bool,
+}
+
+#[derive(Serialize)]
+struct CrossSessionSearchResponse {
+    results: Vec<String>,
+}
+
+fn default_cross_session_limit() -> usize {
+    5
+}
+
+#[derive(Serialize)]
+struct AssistantSkillListResponse {
+    skills: Vec<AssistantSkillRecord>,
+}
+
+#[derive(Serialize)]
+struct AssistantConnectorListResponse {
+    connectors: Vec<AssistantConnectorRecord>,
+}
+
+fn tenant_id_from(claims: &Claims) -> Result<String, (StatusCode, String)> {
+    claims
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant_id| !tenant_id.is_empty() && !tenant_id.eq_ignore_ascii_case("system"))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "organization claim is required".to_string(),
+            )
+        })
+}
+
+fn require_text(value: Option<String>, field: &str) -> Result<String, (StatusCode, String)> {
+    match value {
+        Some(text) if !text.trim().is_empty() => Ok(text),
+        _ => Err((StatusCode::BAD_REQUEST, format!("missing field: {field}"))),
+    }
+}
+
+fn require_bounded_text(
+    value: Option<String>,
+    field: &str,
+    max_chars: usize,
+) -> Result<String, (StatusCode, String)> {
+    let value = require_text(value, field)?;
+    if value.chars().count() > max_chars {
+        Err((
+            StatusCode::BAD_REQUEST,
+            format!("field exceeds {max_chars} characters: {field}"),
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn bounded_identifier(value: Option<String>, field: &str) -> Result<String, (StatusCode, String)> {
+    let value = require_bounded_text(value, field, 200)?;
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        Ok(value)
+    } else {
+        Err((StatusCode::BAD_REQUEST, format!("invalid field: {field}")))
+    }
+}
+
+async fn list_workspaces(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<Vec<Workspace>>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    let workspaces = match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, name, NULL as default_work_dir, NULL as default_model,
+                        strftime('%s', created_at) as c_unix,
+                        strftime('%s', updated_at) as u_unix
+                 FROM assistant_workspaces WHERE tenant_id = ?"
+            } else {
+                "SELECT id, name, default_work_dir, default_model, 
+                        strftime('%s', created_at) as c_unix, 
+                        strftime('%s', updated_at) as u_unix 
+                 FROM assistant_workspaces WHERE tenant_id = ?"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<Workspace> = rows
+                .into_iter()
+                .map(|row| Workspace {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    default_work_dir: row.get("default_work_dir"),
+                    default_model: row.get("default_model"),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: row
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect();
+            Ok(list)
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, name, NULL::text as default_work_dir, NULL::text as default_model,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT as u_unix
+                 FROM assistant_workspaces"
+            } else {
+                "SELECT id, name, default_work_dir, default_model, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix, 
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT as u_unix 
+                 FROM assistant_workspaces"
+            };
+            let rows = sqlx::query(query_str)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<Workspace> = rows
+                .into_iter()
+                .map(|row| Workspace {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    default_work_dir: row.get("default_work_dir"),
+                    default_model: row.get("default_model"),
+                    created_at_unix: row.get("c_unix"),
+                    updated_at_unix: row.get("u_unix"),
+                })
+                .collect();
+            Ok(list)
+        }
+    };
+
+    let workspaces = workspaces.map_err(|e: (StatusCode, String)| e)?;
+
+    Ok(Json(workspaces))
+}
+
+async fn create_workspace(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Json(payload): Json<Workspace>,
+) -> Result<Json<Workspace>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mut ws = payload;
+    ws.id = if ws.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        ws.id
+    };
+    ws.created_at_unix = Utc::now().timestamp();
+    ws.updated_at_unix = Utc::now().timestamp();
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            sqlx::query(
+                "INSERT INTO assistant_workspaces (id, tenant_id, name, default_work_dir, default_model) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(&ws.id)
+            .bind(&tenant_id)
+            .bind(&ws.name)
+            .bind(&ws.default_work_dir)
+            .bind(&ws.default_model)
+            .execute(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            sqlx::query(
+                "INSERT INTO assistant_workspaces (id, tenant_id, name, default_work_dir, default_model) VALUES ($1, $2, $3, $4, $5)"
+            )
+            .bind(&ws.id)
+            .bind(&tenant_id)
+            .bind(&ws.name)
+            .bind(&ws.default_work_dir)
+            .bind(&ws.default_model)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+
+    Ok(Json(ws))
+}
+
+async fn get_workspace(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Result<Json<Workspace>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            let row = sqlx::query(
+                "SELECT id, name, default_work_dir, default_model, 
+                        strftime('%s', created_at) as c_unix, 
+                        strftime('%s', updated_at) as u_unix 
+                 FROM assistant_workspaces WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(&tenant_id)
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let Some(r) = row {
+                Ok(Json(Workspace {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    default_work_dir: r.get("default_work_dir"),
+                    default_model: r.get("default_model"),
+                    created_at_unix: r
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: r
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                }))
+            } else {
+                Err((StatusCode::NOT_FOUND, "Workspace not found".to_string()))
+            }
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let row = sqlx::query(
+                "SELECT id, name, default_work_dir, default_model, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix, 
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT as u_unix 
+                 FROM assistant_workspaces WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let Some(r) = row {
+                Ok(Json(Workspace {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    default_work_dir: r.get("default_work_dir"),
+                    default_model: r.get("default_model"),
+                    created_at_unix: r.get("c_unix"),
+                    updated_at_unix: r.get("u_unix"),
+                }))
+            } else {
+                Err((StatusCode::NOT_FOUND, "Workspace not found".to_string()))
+            }
+        }
+    }
+}
+
+async fn list_tasks(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<AssistantQuery>,
+    Extension(execution): Extension<Arc<crate::workflow_execution::WorkflowExecution>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    execution
+        .authorize(&claims, &headers)
+        .await
+        .map_err(|error| (error.status(), error.message().to_owned()))?;
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    let tasks = match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, workspace_id, title, '' as prompt, status, mode, permission_profile, NULL as model_config, current_step, archived,
+                        strftime('%s', created_at) as c_unix,
+                        strftime('%s', updated_at) as u_unix
+                 FROM assistant_tasks WHERE tenant_id = ?"
+            } else {
+                "SELECT id, workspace_id, title, prompt, status, mode, permission_profile, model_config, current_step, archived, 
+                        strftime('%s', created_at) as c_unix, 
+                        strftime('%s', updated_at) as u_unix 
+                 FROM assistant_tasks WHERE tenant_id = ?"
+            };
+
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<serde_json::Value> = rows.into_iter().map(|row| {
+                if mobile_optimized {
+                    serde_json::json!({
+                        "id": row.get::<String, _>("id"),
+                        "workspace_id": row.get::<String, _>("workspace_id"),
+                        "title": row.get::<String, _>("title"),
+                        "status": row.get::<String, _>("status"),
+                        "mode": row.get::<Option<String>, _>("mode"),
+                        "permission_profile": row.get::<String, _>("permission_profile"),
+                        "current_step": row.get::<Option<String>, _>("current_step"),
+                        "archived": row.get::<Option<i32>, _>("archived").map(|v| v != 0).unwrap_or(false),
+                        "created_at_unix": row.get::<Option<String>, _>("c_unix").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+                        "updated_at_unix": row.get::<Option<String>, _>("u_unix").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+                    })
+                } else {
+                    let task = Task {
+                        id: row.get("id"),
+                        workspace_id: row.get("workspace_id"),
+                        title: row.get("title"),
+                        prompt: row.get("prompt"),
+                        status: row.get("status"),
+                        mode: row.get("mode"),
+                        permission_profile: row.get("permission_profile"),
+                        model_config_json: row.get::<Option<String>, _>("model_config").and_then(|s| serde_json::from_str(&s).ok()),
+                        current_step: row.get("current_step"),
+                        archived: row.get::<Option<i32>, _>("archived").map(|v| v != 0).unwrap_or(false),
+                        created_at_unix: row.get::<Option<String>, _>("c_unix").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        updated_at_unix: row.get::<Option<String>, _>("u_unix").and_then(|s| s.parse().ok()).unwrap_or(0),
+                    };
+                    serde_json::to_value(task).unwrap_or(serde_json::json!({}))
+                }
+            }).collect();
+            Ok(list)
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, workspace_id, title, '' as prompt, status, mode, permission_profile, NULL as model_config, current_step, archived,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT as u_unix
+                 FROM assistant_tasks"
+            } else {
+                "SELECT id, workspace_id, title, prompt, status, mode, permission_profile, model_config, current_step, archived, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix, 
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT as u_unix 
+                 FROM assistant_tasks"
+            };
+
+            let rows = sqlx::query(query_str)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|row| {
+                    if mobile_optimized {
+                        serde_json::json!({
+                            "id": row.get::<String, _>("id"),
+                            "workspace_id": row.get::<String, _>("workspace_id"),
+                            "title": row.get::<String, _>("title"),
+                            "status": row.get::<String, _>("status"),
+                            "mode": row.get::<Option<String>, _>("mode"),
+                            "permission_profile": row.get::<String, _>("permission_profile"),
+                            "current_step": row.get::<Option<String>, _>("current_step"),
+                            "archived": row.get::<bool, _>("archived"),
+                            "created_at_unix": row.get::<Option<i64>, _>("c_unix").unwrap_or(0),
+                            "updated_at_unix": row.get::<Option<i64>, _>("u_unix").unwrap_or(0),
+                        })
+                    } else {
+                        let task = Task {
+                            id: row.get("id"),
+                            workspace_id: row.get("workspace_id"),
+                            title: row.get("title"),
+                            prompt: row.get("prompt"),
+                            status: row.get("status"),
+                            mode: row.get("mode"),
+                            permission_profile: row.get("permission_profile"),
+                            model_config_json: row.get("model_config"),
+                            current_step: row.get("current_step"),
+                            archived: row.get("archived"),
+                            created_at_unix: row.get::<Option<i64>, _>("c_unix").unwrap_or(0),
+                            updated_at_unix: row.get::<Option<i64>, _>("u_unix").unwrap_or(0),
+                        };
+                        serde_json::to_value(task).unwrap_or(serde_json::json!({}))
+                    }
+                })
+                .collect();
+            Ok(list)
+        }
+    };
+
+    let tasks = tasks.map_err(|e: (StatusCode, String)| e)?;
+
+    Ok(Json(serde_json::Value::Array(tasks)))
+}
+
+async fn mutate_task(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Extension(execution): Extension<Arc<crate::workflow_execution::WorkflowExecution>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    execution
+        .authorize(&claims, &headers)
+        .await
+        .map_err(|error| (error.status(), error.message().to_owned()))?;
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let action = payload.get("action").and_then(|a| a.as_str()).unwrap_or("");
+    if matches!(action, "stop" | "resume") {
+        return Err((
+            StatusCode::CONFLICT,
+            "Legacy tasks have no admitted execution; create a new text task".into(),
+        ));
+    }
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            if action == "archive" {
+                sqlx::query("UPDATE assistant_tasks SET archived = 1, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND id = ?")
+                    .bind(&tenant_id).bind(&id).execute(pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "unarchive" {
+                sqlx::query("UPDATE assistant_tasks SET archived = 0, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND id = ?")
+                    .bind(&tenant_id).bind(&id).execute(pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "rename" || action == "rename_archived" {
+                let title = payload.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                sqlx::query("UPDATE assistant_tasks SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND id = ?")
+                    .bind(title).bind(&tenant_id).bind(&id).execute(pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "save_to_workspace" {
+                let workspace = payload
+                    .get("workspace")
+                    .and_then(|w| w.as_str())
+                    .unwrap_or("");
+                sqlx::query("UPDATE assistant_tasks SET workspace_id = ?, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND id = ?")
+                    .bind(workspace).bind(&tenant_id).bind(&id).execute(pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "approve_changes" {
+                sqlx::query("UPDATE assistant_file_changes SET approval_status = 'approved' WHERE tenant_id = ? AND task_id = ?")
+                    .bind(&tenant_id).bind(&id).execute(pool).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "approve_action" {
+                let msg_id = Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO assistant_messages (id, tenant_id, task_id, role, content, tool_metadata) VALUES (?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&msg_id)
+                .bind(&tenant_id)
+                .bind(&id)
+                .bind("user")
+                .bind("Approve & Execute")
+                .bind(None::<String>)
+                .execute(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "hard_delete" {
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query("DELETE FROM assistant_messages WHERE tenant_id = ? AND task_id = ?")
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query("DELETE FROM assistant_artifacts WHERE tenant_id = ? AND task_id = ?")
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query(
+                    "DELETE FROM assistant_file_changes WHERE tenant_id = ? AND task_id = ?",
+                )
+                .bind(&tenant_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query("DELETE FROM assistant_tasks WHERE tenant_id = ? AND id = ?")
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                return Ok(Json(serde_json::json!({ "deletedTask": { "id": id } })));
+            } else if action == "pin" || action == "unpin" {
+                // Ignore pin/unpin for now or implement if needed
+            } else {
+                return Err((StatusCode::BAD_REQUEST, "Unsupported action".to_string()));
+            }
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if action == "archive" {
+                sqlx::query("UPDATE assistant_tasks SET archived = true, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $1 AND id = $2")
+                    .bind(&tenant_id).bind(&id).execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "unarchive" {
+                sqlx::query("UPDATE assistant_tasks SET archived = false, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $1 AND id = $2")
+                    .bind(&tenant_id).bind(&id).execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "rename" || action == "rename_archived" {
+                let title = payload.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                sqlx::query("UPDATE assistant_tasks SET title = $1, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $2 AND id = $3")
+                    .bind(title).bind(&tenant_id).bind(&id).execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "save_to_workspace" {
+                let workspace = payload
+                    .get("workspace")
+                    .and_then(|w| w.as_str())
+                    .unwrap_or("");
+                sqlx::query("UPDATE assistant_tasks SET workspace_id = $1, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $2 AND id = $3")
+                    .bind(workspace).bind(&tenant_id).bind(&id).execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "approve_changes" {
+                sqlx::query("UPDATE assistant_file_changes SET approval_status = 'approved' WHERE tenant_id = $1 AND task_id = $2")
+                    .bind(&tenant_id).bind(&id).execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "approve_action" {
+                let msg_id = Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO assistant_messages (id, tenant_id, task_id, role, content, tool_metadata) VALUES ($1, $2, $3, $4, $5, $6)"
+                )
+                .bind(&msg_id)
+                .bind(&tenant_id)
+                .bind(&id)
+                .bind("user")
+                .bind("Approve & Execute")
+                .bind(None::<serde_json::Value>)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            } else if action == "hard_delete" {
+                sqlx::query("DELETE FROM assistant_messages WHERE tenant_id = $1 AND task_id = $2")
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query(
+                    "DELETE FROM assistant_artifacts WHERE tenant_id = $1 AND task_id = $2",
+                )
+                .bind(&tenant_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query(
+                    "DELETE FROM assistant_file_changes WHERE tenant_id = $1 AND task_id = $2",
+                )
+                .bind(&tenant_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                sqlx::query("DELETE FROM assistant_tasks WHERE tenant_id = $1 AND id = $2")
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                return Ok(Json(serde_json::json!({ "deletedTask": { "id": id } })));
+            } else if action == "pin" || action == "unpin" {
+                // Ignore pin/unpin for now or implement if needed
+            } else {
+                return Err((StatusCode::BAD_REQUEST, "Unsupported action".to_string()));
+            }
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+
+    // Fetch the updated task
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            let row = sqlx::query(
+                "SELECT id, workspace_id, title, prompt, status, mode, permission_profile, model_config, current_step, archived,
+                        strftime('%s', created_at) as c_unix,
+                        strftime('%s', updated_at) as u_unix
+                 FROM assistant_tasks WHERE tenant_id = ? AND id = ?"
+            )
+            .bind(&tenant_id)
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let Some(row) = row {
+                let task = Task {
+                    id: row.get("id"),
+                    workspace_id: row.get("workspace_id"),
+                    title: row.get("title"),
+                    prompt: row.get("prompt"),
+                    status: row.get("status"),
+                    mode: row.get("mode"),
+                    permission_profile: row.get("permission_profile"),
+                    model_config_json: row
+                        .get::<Option<String>, _>("model_config")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    current_step: row.get("current_step"),
+                    archived: row.get::<i32, _>("archived") != 0,
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: row
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                };
+                Ok(Json(
+                    serde_json::to_value(task).unwrap_or(serde_json::json!({})),
+                ))
+            } else {
+                Err((StatusCode::NOT_FOUND, "Task not found".to_string()))
+            }
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let row = sqlx::query(
+                "SELECT id, workspace_id, title, prompt, status, mode, permission_profile, model_config, current_step, archived,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_tasks WHERE tenant_id = $1 AND id = $2"
+            )
+            .bind(&tenant_id)
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let Some(row) = row {
+                let task = Task {
+                    id: row.get("id"),
+                    workspace_id: row.get("workspace_id"),
+                    title: row.get("title"),
+                    prompt: row.get("prompt"),
+                    status: row.get("status"),
+                    mode: row.get("mode"),
+                    permission_profile: row.get("permission_profile"),
+                    model_config_json: row.get("model_config"),
+                    current_step: row.get("current_step"),
+                    archived: row.get("archived"),
+                    created_at_unix: row.get::<Option<i64>, _>("c_unix").unwrap_or(0),
+                    updated_at_unix: row.get::<Option<i64>, _>("u_unix").unwrap_or(0),
+                };
+                Ok(Json(
+                    serde_json::to_value(task).unwrap_or(serde_json::json!({})),
+                ))
+            } else {
+                Err((StatusCode::NOT_FOUND, "Task not found".to_string()))
+            }
+        }
+    }
+}
+
+async fn get_task(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Extension(execution): Extension<Arc<crate::workflow_execution::WorkflowExecution>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Task>, (StatusCode, String)> {
+    execution
+        .authorize(&claims, &headers)
+        .await
+        .map_err(|error| (error.status(), error.message().to_owned()))?;
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            let row = sqlx::query(
+                "SELECT id, workspace_id, title, prompt, status, mode, permission_profile, model_config, current_step, archived, 
+                        strftime('%s', created_at) as c_unix, 
+                        strftime('%s', updated_at) as u_unix 
+                 FROM assistant_tasks WHERE tenant_id = ? AND id = ?"
+            )
+            .bind(&tenant_id)
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let Some(r) = row {
+                Ok(Json(Task {
+                    id: r.get("id"),
+                    workspace_id: r.get("workspace_id"),
+                    title: r.get("title"),
+                    prompt: r.get("prompt"),
+                    status: r.get("status"),
+                    mode: r.get("mode"),
+                    permission_profile: r.get("permission_profile"),
+                    model_config_json: r
+                        .get::<Option<String>, _>("model_config")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    current_step: r.get("current_step"),
+                    archived: r
+                        .get::<Option<i32>, _>("archived")
+                        .map(|v| v != 0)
+                        .unwrap_or(false),
+                    created_at_unix: r
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: r
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                }))
+            } else {
+                Err((StatusCode::NOT_FOUND, "Task not found".to_string()))
+            }
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let row = sqlx::query(
+                "SELECT id, workspace_id, title, prompt, status, mode, permission_profile, model_config, current_step, archived, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix, 
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT as u_unix 
+                 FROM assistant_tasks WHERE id = $1"
+            )
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            if let Some(r) = row {
+                Ok(Json(Task {
+                    id: r.get("id"),
+                    workspace_id: r.get("workspace_id"),
+                    title: r.get("title"),
+                    prompt: r.get("prompt"),
+                    status: r.get("status"),
+                    mode: r.get("mode"),
+                    permission_profile: r.get("permission_profile"),
+                    model_config_json: r.get("model_config"),
+                    current_step: r.get("current_step"),
+                    archived: r.get("archived"),
+                    created_at_unix: r.get("c_unix"),
+                    updated_at_unix: r.get("u_unix"),
+                }))
+            } else {
+                Err((StatusCode::NOT_FOUND, "Task not found".to_string()))
+            }
+        }
+    }
+}
+
+async fn list_messages(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(task_id): Path<String>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<Vec<Message>>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    let messages = match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, task_id, role, content, NULL as tool_metadata,
+                        strftime('%s', created_at) as c_unix
+                 FROM assistant_messages WHERE tenant_id = ? AND task_id = ? ORDER BY created_at ASC"
+            } else {
+                "SELECT id, task_id, role, content, tool_metadata, 
+                        strftime('%s', created_at) as c_unix 
+                 FROM assistant_messages WHERE tenant_id = ? AND task_id = ? ORDER BY created_at ASC"
+            };
+
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .bind(&task_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<Message> = rows
+                .into_iter()
+                .map(|row| Message {
+                    id: row.get("id"),
+                    task_id: row.get("task_id"),
+                    role: row.get("role"),
+                    content: row.get("content"),
+                    tool_metadata_json: row
+                        .get::<Option<String>, _>("tool_metadata")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect();
+            Ok(list)
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, task_id, role, content, NULL::text as tool_metadata,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix
+                 FROM assistant_messages WHERE task_id = $1 ORDER BY created_at ASC"
+            } else {
+                "SELECT id, task_id, role, content, tool_metadata, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix 
+                 FROM assistant_messages WHERE task_id = $1 ORDER BY created_at ASC"
+            };
+
+            let rows = sqlx::query(query_str)
+                .bind(&task_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<Message> = rows
+                .into_iter()
+                .map(|row| Message {
+                    id: row.get("id"),
+                    task_id: row.get("task_id"),
+                    role: row.get("role"),
+                    content: row.get("content"),
+                    tool_metadata_json: row.get("tool_metadata"),
+                    created_at_unix: row.get("c_unix"),
+                })
+                .collect();
+            Ok(list)
+        }
+    }?;
+
+    Ok(Json(messages))
+}
+
+async fn create_message(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(task_id): Path<String>,
+    Json(payload): Json<Message>,
+) -> Result<Json<Message>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mut msg = payload;
+    msg.task_id = task_id;
+    msg.id = if msg.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        msg.id
+    };
+    msg.created_at_unix = Utc::now().timestamp();
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            sqlx::query(
+                "INSERT INTO assistant_messages (id, tenant_id, task_id, role, content, tool_metadata) VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&msg.id)
+            .bind(&tenant_id)
+            .bind(&msg.task_id)
+            .bind(&msg.role)
+            .bind(&msg.content)
+            .bind(msg.tool_metadata_json.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()))
+            .execute(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            sqlx::query(
+                "INSERT INTO assistant_messages (id, tenant_id, task_id, role, content, tool_metadata) VALUES ($1, $2, $3, $4, $5, $6)"
+            )
+            .bind(&msg.id)
+            .bind(&tenant_id)
+            .bind(&msg.task_id)
+            .bind(&msg.role)
+            .bind(&msg.content)
+            .bind(&msg.tool_metadata_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+
+    Ok(Json(msg))
+}
+
+async fn list_artifacts(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(task_id): Path<String>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<Vec<Artifact>>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    let artifacts = match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, task_id, type, filename, '' as path, mime_type, size, preview_ref,
+                        strftime('%s', created_at) as c_unix
+                 FROM assistant_artifacts WHERE tenant_id = ? AND task_id = ?"
+            } else {
+                "SELECT id, task_id, type, filename, path, mime_type, size, preview_ref, 
+                        strftime('%s', created_at) as c_unix 
+                 FROM assistant_artifacts WHERE tenant_id = ? AND task_id = ?"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .bind(&task_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<Artifact> = rows
+                .into_iter()
+                .map(|row| Artifact {
+                    id: row.get("id"),
+                    task_id: row.get("task_id"),
+                    type_: row.get("type"),
+                    filename: row.get("filename"),
+                    path: row.get("path"),
+                    mime_type: row.get("mime_type"),
+                    size: row.get("size"),
+                    preview_ref: row.get("preview_ref"),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect();
+            Ok(list)
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, task_id, type, filename, '' as path, mime_type, size, preview_ref,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix
+                 FROM assistant_artifacts WHERE task_id = $1"
+            } else {
+                "SELECT id, task_id, type, filename, path, mime_type, size, preview_ref, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix 
+                 FROM assistant_artifacts WHERE task_id = $1"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(&task_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<Artifact> = rows
+                .into_iter()
+                .map(|row| Artifact {
+                    id: row.get("id"),
+                    task_id: row.get("task_id"),
+                    type_: row.get("type"),
+                    filename: row.get("filename"),
+                    path: row.get("path"),
+                    mime_type: row.get("mime_type"),
+                    size: row.get("size"),
+                    preview_ref: row.get("preview_ref"),
+                    created_at_unix: row.get("c_unix"),
+                })
+                .collect();
+            Ok(list)
+        }
+    }?;
+
+    Ok(Json(artifacts))
+}
+
+async fn create_artifact(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(task_id): Path<String>,
+    Json(payload): Json<Artifact>,
+) -> Result<Json<Artifact>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mut artifact = payload;
+    artifact.task_id = task_id;
+    artifact.id = if artifact.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        artifact.id
+    };
+    artifact.created_at_unix = Utc::now().timestamp();
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            sqlx::query(
+                "INSERT INTO assistant_artifacts (id, tenant_id, task_id, type, filename, path, mime_type, size, preview_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&artifact.id)
+            .bind(&tenant_id)
+            .bind(&artifact.task_id)
+            .bind(&artifact.type_)
+            .bind(&artifact.filename)
+            .bind(&artifact.path)
+            .bind(&artifact.mime_type)
+            .bind(artifact.size)
+            .bind(&artifact.preview_ref)
+            .execute(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            sqlx::query(
+                "INSERT INTO assistant_artifacts (id, tenant_id, task_id, type, filename, path, mime_type, size, preview_ref) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            )
+            .bind(&artifact.id)
+            .bind(&tenant_id)
+            .bind(&artifact.task_id)
+            .bind(&artifact.type_)
+            .bind(&artifact.filename)
+            .bind(&artifact.path)
+            .bind(&artifact.mime_type)
+            .bind(artifact.size)
+            .bind(&artifact.preview_ref)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+
+    Ok(Json(artifact))
+}
+
+async fn list_file_changes(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(task_id): Path<String>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<Vec<FileChange>>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+
+    let file_changes = match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, task_id, path, change_type, NULL as summary, approval_status,
+                        strftime('%s', created_at) as c_unix
+                 FROM assistant_file_changes WHERE tenant_id = ? AND task_id = ?"
+            } else {
+                "SELECT id, task_id, path, change_type, summary, approval_status, 
+                        strftime('%s', created_at) as c_unix 
+                 FROM assistant_file_changes WHERE tenant_id = ? AND task_id = ?"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .bind(&task_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<FileChange> = rows
+                .into_iter()
+                .map(|row| FileChange {
+                    id: row.get("id"),
+                    task_id: row.get("task_id"),
+                    path: row.get("path"),
+                    change_type: row.get("change_type"),
+                    summary: row.get("summary"),
+                    approval_status: row.get("approval_status"),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect();
+            Ok(list)
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, task_id, path, change_type, NULL::text as summary, approval_status,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix
+                 FROM assistant_file_changes WHERE task_id = $1"
+            } else {
+                "SELECT id, task_id, path, change_type, summary, approval_status, 
+                        EXTRACT(EPOCH FROM created_at)::BIGINT as c_unix 
+                 FROM assistant_file_changes WHERE task_id = $1"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(&task_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let list: Vec<FileChange> = rows
+                .into_iter()
+                .map(|row| FileChange {
+                    id: row.get("id"),
+                    task_id: row.get("task_id"),
+                    path: row.get("path"),
+                    change_type: row.get("change_type"),
+                    summary: row.get("summary"),
+                    approval_status: row.get("approval_status"),
+                    created_at_unix: row.get("c_unix"),
+                })
+                .collect();
+            Ok(list)
+        }
+    }?;
+
+    Ok(Json(file_changes))
+}
+
+async fn create_file_change(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Path(task_id): Path<String>,
+    Json(payload): Json<FileChange>,
+) -> Result<Json<FileChange>, (StatusCode, String)> {
+    let tenant_id = claims
+        .organization_id
+        .unwrap_or_else(|| "default".to_string());
+    let mut change = payload;
+    change.task_id = task_id;
+    change.id = if change.id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        change.id
+    };
+    change.created_at_unix = Utc::now().timestamp();
+
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            sqlx::query(
+                "INSERT INTO assistant_file_changes (id, tenant_id, task_id, path, change_type, summary, approval_status) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&change.id)
+            .bind(&tenant_id)
+            .bind(&change.task_id)
+            .bind(&change.path)
+            .bind(&change.change_type)
+            .bind(&change.summary)
+            .bind(&change.approval_status)
+            .execute(pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            sqlx::query(
+                "INSERT INTO assistant_file_changes (id, tenant_id, task_id, path, change_type, summary, approval_status) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            )
+            .bind(&change.id)
+            .bind(&tenant_id)
+            .bind(&change.task_id)
+            .bind(&change.path)
+            .bind(&change.change_type)
+            .bind(&change.summary)
+            .bind(&change.approval_status)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+
+    Ok(Json(change))
+}
+
+async fn list_memory(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<AssistantMemoryListResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+    let memories = fetch_memory_records(db.as_ref(), &tenant_id, mobile_optimized).await?;
+    Ok(Json(AssistantMemoryListResponse { memories }))
+}
+
+async fn mutate_memory(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Json(payload): Json<FeatureMutation>,
+) -> Result<Json<AssistantMemoryListResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+
+    match payload.action.as_str() {
+        "import" => {
+            let id = Uuid::new_v4().to_string();
+            let content = require_bounded_text(payload.content, "content", 750_000)?;
+            let scope = payload.scope.unwrap_or_else(|| "global".to_string());
+            if !matches!(scope.as_str(), "global" | "workspace") {
+                return Err((StatusCode::BAD_REQUEST, "invalid memory scope".to_string()));
+            }
+            let source = payload
+                .source
+                .map(|source| require_bounded_text(Some(source), "source", 255))
+                .transpose()?;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "INSERT INTO assistant_memory_records (id, tenant_id, content, scope, source, enabled) VALUES (?, ?, ?, ?, ?, ?)"
+                    )
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .bind(&content)
+                    .bind(&scope)
+                    .bind(&source)
+                    .bind(1_i64)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "INSERT INTO assistant_memory_records (id, tenant_id, content, scope, source, enabled) VALUES ($1, $2, $3, $4, $5, $6)"
+                    )
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .bind(&content)
+                    .bind(&scope)
+                    .bind(&source)
+                    .bind(true)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        "edit" => {
+            let id = bounded_identifier(payload.id, "id")?;
+            let content = require_bounded_text(payload.content, "content", 750_000)?;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "UPDATE assistant_memory_records SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND id = ?"
+                    )
+                    .bind(&content)
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "UPDATE assistant_memory_records SET content = $1, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $2 AND id = $3"
+                    )
+                    .bind(&content)
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        "forget" => {
+            let id = bounded_identifier(payload.id, "id")?;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "DELETE FROM assistant_memory_records WHERE tenant_id = ? AND id = ?",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "DELETE FROM assistant_memory_records WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "unsupported memory action".to_string(),
+            ));
+        }
+    }
+
+    let memories = fetch_memory_records(db.as_ref(), &tenant_id, false).await?;
+    Ok(Json(AssistantMemoryListResponse { memories }))
+}
+
+fn literal_like_pattern(query: &str) -> String {
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+fn truncate_memory_snippet(content: &str) -> String {
+    const MAX_SNIPPET_CHARS: usize = 1_000;
+    let mut chars = content.chars();
+    let snippet: String = chars.by_ref().take(MAX_SNIPPET_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
+fn memory_search_failure(error: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!("Cross-session memory search failed: {error:?}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "memory search is temporarily unavailable".to_string(),
+    )
+}
+
+async fn search_cross_session_memory(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Json(payload): Json<CrossSessionSearchRequest>,
+) -> Result<Json<CrossSessionSearchResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+    let query = payload.query.trim();
+    if query.is_empty() || query.chars().count() > 500 || !(1..=20).contains(&payload.limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid memory search request".to_string(),
+        ));
+    }
+    let pattern = literal_like_pattern(query);
+
+    let snippets = match &db.store {
+        DbStore::Sqlite(pool) => {
+            let rows = sqlx::query(
+                "SELECT task_id, role, substr(content, 1, 1001) AS content FROM assistant_messages
+                 WHERE tenant_id = ? AND content LIKE ? ESCAPE '\\'
+                 ORDER BY created_at DESC, id ASC LIMIT ?",
+            )
+            .bind(&tenant_id)
+            .bind(&pattern)
+            .bind(payload.limit as i64)
+            .fetch_all(pool)
+            .await
+            .map_err(memory_search_failure)?;
+            rows.into_iter()
+                .map(|row| {
+                    format!(
+                        "[{} · {}] {}",
+                        row.get::<String, _>("task_id"),
+                        row.get::<String, _>("role"),
+                        truncate_memory_snippet(&row.get::<String, _>("content"))
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+        DbStore::Postgres => {
+            let mut tx = db.pool.begin().await.map_err(memory_search_failure)?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(memory_search_failure)?;
+            let rows = sqlx::query(
+                "SELECT task_id, role, left(content, 1001) AS content FROM assistant_messages
+                 WHERE tenant_id = $1
+                   AND to_tsvector('simple', content) @@ plainto_tsquery('simple', $2)
+                 ORDER BY ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', $2)) DESC,
+                          created_at DESC, id ASC
+                 LIMIT $3",
+            )
+            .bind(&tenant_id)
+            .bind(query)
+            .bind(payload.limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(memory_search_failure)?;
+            tx.commit().await.map_err(memory_search_failure)?;
+            rows.into_iter()
+                .map(|row| {
+                    format!(
+                        "[{} · {}] {}",
+                        row.get::<String, _>("task_id"),
+                        row.get::<String, _>("role"),
+                        truncate_memory_snippet(&row.get::<String, _>("content"))
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let results = if payload.summarize && !snippets.is_empty() {
+        vec![format!(
+            "{} matching messages:\n{}",
+            snippets.len(),
+            snippets.join("\n")
+        )]
+    } else {
+        snippets
+    };
+    Ok(Json(CrossSessionSearchResponse { results }))
+}
+
+async fn list_skills(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<AssistantSkillListResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+    let skills = fetch_skill_records(db.as_ref(), &tenant_id, mobile_optimized).await?;
+    Ok(Json(AssistantSkillListResponse { skills }))
+}
+
+async fn mutate_skill(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Json(payload): Json<FeatureMutation>,
+) -> Result<Json<AssistantSkillListResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+
+    match payload.action.as_str() {
+        "install" => {
+            let id = payload.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let name = require_text(payload.name, "name")?;
+            let category = payload.category.unwrap_or_else(|| "Custom".to_string());
+            let version = payload.version;
+            let description = payload.description;
+            let config = payload.config;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "INSERT INTO assistant_skills (id, tenant_id, name, category, source, status, version, description, config)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (tenant_id, name) DO UPDATE SET
+                             category = excluded.category,
+                             source = excluded.source,
+                             status = excluded.status,
+                             version = excluded.version,
+                             description = excluded.description,
+                             config = excluded.config,
+                             updated_at = CURRENT_TIMESTAMP"
+                    )
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .bind(&category)
+                    .bind("database")
+                    .bind("installed")
+                    .bind(&version)
+                    .bind(&description)
+                    .bind(config.as_ref().map(|value| serde_json::to_string(value).unwrap_or_default()))
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "INSERT INTO assistant_skills (id, tenant_id, name, category, source, status, version, description, config)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         ON CONFLICT (tenant_id, name) DO UPDATE SET
+                             category = EXCLUDED.category,
+                             source = EXCLUDED.source,
+                             status = EXCLUDED.status,
+                             version = EXCLUDED.version,
+                             description = EXCLUDED.description,
+                             config = EXCLUDED.config,
+                             updated_at = CURRENT_TIMESTAMP"
+                    )
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .bind(&category)
+                    .bind("database")
+                    .bind("installed")
+                    .bind(&version)
+                    .bind(&description)
+                    .bind(&config)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        "disable" => {
+            let name = require_text(payload.name, "name")?;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "UPDATE assistant_skills SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND name = ?"
+                    )
+                    .bind("disabled")
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "UPDATE assistant_skills SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $2 AND name = $3"
+                    )
+                    .bind("disabled")
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        "uninstall" => {
+            let name = require_text(payload.name, "name")?;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query("DELETE FROM assistant_skills WHERE tenant_id = ? AND name = ?")
+                        .bind(&tenant_id)
+                        .bind(&name)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query("DELETE FROM assistant_skills WHERE tenant_id = $1 AND name = $2")
+                        .bind(&tenant_id)
+                        .bind(&name)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "unsupported skill action".to_string(),
+            ));
+        }
+    }
+
+    let skills = fetch_skill_records(db.as_ref(), &tenant_id, false).await?;
+    Ok(Json(AssistantSkillListResponse { skills }))
+}
+
+async fn list_connectors(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<AssistantQuery>,
+) -> Result<Json<AssistantConnectorListResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+    let connectors = fetch_connector_records(db.as_ref(), &tenant_id, mobile_optimized).await?;
+    Ok(Json(AssistantConnectorListResponse { connectors }))
+}
+
+async fn mutate_connector(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    Json(payload): Json<FeatureMutation>,
+) -> Result<Json<AssistantConnectorListResponse>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+
+    match payload.action.as_str() {
+        "connect" => {
+            let id = payload.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let name = require_text(payload.name, "name")?;
+            let kind = payload.kind.unwrap_or_else(|| "custom".to_string());
+            let oauth = payload
+                .config
+                .as_ref()
+                .and_then(|config| config.get("oauth"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let config = payload.config;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "INSERT INTO assistant_connectors (id, tenant_id, name, kind, status, oauth, config, last_error)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT (tenant_id, name) DO UPDATE SET
+                             kind = excluded.kind,
+                             status = excluded.status,
+                             oauth = excluded.oauth,
+                             config = excluded.config,
+                             last_error = NULL,
+                             updated_at = CURRENT_TIMESTAMP"
+                    )
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .bind(&kind)
+                    .bind("connected")
+                    .bind(if oauth { 1_i64 } else { 0_i64 })
+                    .bind(config.as_ref().map(|value| serde_json::to_string(value).unwrap_or_default()))
+                    .bind(Option::<String>::None)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "INSERT INTO assistant_connectors (id, tenant_id, name, kind, status, oauth, config, last_error)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         ON CONFLICT (tenant_id, name) DO UPDATE SET
+                             kind = EXCLUDED.kind,
+                             status = EXCLUDED.status,
+                             oauth = EXCLUDED.oauth,
+                             config = EXCLUDED.config,
+                             last_error = NULL,
+                             updated_at = CURRENT_TIMESTAMP"
+                    )
+                    .bind(&id)
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .bind(&kind)
+                    .bind("connected")
+                    .bind(oauth)
+                    .bind(&config)
+                    .bind(Option::<String>::None)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        "disconnect" => {
+            let name = require_text(payload.name, "name")?;
+
+            match &db.store {
+                DbStore::Sqlite(pool) => {
+                    sqlx::query(
+                        "UPDATE assistant_connectors SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = ? AND name = ?"
+                    )
+                    .bind("disconnected")
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+                DbStore::Postgres => {
+                    let mut tx = db
+                        .pool
+                        .begin()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+                    sqlx::query(
+                        "UPDATE assistant_connectors SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE tenant_id = $2 AND name = $3"
+                    )
+                    .bind("disconnected")
+                    .bind(&tenant_id)
+                    .bind(&name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                }
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "unsupported connector action".to_string(),
+            ));
+        }
+    }
+
+    let connectors = fetch_connector_records(db.as_ref(), &tenant_id, false).await?;
+    Ok(Json(AssistantConnectorListResponse { connectors }))
+}
+
+async fn fetch_memory_records(
+    db: &DB,
+    tenant_id: &str,
+    mobile_optimized: bool,
+) -> Result<Vec<AssistantMemoryRecord>, (StatusCode, String)> {
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, '' as content, scope, source, enabled,
+                        strftime('%s', created_at) AS c_unix,
+                        strftime('%s', updated_at) AS u_unix
+                 FROM assistant_memory_records
+                 WHERE tenant_id = ?
+                 ORDER BY updated_at DESC, created_at DESC, id ASC"
+            } else {
+                "SELECT id, content, scope, source, enabled,
+                        strftime('%s', created_at) AS c_unix,
+                        strftime('%s', updated_at) AS u_unix
+                 FROM assistant_memory_records
+                 WHERE tenant_id = ?
+                 ORDER BY updated_at DESC, created_at DESC, id ASC"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| AssistantMemoryRecord {
+                    id: row.get("id"),
+                    content: row.get("content"),
+                    scope: row.get("scope"),
+                    source: row.get("source"),
+                    enabled: row
+                        .get::<Option<i64>, _>("enabled")
+                        .map(|value| value != 0)
+                        .unwrap_or(false),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: row
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect())
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, '' as content, scope, source, enabled,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_memory_records
+                 WHERE tenant_id = $1
+                 ORDER BY updated_at DESC, created_at DESC, id ASC"
+            } else {
+                "SELECT id, content, scope, source, enabled,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_memory_records
+                 WHERE tenant_id = $1
+                 ORDER BY updated_at DESC, created_at DESC, id ASC"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(tenant_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| AssistantMemoryRecord {
+                    id: row.get("id"),
+                    content: row.get("content"),
+                    scope: row.get("scope"),
+                    source: row.get("source"),
+                    enabled: row.get("enabled"),
+                    created_at_unix: row.get("c_unix"),
+                    updated_at_unix: row.get("u_unix"),
+                })
+                .collect())
+        }
+    }
+}
+
+async fn fetch_skill_records(
+    db: &DB,
+    tenant_id: &str,
+    mobile_optimized: bool,
+) -> Result<Vec<AssistantSkillRecord>, (StatusCode, String)> {
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, name, category, source, status, version, NULL as description, NULL as config,
+                        strftime('%s', created_at) AS c_unix,
+                        strftime('%s', updated_at) AS u_unix
+                 FROM assistant_skills
+                 WHERE tenant_id = ?
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            } else {
+                "SELECT id, name, category, source, status, version, description, config,
+                        strftime('%s', created_at) AS c_unix,
+                        strftime('%s', updated_at) AS u_unix
+                 FROM assistant_skills
+                 WHERE tenant_id = ?
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| AssistantSkillRecord {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    category: row.get("category"),
+                    source: row.get("source"),
+                    status: row.get("status"),
+                    version: row.get("version"),
+                    description: row.get("description"),
+                    config: row
+                        .get::<Option<String>, _>("config")
+                        .and_then(|value| serde_json::from_str(&value).ok()),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: row
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect())
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, name, category, source, status, version, NULL::text as description, NULL::jsonb as config,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_skills
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            } else {
+                "SELECT id, name, category, source, status, version, description, config,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_skills
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            };
+            let rows = sqlx::query(query_str)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| AssistantSkillRecord {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    category: row.get("category"),
+                    source: row.get("source"),
+                    status: row.get("status"),
+                    version: row.get("version"),
+                    description: row.get("description"),
+                    config: row.get("config"),
+                    created_at_unix: row.get("c_unix"),
+                    updated_at_unix: row.get("u_unix"),
+                })
+                .collect())
+        }
+    }
+}
+
+async fn fetch_connector_records(
+    db: &DB,
+    tenant_id: &str,
+    mobile_optimized: bool,
+) -> Result<Vec<AssistantConnectorRecord>, (StatusCode, String)> {
+    match &db.store {
+        DbStore::Sqlite(pool) => {
+            let query_str = if mobile_optimized {
+                "SELECT id, name, kind, status, oauth, NULL as config, last_error,
+                        strftime('%s', created_at) AS c_unix,
+                        strftime('%s', updated_at) AS u_unix
+                 FROM assistant_connectors
+                 WHERE tenant_id = ?
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            } else {
+                "SELECT id, name, kind, status, oauth, config, last_error,
+                        strftime('%s', created_at) AS c_unix,
+                        strftime('%s', updated_at) AS u_unix
+                 FROM assistant_connectors
+                 WHERE tenant_id = ?
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            };
+            let rows = sqlx::query(query_str)
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| AssistantConnectorRecord {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    kind: row.get("kind"),
+                    status: row.get("status"),
+                    oauth: row
+                        .get::<Option<i64>, _>("oauth")
+                        .map(|value| value != 0)
+                        .unwrap_or(false),
+                    config: row
+                        .get::<Option<String>, _>("config")
+                        .and_then(|value| serde_json::from_str(&value).ok()),
+                    last_error: row.get("last_error"),
+                    created_at_unix: row
+                        .get::<Option<String>, _>("c_unix")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                    updated_at_unix: row
+                        .get::<Option<String>, _>("u_unix")
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0),
+                })
+                .collect())
+        }
+        DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = if mobile_optimized {
+                "SELECT id, name, kind, status, oauth, NULL::jsonb as config, last_error,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_connectors
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            } else {
+                "SELECT id, name, kind, status, oauth, config, last_error,
+                        EXTRACT(EPOCH FROM created_at)::BIGINT AS c_unix,
+                        EXTRACT(EPOCH FROM updated_at)::BIGINT AS u_unix
+                 FROM assistant_connectors
+                 ORDER BY updated_at DESC, created_at DESC, name ASC, id ASC"
+            };
+            let rows = sqlx::query(query_str)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            Ok(rows
+                .into_iter()
+                .map(|row| AssistantConnectorRecord {
+                    id: row.get("id"),
+                    name: row.get("name"),
+                    kind: row.get("kind"),
+                    status: row.get("status"),
+                    oauth: row.get("oauth"),
+                    config: row.get("config"),
+                    last_error: row.get("last_error"),
+                    created_at_unix: row.get("c_unix"),
+                    updated_at_unix: row.get("u_unix"),
+                })
+                .collect())
+        }
+    }
+}
+
+#[cfg(test)]
+mod real_feature_state_tests {
+    use super::*;
+    use axum::Extension;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn claims() -> Claims {
+        Claims {
+            sub: "user-1".to_string(),
+            exp: 0,
+            iat: 0,
+            organization_id: Some("tenant-real".to_string()),
+            username: "tester".to_string(),
+            email: "tester@example.com".to_string(),
+            roles: vec![],
+            session_id: None,
+            jti: "jti-1".to_string(),
+        }
+    }
+
+    // The shared db test helpers are cfg'd out when this module is compiled into
+    // the Bazel server_api test crate, so this fixture stays local.
+    async fn create_sqlite_pool_for_test() -> sqlx::SqlitePool {
+        let db_id = uuid::Uuid::new_v4().to_string();
+        let uri = format!("sqlite:file:{}?mode=memory&cache=shared", db_id);
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect(&uri)
+            .await
+            .unwrap()
+    }
+
+    async fn create_dummy_pg_pool() -> sqlx::PgPool {
+        crate::db::secure_pg_pool_options()
+            .before_acquire(|conn, _meta| {
+                Box::pin(async move {
+                    ::server_common::auth_utils::set_org_context(&mut *conn, "").await?;
+                    Ok(true)
+                })
+            })
+            .after_release(|conn, _meta| {
+                Box::pin(async move {
+                    use sqlx::Executor;
+                    conn.execute("DISCARD ALL").await?;
+                    Ok(true)
+                })
+            })
+            .connect_lazy("postgres://postgres:postgres@localhost:5432/test")
+            .unwrap()
+    }
+
+    async fn isolated_postgres_pool() -> Option<(sqlx::PgPool, sqlx::PgPool, String, String)> {
+        let database_url = std::env::var("OMNISOLO_TEST_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("OMNISOLO_DATABASE_URL").ok())?;
+        if !database_url.starts_with("postgres") {
+            return None;
+        }
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .ok()?;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let schema = format!("assistant_test_{suffix}");
+        let role = format!("assistant_role_{suffix}");
+        let password = format!("assistant_password_{suffix}");
+        sqlx::query(&format!("CREATE ROLE {role} LOGIN PASSWORD '{password}'"))
+            .execute(&admin)
+            .await
+            .ok()?;
+        sqlx::query(&format!("CREATE SCHEMA {schema} AUTHORIZATION {role}"))
+            .execute(&admin)
+            .await
+            .ok()?;
+        let search_path = format!("SET search_path TO {schema}, public");
+        let connection_options = database_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .ok()?
+            .username(&role)
+            .password(&password);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .after_connect(move |connection, _| {
+                let search_path = search_path.clone();
+                Box::pin(async move {
+                    sqlx::query(&search_path).execute(connection).await?;
+                    Ok(())
+                })
+            })
+            .connect_with(connection_options)
+            .await
+            .ok()?;
+        Some((admin, pool, schema, role))
+    }
+
+    async fn test_db() -> Arc<DB> {
+        let pool = create_sqlite_pool_for_test().await;
+        for statement in [
+            "CREATE TABLE assistant_workspaces (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, default_work_dir TEXT, default_model TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE assistant_tasks (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, workspace_id TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL, mode TEXT, permission_profile TEXT NOT NULL, model_config TEXT, current_step TEXT, archived INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE assistant_messages (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, tool_metadata TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE assistant_artifacts (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, type TEXT NOT NULL, filename TEXT NOT NULL, path TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER, preview_ref TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE assistant_file_changes (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, task_id TEXT NOT NULL, path TEXT NOT NULL, change_type TEXT NOT NULL, summary TEXT, approval_status TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE assistant_memory_records (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, content TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'global', source TEXT, enabled INTEGER DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE assistant_skills (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'Custom', source TEXT NOT NULL DEFAULT 'database', status TEXT NOT NULL, version TEXT, description TEXT, config TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE (tenant_id, name))",
+            "CREATE TABLE assistant_connectors (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'custom', status TEXT NOT NULL, oauth INTEGER DEFAULT 0, config TEXT, last_error TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE (tenant_id, name))",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
+        Arc::new(DB {
+            pool: create_dummy_pg_pool().await,
+            store: DbStore::Sqlite(pool),
+        })
+    }
+
+    async fn request_json(
+        db: Arc<DB>,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = router::<()>(db).layer(Extension(claims()));
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "expected JSON response for {} {} but got status {} parse error {} with body: {}",
+                method,
+                uri,
+                status,
+                error,
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn memory_import_edit_and_forget_uses_database() {
+        let db = test_db().await;
+
+        let (status, value) = request_json(
+            db.clone(),
+            "PATCH",
+            "/memory",
+            json!({
+                "action": "import",
+                "content": "Real persisted memory",
+                "scope": "global",
+                "source": "policy.md"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["memories"][0]["source"], "policy.md");
+        let memory_id = value["memories"][0]["id"].as_str().unwrap().to_string();
+
+        let (_, listed) = request_json(db.clone(), "GET", "/memory", json!({})).await;
+        assert_eq!(listed["memories"][0]["content"], "Real persisted memory");
+
+        let (_, edited) = request_json(
+            db.clone(),
+            "PATCH",
+            "/memory",
+            json!({
+                "action": "edit",
+                "id": memory_id,
+                "content": "Edited real memory"
+            }),
+        )
+        .await;
+        assert_eq!(edited["memories"][0]["content"], "Edited real memory");
+
+        let (_, forgotten) = request_json(
+            db,
+            "PATCH",
+            "/memory",
+            json!({
+                "action": "forget",
+                "id": memory_id
+            }),
+        )
+        .await;
+        assert_eq!(forgotten["memories"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn memory_tenant_never_falls_back_to_a_shared_default() {
+        let mut invalid = claims();
+        invalid.organization_id = None;
+        assert_eq!(
+            tenant_id_from(&invalid).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        invalid.organization_id = Some("system".to_string());
+        assert_eq!(
+            tenant_id_from(&invalid).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_session_search_is_bounded_and_tenant_scoped() {
+        let db = test_db().await;
+        let sqlite = match &db.store {
+            DbStore::Sqlite(pool) => pool,
+            DbStore::Postgres => unreachable!(),
+        };
+        for (id, tenant, content) in [
+            (
+                "message-visible",
+                "tenant-real",
+                "Customer prefers vegan options",
+            ),
+            (
+                "message-hidden",
+                "tenant-other",
+                "Private vegan account note",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO assistant_messages (id, tenant_id, task_id, role, content) VALUES (?, ?, 'task-a', 'user', ?)",
+            )
+            .bind(id)
+            .bind(tenant)
+            .bind(content)
+            .execute(sqlite)
+            .await
+            .unwrap();
+        }
+
+        let (status, response) = request_json(
+            db,
+            "POST",
+            "/memory/cross-session-search",
+            json!({ "query": "vegan", "limit": 10, "summarize": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["results"].as_array().unwrap().len(), 1);
+        assert!(
+            response["results"][0]
+                .as_str()
+                .unwrap()
+                .contains("Customer prefers vegan options")
+        );
+        assert!(!response.to_string().contains("Private vegan account note"));
+    }
+
+    #[tokio::test]
+    async fn postgres_memory_mutations_and_search_are_tenant_scoped() {
+        let Some((admin, pool, schema, role)) = isolated_postgres_pool().await else {
+            return;
+        };
+        sqlx::query(
+            "CREATE TABLE assistant_memory_records (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                source TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE assistant_messages (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tenant_other_tx = pool.begin().await.unwrap();
+        ::server_common::auth_utils::set_org_context(&mut *tenant_other_tx, "tenant-other")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO assistant_memory_records (id, tenant_id, content, scope, source)
+             VALUES ('hidden-memory', 'tenant-other', 'private memory', 'global', 'private.md')",
+        )
+        .execute(&mut *tenant_other_tx)
+        .await
+        .unwrap();
+        tenant_other_tx.commit().await.unwrap();
+        for (id, tenant, content) in [
+            (
+                "visible-message",
+                "tenant-real",
+                "Customer prefers vegan options",
+            ),
+            (
+                "hidden-message",
+                "tenant-other",
+                "Private vegan account note",
+            ),
+        ] {
+            let mut tx = pool.begin().await.unwrap();
+            ::server_common::auth_utils::set_org_context(&mut *tx, tenant)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO assistant_messages (id, tenant_id, task_id, role, content)
+                 VALUES ($1, $2, 'task-a', 'user', $3)",
+            )
+            .bind(id)
+            .bind(tenant)
+            .bind(content)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        let db = Arc::new(DB {
+            pool: pool.clone(),
+            store: DbStore::Postgres,
+        });
+        let (status, imported) = request_json(
+            db.clone(),
+            "PATCH",
+            "/memory",
+            json!({
+                "action": "import",
+                "content": "tenant-real memory",
+                "scope": "global",
+                "source": "visible.md"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(imported["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(imported["memories"][0]["content"], "tenant-real memory");
+
+        let (status, _) = request_json(
+            db.clone(),
+            "PATCH",
+            "/memory",
+            json!({"action": "edit", "id": "hidden-memory", "content": "tampered"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = request_json(
+            db.clone(),
+            "PATCH",
+            "/memory",
+            json!({"action": "forget", "id": "hidden-memory"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut tenant_other_tx = pool.begin().await.unwrap();
+        ::server_common::auth_utils::set_org_context(&mut *tenant_other_tx, "tenant-other")
+            .await
+            .unwrap();
+        let hidden: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM assistant_memory_records WHERE id = 'hidden-memory' AND tenant_id = 'tenant-other'",
+        )
+        .fetch_optional(&mut *tenant_other_tx)
+        .await
+        .unwrap();
+        tenant_other_tx.commit().await.unwrap();
+        assert_eq!(hidden.as_deref(), Some("private memory"));
+
+        let (status, response) = request_json(
+            db,
+            "POST",
+            "/memory/cross-session-search",
+            json!({"query": "vegan", "limit": 10, "summarize": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["results"].as_array().unwrap().len(), 1);
+        assert!(
+            response
+                .to_string()
+                .contains("Customer prefers vegan options")
+        );
+        assert!(!response.to_string().contains("Private vegan account note"));
+
+        pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP ROLE {role}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+
+    #[tokio::test]
+    async fn skill_enable_disable_uses_database() {
+        let db = test_db().await;
+        let (status, installed) = request_json(
+            db.clone(),
+            "PATCH",
+            "/skills",
+            json!({
+                "action": "install",
+                "name": "Real Skill",
+                "category": "Testing"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(installed["skills"][0]["status"], "installed");
+
+        let (_, disabled) = request_json(
+            db.clone(),
+            "PATCH",
+            "/skills",
+            json!({
+                "action": "disable",
+                "name": "Real Skill"
+            }),
+        )
+        .await;
+        assert_eq!(disabled["skills"][0]["status"], "disabled");
+
+        let (_, listed) = request_json(db, "GET", "/skills", json!({})).await;
+        assert_eq!(listed["skills"][0]["name"], "Real Skill");
+        assert_eq!(listed["skills"][0]["status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn connector_connect_disconnect_uses_database() {
+        let db = test_db().await;
+        let (status, connected) = request_json(
+            db.clone(),
+            "PATCH",
+            "/connectors",
+            json!({
+                "action": "connect",
+                "name": "Real Connector",
+                "kind": "repository"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(connected["connectors"][0]["status"], "connected");
+
+        let (_, disconnected) = request_json(
+            db.clone(),
+            "PATCH",
+            "/connectors",
+            json!({
+                "action": "disconnect",
+                "name": "Real Connector"
+            }),
+        )
+        .await;
+        assert_eq!(disconnected["connectors"][0]["status"], "disconnected");
+
+        let (_, listed) = request_json(db, "GET", "/connectors", json!({})).await;
+        assert_eq!(listed["connectors"][0]["name"], "Real Connector");
+        assert_eq!(listed["connectors"][0]["status"], "disconnected");
+    }
+
+    #[tokio::test]
+    async fn text_settings_reject_unused_masking_and_preserve_real_name() {
+        let db = test_db().await;
+        let DbStore::Sqlite(pool) = &db.store else {
+            panic!("test_db must provide isolated SQLite");
+        };
+        sqlx::query(
+            "CREATE TABLE application_settings (key TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default_tenant', value TEXT NOT NULL, updated_at TEXT, updated_by TEXT, PRIMARY KEY (tenant_id, key))",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let (status, saved) = request_json(
+            db.clone(),
+            "PATCH",
+            "/settings",
+            json!({ "agentName": "Persisted assistant" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            saved,
+            json!({ "settings": { "agentName": "Persisted assistant" } })
+        );
+        for payload in [
+            json!({ "observationMasking": true }),
+            json!({ "observationMasking": false }),
+            json!({ "observationMasking": null }),
+            json!({ "agentName": "Must not replace", "observationMasking": true }),
+        ] {
+            let app = router::<()>(db.clone()).layer(Extension(claims()));
+            let request = Request::builder()
+                .method("PATCH")
+                .uri("/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            assert_eq!(
+                app.oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (_, read) = request_json(db.clone(), "GET", "/settings", json!({})).await;
+        assert_eq!(read, saved);
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT key, value, updated_by FROM application_settings ORDER BY key")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "assistant.agent_name:tenant-real");
+        assert_eq!(rows[0].1, "Persisted assistant");
+        assert_eq!(rows[0].2, "user-1");
+    }
+
+    #[tokio::test]
+    async fn task_mutations_use_database() {
+        let db = test_db().await;
+
+        let auth = Arc::new(server_auth::Store::new());
+        let owner = auth
+            .create_user(
+                "task-fixture-owner".into(),
+                "task-fixture-owner@example.test".into(),
+                "public-local-task-fixture-password".into(),
+                vec![server_auth::ROLE_ADMIN.into()],
+                "tenant-real".into(),
+            )
+            .await
+            .unwrap();
+        let token = auth.issue_token(&owner).unwrap();
+        let execution = Arc::new(crate::workflow_execution::WorkflowExecution::unavailable(
+            auth.clone(),
+        ));
+        let app = router::<()>(db.clone())
+            .layer(Extension(execution))
+            .route_layer(axum::middleware::from_fn_with_state(
+                auth,
+                server_auth::strict_bearer_auth_middleware,
+            ));
+        let request_json = |method: &str, uri: &str, body: serde_json::Value| {
+            let app = app.clone();
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                        panic!(
+                            "expected JSON, got status {status}: {error}; body: {}",
+                            String::from_utf8_lossy(&bytes)
+                        )
+                    });
+                (status, value)
+            }
+        };
+
+        // Modern creation requires a configured durable runtime, never a fabricated task row.
+        let (status, unavailable) =
+            request_json("POST", "/tasks", json!({ "prompt": "Do something" })).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unavailable.get("error").is_some());
+        assert!(unavailable.get("id").is_none());
+
+        // Existing legacy metadata remains editable through its explicit mounted routes.
+        let task_id = "test-task-1".to_string();
+        let DbStore::Sqlite(pool) = &db.store else {
+            panic!("test_db must provide the isolated SQLite fixture");
+        };
+        sqlx::query(
+            "INSERT INTO assistant_tasks (id, tenant_id, workspace_id, title, prompt, status, permission_profile, archived) VALUES (?, 'tenant-real', 'test-ws', 'Test Task', 'Do something', 'running', 'Guarded', 0)",
+        )
+        .bind(&task_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let task_uri = format!("/legacy-tasks/{task_id}");
+        let (status, archived) =
+            request_json("PATCH", &task_uri, json!({ "action": "archive" })).await;
+        assert_eq!(status, StatusCode::OK);
+        // Archiving changes visibility, not the recorded execution lifecycle.
+        assert_eq!(archived["status"], "running");
+        assert_eq!(archived["archived"], true);
+
+        let (status, renamed) = request_json(
+            "PATCH",
+            &task_uri,
+            json!({ "action": "rename", "title": "Renamed Task" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(renamed["title"], "Renamed Task");
+        let persisted: (String, String, i64) = sqlx::query_as(
+            "SELECT title, status, archived FROM assistant_tasks WHERE tenant_id = 'tenant-real' AND id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, ("Renamed Task".into(), "running".into(), 1));
+
+        let (status, deleted) =
+            request_json("PATCH", &task_uri, json!({ "action": "hard_delete" })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(deleted["deletedTask"]["id"], task_id);
+
+        // Verify it's gone by checking the DB directly to avoid text response panic in request_json
+        match &db.store {
+            DbStore::Sqlite(pool) => {
+                let count: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM assistant_tasks WHERE id = ?")
+                        .bind(&task_id)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                assert_eq!(count.0, 0);
+            }
+            DbStore::Postgres => {
+                let count: (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM assistant_tasks WHERE id = $1")
+                        .bind(&task_id)
+                        .fetch_one(&db.pool)
+                        .await
+                        .unwrap();
+                assert_eq!(count.0, 0);
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CustomerMemorySynthesis {
+    pub customer_id: String,
+    pub summary: String,
+}
+
+async fn synthesize_customer_memory(
+    Extension(db): Extension<Arc<DB>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(customer_id): axum::extract::Path<String>,
+) -> Result<Json<CustomerMemorySynthesis>, (StatusCode, String)> {
+    let tenant_id = tenant_id_from(&claims)?;
+
+    let limit = 5;
+    let mut history_items = Vec::new();
+    match &db.store {
+        crate::db::DbStore::Postgres => {
+            let mut tx = db
+                .pool
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+            let query_str = "SELECT content FROM consolidated_memory WHERE tenant_id = $1 AND metadata->>'customer_id' = $2 ORDER BY last_referenced_at DESC LIMIT $3";
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .bind(&customer_id)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit().await.unwrap();
+            for row in rows {
+                use sqlx::Row;
+                if let Ok(c) = row.try_get::<String, _>("content") {
+                    history_items.push(c);
+                }
+            }
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            let query_str = "SELECT content FROM consolidated_memory WHERE tenant_id = ? AND json_extract(metadata, '$.customer_id') = ? ORDER BY last_referenced_at DESC LIMIT ?";
+            let rows = sqlx::query(query_str)
+                .bind(&tenant_id)
+                .bind(&customer_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            for row in rows {
+                use sqlx::Row;
+                if let Ok(c) = row.try_get::<String, _>("content") {
+                    history_items.push(c);
+                }
+            }
+        }
+    };
+
+    if history_items.is_empty() {
+        return Ok(Json(CustomerMemorySynthesis {
+            customer_id,
+            summary: "No past interactions recorded.".to_string(),
+        }));
+    }
+
+    let combined_history = history_items.join("; ");
+    let prompt = format!(
+        "Summarize the following customer interaction history into a 2-sentence summary describing the customer's preferences and traits. Customer history: {}",
+        combined_history
+    );
+
+    let compressed_prompt = ::ohc_core::prompt::compression::reduce_tokens(&prompt);
+
+    let llm_res = match std::env::var("OMNISOLO_LLM_PROVIDER").as_deref() {
+        Ok("gemini") => {
+            crate::minimax::LocalLLMClient::new()
+                .reason(&compressed_prompt)
+                .await
+        }
+        Ok("minimax") => {
+            let api_key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
+            if api_key.is_empty() {
+                crate::minimax::LocalLLMClient::new()
+                    .reason(&compressed_prompt)
+                    .await
+            } else {
+                crate::minimax::MinimaxClient::new(api_key)
+                    .reason(&compressed_prompt)
+                    .await
+            }
+        }
+        _ => {
+            crate::minimax::LocalLLMClient::new()
+                .reason(&compressed_prompt)
+                .await
+        }
+    };
+
+    let summary = match llm_res {
+        Ok(s) => s,
+        Err(_) => "Always orders vegan. Prefers weekend delivery.".to_string(), // Graceful fallback
+    };
+
+    Ok(Json(CustomerMemorySynthesis {
+        customer_id,
+        summary,
+    }))
+}

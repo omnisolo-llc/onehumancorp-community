@@ -1,0 +1,48 @@
+import {
+  proxyBackendRequest,
+  stripBrowserIdentityJsonRequestBody,
+} from "@/lib/auth/backendTransport";
+import { isPublicationOwnerPath, proxyPublicationOwnerRequest } from "@/lib/auth/publicationRequest";
+
+type RouteContext = { params: Promise<{ path: string[] }> };
+
+function backendPath(path: string[]): string | null {
+  if (
+    path.length === 0 ||
+    path.some(
+      (segment) =>
+        segment === "." ||
+        segment === ".." ||
+        !/^[A-Za-z0-9._~-]{1,128}$/.test(segment),
+    )
+  ) {
+    return null;
+  }
+  return `/api/v1/${path.join("/")}`;
+}
+
+async function proxy(request: Request, context: RouteContext): Promise<Response> {
+  const path = backendPath((await context.params).path);
+  if (path === null) {
+    return Response.json({ error: "invalid API path" }, { status: 400 });
+  }
+  if (isPublicationOwnerPath(path)) return proxyPublicationOwnerRequest(request, path);
+  const hasRequestBody = request.method !== "GET" && request.method !== "HEAD";
+  const isJson = request.headers
+    .get("content-type")
+    ?.toLowerCase()
+    .startsWith("application/json");
+  const streamResponse = /^\/api\/v1\/agents\/(?:metrics\/stream|[A-Za-z0-9._~-]+\/stream|orchestrate)$/.test(path);
+  return proxyBackendRequest(request, path, {
+    forwardQuery: request.method === "GET" || request.method === "HEAD",
+    ...(streamResponse ? { streamResponse: true as const } : {}),
+    ...(isJson && hasRequestBody ? { transformRequestBody: stripBrowserIdentityJsonRequestBody } : {}),
+  });
+}
+
+export const GET = proxy;
+export const HEAD = proxy;
+export const POST = proxy;
+export const PUT = proxy;
+export const PATCH = proxy;
+export const DELETE = proxy;

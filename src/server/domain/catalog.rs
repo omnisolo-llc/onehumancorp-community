@@ -1,0 +1,67 @@
+use serde_json::Value;
+use sqlx::{Executor, PgPool, Postgres};
+
+pub async fn handle_create_product(
+    tenant_id: &str,
+    payload: &Value,
+    pool: &PgPool,
+) -> Result<(), sqlx::Error> {
+    create_product_on(tenant_id, payload, pool)
+        .await
+        .map(|_| ())
+}
+
+/// The queued local action supplies its tenant-scoped, authority-owned
+/// transaction. The legacy pool API above keeps its existing caller contract.
+pub(crate) async fn create_product_on<'e, E>(
+    tenant_id: &str,
+    payload: &Value,
+    executor: E,
+) -> Result<String, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let title = payload
+        .get("title")
+        .or_else(|| payload.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("New Product");
+    let description = payload
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let price = payload.get("price");
+    let price_f64 = price
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .or_else(|| price.and_then(Value::as_f64))
+        .unwrap_or(0.0);
+
+    let price_cents = (price_f64 * 100.0).round() as i64;
+    let item_type = payload
+        .get("item_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Product");
+    let product_id = uuid::Uuid::new_v4().to_string();
+
+    tracing::info!(
+        "Creating product via action_router for tenant: {}, title: {}",
+        tenant_id,
+        title
+    ); // pii-safe
+
+    sqlx::query(
+        "INSERT INTO products (id, tenant_id, title, description, type, price_cents, inventory_count, is_subscribable, subscription_frequency, subscription_discount_percent) VALUES ($1, $2, $3, $4, $5, $6, 100, false, null, 0)"
+    )
+    .bind(&product_id)
+    .bind(tenant_id)
+    .bind(title)
+    .bind(description)
+    .bind(item_type)
+    .bind(price_cents)
+    .execute(executor)
+    .await?;
+
+    Ok(product_id)
+}

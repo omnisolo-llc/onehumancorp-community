@@ -1,0 +1,1457 @@
+'use client';
+import React,{ useCallback,useEffect,useMemo,useState,useId,useRef } from 'react';
+import Link from 'next/link';
+import { useTenantAnalysis } from './useTenantAnalysis';
+import { AgentMetrics } from './components/AgentMetrics';
+import { AgentWorkflowBuilder } from './components/AgentWorkflowBuilder';
+import { InteractiveWalkthrough,WalkthroughTarget } from '../../components/Walkthrough';
+import { WithTooltip } from '../../components/TooltipRegistry';
+import { useProPlan } from '../components/useProPlan';
+import { useAuthenticatedPolling } from '../../hooks/useAuthenticatedPolling';
+import {
+connectors,
+expertTeams,
+experts,
+exploreTemplates,remoteAssistants,
+skillMarket,
+type ExpertCatalogItem
+} from './catalog';
+type Panel =
+  | 'browse'
+  | 'teams'
+  | 'skills'
+  | 'connectors'
+  | 'automations'
+  | 'memory'
+  | 'results'
+  | 'operations'
+  | 'workflows'
+  | 'feed'
+  | 'approvals'
+  | 'explore'
+  | 'remote'
+  | 'data';
+type Mode = 'Ask' | 'Craft' | 'Plan';
+type ReadState = 'unverified' | 'loading' | 'ready' | 'unavailable';
+function RecordReadNotice({ state }: { state: ReadState }) {
+  return <p role="status" className="p-4 text-sm">{state === 'unavailable' ? 'Agent records are unavailable. Their current state has not been verified.' : state === 'loading' ? 'Loading current agent records…' : 'Verify your session before reading agent records.'}</p>;
+}
+type WorkflowRecord = {
+  id: string;
+  name: string;
+  workflow: string;
+  task: string;
+  status: string;
+  command?: string;
+  output?: string;
+  error?: string;
+};
+type ApprovalItem = {
+  id: string;
+  department: string;
+  description: string;
+  status: string;
+};
+function isWorkflow(value: unknown): value is WorkflowRecord {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return ['id', 'name', 'workflow', 'task'].every(key => typeof row[key] === 'string') && typeof row.status === 'string' && ['queued', 'running', 'completed', 'failed', 'cancelled', 'outcome_unknown'].includes(row.status) && ['command', 'output', 'error'].every(key => row[key] == null || typeof row[key] === 'string');
+}
+function isApproval(value: unknown): value is ApprovalItem {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return ['id', 'department', 'description', 'status'].every(key => typeof row[key] === 'string');
+}
+const departments = [
+  { id: 'operations', name: 'The Manager', role: 'Operations', description: 'Inventory, orders, fulfillment, and handoffs.', status: 'Active' },
+  { id: 'customer_success', name: 'The Ambassador', role: 'Customer Success', description: 'Customer replies, loyalty, review recovery, and escalations.', status: 'Active' },
+  { id: 'marketing', name: 'The Promoter', role: 'Marketing', description: 'Posts, promos, campaigns, and brand voice.', status: 'Active' },
+  { id: 'sales', name: 'The Closer', role: 'Sales', description: 'Quotes, follow-ups, pipeline cleanup, and win-back actions.', status: 'Active' },
+  { id: 'finance', name: 'The Accountant', role: 'Finance', description: 'Invoices, margins, budgets, and cash-flow checks.', status: 'Guarded' },
+  { id: 'legal', name: 'The Counsel', role: 'Legal', description: 'Contracts, compliance, and approval-only risk review.', status: 'Approval only' },
+];
+const modelOptions = ['MiniMax-M3', 'Auto', 'OpenAI GPT-4.1', 'Claude Sonnet', 'Local Ollama'];
+const workspaces = ['No workspace access', 'Current business', 'Marketing sprint', 'Finance review', 'Customer support'];
+const resultTabs = ['Artifacts', 'All files', 'Diffs', 'Preview'];
+function slugTestId(id: string) {
+  return `expert-card-${id}`;
+}
+function itemInitials(name: string) {
+  return name
+    .split(' ')
+    .map((part) => part[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
+}
+function SectionHeader({ title, detail }: { title: string; detail?: string }) {
+  return (
+    <div className="mb-4 flex items-end justify-between gap-3">
+      <div>
+        <h2 className="text-xl font-bold text-zinc-950">{title}</h2>
+        {detail && <p className="mt-1 text-sm text-zinc-600">{detail}</p>}
+      </div>
+    </div>
+  );
+}
+function StatusPill({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">
+      {children}
+    </span>
+  );
+}
+export default function AgentsPage() {
+  const [panel, setPanel] = useState<Panel>('browse');
+  const [selectedDepartment, setSelectedDepartment] = useState<string | null>(null);
+  const [selected, setSelected] = useState<ExpertCatalogItem>(experts[0]);
+  const [mode, setMode] = useState<Mode>('Ask');
+  const [model, setModel] = useState('Auto');
+  const [workspace, setWorkspace] = useState('No workspace access');
+  const [taskPrompt, setTaskPrompt] = useState('Create a practical operating plan and assign next actions.');
+  const [summonMessage, setSummonMessage] = useState('Growth Strategist is ready');
+  const [runMessage, setRunMessage] = useState('');
+  const [runError, setRunError] = useState('');
+  const [isWalkthroughOpen, setIsWalkthroughOpen] = useState(false);
+
+  const walkthroughSteps: import('../../components/Walkthrough').Step[] = [
+    { targetId: 'agents-composer-title', title: 'Task Composer', content: 'Assign tasks to your AI Agent here.' },
+    { targetId: 'activate-agent-btn', title: 'Activate your AI Support Agent', content: 'Click here to activate your AI Support Agent.' }
+  ];
+  const [workflows, setWorkflows] = useState<WorkflowRecord[]>([]);
+  const [workflowCursors, setWorkflowCursors] = useState<Array<string | null>>([null]);
+  const [nextWorkflowCursor, setNextWorkflowCursor] = useState<string | null>(null);
+  const [resultRecord, setResultRecord] = useState<WorkflowRecord | undefined>();
+  const workflowCursor = workflowCursors.at(-1) ?? null;
+  const [readState, setReadState] = useState<ReadState>('unverified');
+  const [feed, setFeed] = useState<ApprovalItem[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
+  const [query, setQuery] = useState('');
+  const [enabledSkills, setEnabledSkills] = useState<string[]>([]);
+  const [enabledConnectors, setEnabledConnectors] = useState<string[]>([]);
+  const [selectedResultTab, setSelectedResultTab] = useState('Artifacts');
+  const { hasPro, currentPlan, planError, claimTrial, claimError } = useProPlan();
+  const proPlanStatusId = useId();
+  const [proModeActive, setProModeActive] = useState(true);
+  const [showPaywall, setShowPaywall] = useState(false);
+  const isProModeEnabled = currentPlan !== null && hasPro && proModeActive;
+  const [contextReferences, setContextReferences] = useState('');
+  const [attachments, setAttachments] = useState('');
+  const [customProvider, setCustomProvider] = useState('');
+  const [workDirectory, setWorkDirectory] = useState('');
+  const [outputFormat, setOutputFormat] = useState('Brief');
+  const [taskConstraints, setTaskConstraints] = useState('');
+  const allCatalog = useMemo(() => [...experts, ...expertTeams], []);
+  const visibleExperts = useMemo(() => {
+    const source = panel === 'teams' ? expertTeams : experts;
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return source;
+    return source.filter((item) =>
+      [item.name, item.role, item.category, item.summary, ...item.strengths].join(' ').toLowerCase().includes(normalized),
+    );
+  }, [panel, query]);
+  const mostUsed = useMemo(
+    () => [...allCatalog].sort((a, b) => b.usageCount - a.usageCount).slice(0, 3),
+    [allCatalog],
+  );
+  const reads = useRef(0);
+  const retireView = useCallback(() => {
+    reads.current += 1; setWorkflowCursors([null]); setNextWorkflowCursor(null); setResultRecord(undefined); setWorkflows([]); setFeed([]); setApprovals([]); setPanel('browse'); setQuery(''); setOutputFormat('Brief'); setReadState('unverified');
+    setRunMessage(''); setRunError(''); setTaskPrompt(''); setContextReferences(''); setAttachments('');
+    setCustomProvider(''); setWorkDirectory(''); setTaskConstraints('');
+    setModel('Auto'); setMode('Ask'); setWorkspace('No workspace access'); setEnabledSkills([]); setEnabledConnectors([]); setProModeActive(true);
+  }, []);
+  const execution = useTenantAnalysis(retireView);
+  const { readSnapshot, revision, ready } = execution;
+  const fetchAll = useCallback(async () => {
+    if (!ready) return;
+    const sequence = ++reads.current; setReadState('loading');
+    try {
+      const [approvalsData, feedData, workflowsData] = await Promise.all([
+        readSnapshot('/api/v1/agents/approvals'), readSnapshot('/api/v1/agents/approvals/activity'), readSnapshot(workflowCursor ? `/api/v1/agents/workflows?before=${encodeURIComponent(workflowCursor)}` : '/api/v1/agents/workflows'),
+      ]) as [{ pending_approvals?: unknown }, { pending_approvals?: unknown }, { workflows?: unknown; next_cursor?: unknown }];
+      if (sequence !== reads.current) return;
+      if (!Array.isArray(approvalsData.pending_approvals) || !Array.isArray(feedData.pending_approvals) || !Array.isArray(workflowsData.workflows) || !approvalsData.pending_approvals.every(isApproval) || !feedData.pending_approvals.every(isApproval) || !workflowsData.workflows.every(isWorkflow)) throw new Error('Invalid agent data');
+      const cursor = workflowsData.next_cursor;
+      if (cursor != null && (typeof cursor !== 'string' || !/^[0-9]{1,12}:[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(cursor) || cursor === workflowCursor || workflowsData.workflows.length === 0)) throw new Error('Invalid workflow cursor');
+      let focused = workflowsData.workflows.find(item => item.id === runMessage);
+      if (runMessage && !focused) {
+        try {
+          const detail = await readSnapshot(`/api/v1/agents/workflows/${runMessage}`) as {workflow?: unknown};
+          if (isWorkflow(detail?.workflow) && detail.workflow.id === runMessage) focused = detail.workflow;
+        } catch { /* A missing detail never invents a result or hides valid history. */ }
+      }
+      if (sequence !== reads.current) return;
+      setResultRecord(focused); setNextWorkflowCursor(typeof cursor === 'string' ? cursor : null);
+      setApprovals(approvalsData.pending_approvals); setFeed(feedData.pending_approvals); setWorkflows(workflowsData.workflows); setReadState('ready');
+    } catch {
+      if (sequence === reads.current) { setReadState('unavailable'); setRunError('Could not refresh agent records. No empty or successful result has been inferred.'); }
+    }
+  }, [readSnapshot, ready, workflowCursor, runMessage]);
+  useEffect(() => { void fetchAll(); return () => { reads.current += 1; }; }, [fetchAll, revision]);
+  useAuthenticatedPolling({ onPoll: fetchAll, enabled: ready });
+  const unsupported = mode !== 'Ask' || workspace !== 'No workspace access' || enabledSkills.length > 0 || enabledConnectors.length > 0 || !!contextReferences.trim() || !!attachments.trim() || !!customProvider.trim() || !!workDirectory.trim() || outputFormat !== 'Brief' || !!taskConstraints.trim() || selected.kind === 'team';
+  const modelUnavailable = model !== 'Auto' && model !== execution.policy?.model;
+  const executionReason = unsupported ? 'Workspace, tools, connectors, attachments, custom endpoints, teams and advanced output options are not supported by text analysis. Clear those options before submitting.' : modelUnavailable ? 'Select Auto or the configured model for text analysis.' : execution.notice;
+  const canStart = execution.ready && !!execution.policy && !execution.busy && !execution.held && !unsupported && !modelUnavailable && !!taskPrompt.trim() && [...taskPrompt].length <= 16000;
+  function summon(item: ExpertCatalogItem) {
+    setSelected(item); setModel('Auto'); setEnabledSkills([]); setEnabledConnectors([]);
+    setTaskPrompt(item.examples[0]); setSummonMessage(`${item.name} is ready`);
+  }
+  async function startTask() {
+    if (!canStart) return;
+    setRunError('');
+    await execution.start({ name: selected.name, role: selected.role, model, task: taskPrompt });
+  }
+  useEffect(() => {
+    if (execution.receipt) { setRunMessage(execution.receipt.workflow_id); setPanel('results'); }
+  }, [execution.receipt]);
+  async function startWorkflow(name: string, task: string) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(task); } catch { /* Plain text is the supported input. */ }
+    if (parsed && typeof parsed === 'object' && 'nodes' in parsed) throw new Error('Visual workflows are not supported by text analysis. No task was submitted.');
+    const accepted = await execution.start({ name, role: 'Text analyst', model: 'Auto', task });
+    if (!accepted) throw new Error('Task acceptance was not confirmed. Review the composer status before trying again.');
+  }
+  async function decideApproval(id: string, approved: boolean) {
+    try {
+      const res = await fetch(`/api/v1/agents/approvals/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approved }),
+      });
+      if (res.ok) {
+        setApprovals((current) => current.filter((item) => item.id !== id));
+      }
+    } catch (err) {
+      console.error('Failed to process approval:', err);
+    }
+  }
+  return (
+    <div className="min-h-screen w-full min-w-0 max-w-full overflow-x-hidden bg-stone-50 dark:bg-zinc-950 text-zinc-950 dark:text-zinc-50 transition-colors duration-200">
+      <InteractiveWalkthrough steps={walkthroughSteps} isOpen={isWalkthroughOpen} onClose={() => setIsWalkthroughOpen(false)} />
+      <header className="min-w-0 max-w-full border-b border-zinc-200 dark:border-zinc-850 bg-white/70 dark:bg-zinc-900/70 backdrop-blur-[30px] sticky top-0 z-30">
+        <div className="mx-auto flex w-full min-w-0 max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6 lg:px-8">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <Link href="/dashboard" className="text-sm font-bold text-teal-600 dark:text-teal-400 hover:underline">
+                ← Back to Dashboard
+              </Link>
+              <div className="flex items-center gap-4"><h1 className="mt-2 text-3xl font-extrabold tracking-tight text-zinc-900 dark:text-white">AI Departments</h1><button id="assistant-walkthrough-btn" onClick={() => setIsWalkthroughOpen(true)} className="px-3 py-1.5 text-sm bg-teal-50 text-teal-700 rounded-lg hover:bg-teal-100 font-semibold transition-colors mt-2">Start Tour</button></div>
+              <h2 className="mt-1 text-sm font-bold text-zinc-500 dark:text-zinc-400">Expert Center</h2>
+              <p className="mt-1 max-w-3xl text-sm text-zinc-600 dark:text-zinc-450">
+                Browse task templates and submit text analysis to the configured provider. Workspace actions, expert teams, skills and connectors are not executable in this view.
+              </p>
+            </div>
+            <div className="space-y-3">
+              <div className="flex items-center justify-end gap-2">
+                <span className="text-xs font-semibold uppercase text-zinc-500 dark:text-zinc-400">Pro Mode</span>
+                <button
+                  type="button"
+                  aria-label="Toggle Pro Mode"
+                  aria-pressed={currentPlan === null ? 'mixed' : isProModeEnabled}
+                  aria-busy={currentPlan === null && !planError}
+                  aria-describedby={proPlanStatusId}
+                  disabled={currentPlan === null}
+                  onClick={() => {
+                    if (currentPlan === null) return;
+                    if (!hasPro) setShowPaywall(true);
+                    else setProModeActive((active) => !active);
+                  }}
+                  className={`h-6 w-10 rounded-full p-1 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-teal-500 focus-visible:ring-offset-2 ${isProModeEnabled ? 'bg-teal-600' : 'bg-zinc-300 dark:bg-zinc-700'}`}
+                >
+                  <span className={`block h-4 w-4 rounded-full bg-white transition-transform ${isProModeEnabled ? 'translate-x-4' : ''}`} />
+                </button>
+              </div>
+              <p id={proPlanStatusId} role="status" aria-label="Pro Mode readiness" className="text-right text-xs text-zinc-500 dark:text-zinc-400">
+                {currentPlan === null
+                  ? planError ?? 'Checking current plan…'
+                  : hasPro && !proModeActive
+                    ? `Current plan: ${currentPlan} (Pro Mode paused)`
+                    : `Current plan: ${currentPlan}`}
+              </p>
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur px-3 py-2">
+                  <div className="text-lg font-bold text-zinc-900 dark:text-white">{allCatalog.length}</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Experts</div>
+                </div>
+                <div className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur px-3 py-2">
+                  <div className="text-lg font-bold text-zinc-900 dark:text-white">{skillMarket.length}</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Skills</div>
+                </div>
+                <div className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur px-3 py-2">
+                  <div className="text-lg font-bold text-zinc-900 dark:text-white">{connectors.length}</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Connectors</div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <nav className="flex w-full min-w-0 max-w-full gap-2 overflow-x-auto pb-1 custom-scrollbar" aria-label="Agent feature sections">
+            {[
+              ['browse', 'Browse experts'],
+              ['teams', 'Expert Teams'],
+              ['skills', 'Skills'],
+              ['connectors', 'Connectors'],
+              ['automations', 'Automations'],
+              ['memory', 'Memory'],
+              ['explore', 'Templates'],
+              ['results', 'Results'],
+              ['feed', 'Activity Feed'],
+              ['approvals', 'Needs Approval'],
+              ['operations', 'My Team'],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => { setPanel(id as Panel); if (id === 'operations') setSelectedDepartment(null); }}
+                aria-pressed={panel === id}
+                aria-label={label}
+                aria-describedby={id === 'approvals' && approvals.length > 0 ? 'agent-pending-approvals-count' : undefined}
+                className={`whitespace-nowrap rounded-full px-4 py-2 text-sm font-semibold transition-all border outline-none ${
+                  panel === id
+                    ? 'border-teal-600 bg-teal-600 text-white shadow-sm'
+                    : 'border-zinc-200 dark:border-zinc-800 bg-white/80 dark:bg-zinc-900/80 text-zinc-700 dark:text-zinc-300 hover:border-teal-300 dark:hover:border-teal-700'
+                }`}
+              >
+                {label}
+                {id === 'approvals' && approvals.length > 0 && <span id="agent-pending-approvals-count"> ({approvals.length}) <span className="sr-only">pending approvals</span></span>}
+              </button>
+            ))}
+          </nav>
+          <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-250/70 dark:border-zinc-800/70 bg-zinc-50/50 dark:bg-zinc-900/50 px-4 py-2 text-sm text-zinc-700 dark:text-zinc-300">
+            <span className="font-bold text-zinc-900 dark:text-white">Operational team:</span>
+            <button type="button" onClick={() => { setPanel('operations'); setSelectedDepartment('operations'); }} aria-pressed={panel === 'operations' && selectedDepartment === 'operations'} className="bg-zinc-200/80 dark:bg-zinc-800/80 px-2 py-0.5 rounded-md text-xs font-semibold cursor-pointer"><span>The Manager</span></button>
+            <button type="button" onClick={() => { setPanel('operations'); setSelectedDepartment('customer_success'); }} aria-pressed={panel === 'operations' && selectedDepartment === 'customer_success'} className="bg-zinc-200/80 dark:bg-zinc-800/80 px-2 py-0.5 rounded-md text-xs font-semibold cursor-pointer"><span>The Ambassador</span></button>
+            <button type="button" onClick={() => { setPanel('operations'); setSelectedDepartment('marketing'); }} aria-pressed={panel === 'operations' && selectedDepartment === 'marketing'} className="bg-zinc-200/80 dark:bg-zinc-800/80 px-2 py-0.5 rounded-md text-xs font-semibold cursor-pointer"><span>The Promoter</span></button>
+          </div>
+        </div>
+      </header>
+      {showPaywall && currentPlan !== null && !hasPro && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/60 backdrop-blur-[30px] saturate-[210%] p-4">
+          <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 p-6 shadow-2xl">
+            <h2 className="text-2xl font-bold text-zinc-950 dark:text-white">Upgrade to Pro</h2>
+            <p className="mt-2 text-sm text-zinc-650 dark:text-zinc-400">Unlock advanced model routing, connector automation, and higher agent budgets.</p>
+            <Link href="/settings" className="mt-4 block rounded-xl bg-teal-600 hover:bg-teal-700 px-4 py-3 text-center text-sm font-bold text-white transition-colors">
+              Upgrade to Pro
+            </Link>
+            <button
+              type="button"
+              onClick={async () => {
+                await claimTrial();
+              }}
+              className="mt-3 w-full rounded-xl border border-amber-250 bg-amber-50/50 dark:bg-amber-900/25 px-4 py-3 text-sm font-bold text-amber-900 dark:text-amber-200 hover:bg-amber-100/50 dark:hover:bg-amber-900/40 transition-colors"
+            >
+              Check trial availability
+            </button>
+            {claimError && <p className="mt-2 text-sm text-red-600" role="alert">{claimError}</p>}
+            <button type="button" onClick={() => setShowPaywall(false)} className="mt-3 w-full text-sm font-semibold text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-300">
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+      <main className="mx-auto grid w-full min-w-0 max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_380px] lg:px-8">
+        <section className="min-w-0 max-w-full space-y-6">
+          {(panel === 'browse' || panel === 'teams') && (
+            <CatalogPanel
+              panel={panel}
+              query={query}
+              setQuery={setQuery}
+              visibleExperts={visibleExperts}
+              mostUsed={mostUsed}
+              summon={summon}
+            />
+          )}
+          {panel === 'skills' && (
+            <SkillsPanel enabledSkills={enabledSkills} setEnabledSkills={setEnabledSkills} />
+          )}
+          {panel === 'connectors' && (
+            <ConnectorsPanel enabledConnectors={enabledConnectors} setEnabledConnectors={setEnabledConnectors} />
+          )}
+          {panel === 'automations' && <AutomationsPanel />}
+          {panel === 'memory' && <MemoryPanel />}
+          {panel === 'results' && (
+            <ResultsPanel
+              selected={selected}
+              workflowId={runMessage}
+              record={readState === 'ready' ? resultRecord : undefined}
+              resultTab={selectedResultTab}
+              setResultTab={setSelectedResultTab}
+            />
+          )}
+          {panel === 'explore' && <ExplorePanel summon={summon} />}
+          {panel === 'remote' && <RemotePanel />}
+          {panel === 'data' && <DataPanel />}
+          {panel === 'operations' && <><OperationsPanel selectedId={selectedDepartment} showAll={() => setSelectedDepartment(null)} /><AgentMetrics /></>}
+          {panel === 'workflows' && <WorkflowsPanel readState={readState} workflows={workflows} onSave={startWorkflow} older={nextWorkflowCursor ? () => setWorkflowCursors(values => [...values, nextWorkflowCursor]) : undefined} newer={workflowCursors.length > 1 ? () => setWorkflowCursors(values => values.slice(0, -1)) : undefined} />}
+          {panel === 'feed' && <FeedPanel readState={readState} feed={feed} />}
+          {panel === 'approvals' && <ApprovalsPanel readState={readState} approvals={approvals} decideApproval={decideApproval} />}
+        </section>
+        <aside className="min-w-0 max-w-full space-y-5">
+          <ComposerPanel
+            mode={mode}
+            setMode={setMode}
+            model={model}
+            setModel={setModel}
+            workspace={workspace}
+            setWorkspace={setWorkspace}
+            taskPrompt={taskPrompt}
+            setTaskPrompt={setTaskPrompt}
+            enabledSkills={enabledSkills}
+            enabledConnectors={enabledConnectors}
+            summonMessage={summonMessage}
+            running={execution.busy}
+            canStart={canStart}
+            executionReason={executionReason}
+            configuredModel={execution.policy?.model}
+            runError={runError}
+            runMessage={runMessage}
+            contextReferences={contextReferences}
+            setContextReferences={setContextReferences}
+            attachments={attachments}
+            setAttachments={setAttachments}
+            customProvider={customProvider}
+            setCustomProvider={setCustomProvider}
+            workDirectory={workDirectory}
+            setWorkDirectory={setWorkDirectory}
+            outputFormat={outputFormat}
+            setOutputFormat={setOutputFormat}
+            taskConstraints={taskConstraints}
+            setTaskConstraints={setTaskConstraints}
+            startTask={startTask}
+          />
+          {execution.receipt && <button type="button" onClick={execution.startAnother} disabled={execution.busy} className="text-sm underline">Prepare another task</button>}
+          <ResultsPanel
+            selected={selected}
+            workflowId={runMessage}
+            record={readState === 'ready' ? resultRecord : undefined}
+            resultTab={selectedResultTab}
+            setResultTab={setSelectedResultTab}
+            compact
+          />
+          <ExtensionShortcuts setPanel={setPanel} />
+        </aside>
+      </main>
+    </div>
+  );
+}
+function CatalogPanel({
+  panel,
+  query,
+  setQuery,
+  visibleExperts,
+  mostUsed,
+  summon,
+}: {
+  panel: Panel;
+  query: string;
+  setQuery: (value: string) => void;
+  visibleExperts: ExpertCatalogItem[];
+  mostUsed: ExpertCatalogItem[];
+  summon: (item: ExpertCatalogItem) => void;
+}) {
+  const featuredScenarios = [
+    {
+      title: "Content Creation",
+      desc: "Specialists in posts, copy matching, and social outreach.",
+      tag: "Marketing",
+      team: "Product Swarm",
+      members: ["Growth Strategist", "Customer Ambassador"]
+    },
+    {
+      title: "Investment Analysis",
+      desc: "Financial margins, Scenario audits, and growth margins.",
+      tag: "Finance",
+      team: "Revenue Swarm",
+      members: ["Finance Controller", "Revenue Strategist"]
+    },
+    {
+      title: "Legal & Compliance",
+      desc: "Legal review, safety checks, and regulatory policy gates.",
+      tag: "Legal",
+      team: "Corporate Counsel",
+      members: ["Operations Manager", "Policy Checker"]
+    },
+    {
+      title: "Operations & Supply",
+      desc: "Order dispatch, stock recovery, and team workspace handoffs.",
+      tag: "Ops",
+      team: "Operations Swarm",
+      members: ["Operations Manager", "Customer Ambassador"]
+    }
+  ];
+
+  return (
+    <>
+      {/* Featured Scenarios Carousel */}
+      <div className="w-full min-w-0 max-w-full rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-6 shadow-sm">
+        <h3 className="text-lg font-bold text-zinc-900 dark:text-white mb-4">Featured Scenarios</h3>
+        <div className="flex w-full min-w-0 max-w-full gap-4 overflow-x-auto pb-2 scrollbar-thin scrollbar-thumb-zinc-350 dark:scrollbar-thumb-zinc-700 scrollbar-track-transparent snap-x">
+          {featuredScenarios.map((scenario) => (
+            <div
+              key={scenario.title}
+              className="min-w-[280px] md:min-w-[320px] snap-start p-5 rounded-2xl border border-zinc-200/60 dark:border-zinc-800/60 bg-white/80 dark:bg-zinc-900/80 hover:shadow-md hover:border-teal-500/50 dark:hover:border-teal-500/50 transition-all flex flex-col justify-between"
+            >
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-teal-50 dark:bg-teal-950/50 text-teal-700 dark:text-teal-400">
+                    {scenario.tag}
+                  </span>
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium">{scenario.team}</span>
+                </div>
+                <h4 className="text-base font-bold text-zinc-900 dark:text-white mb-1">{scenario.title}</h4>
+                <p className="text-xs text-zinc-650 dark:text-zinc-400 leading-relaxed mb-4">{scenario.desc}</p>
+              </div>
+              <div className="flex items-center gap-1 mt-auto pt-3 border-t border-zinc-100 dark:border-zinc-800">
+                <span className="text-[10px] uppercase font-bold text-zinc-400 dark:text-zinc-550 mr-1">Includes:</span>
+                {scenario.members.map((member) => (
+                  <span key={member} className="text-[10px] font-semibold bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 px-1.5 py-0.5 rounded-md truncate max-w-[90px]">
+                    {member}
+                  </span>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Search Filter Panel */}
+      <div className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+        <SectionHeader
+          title={panel === 'teams' ? 'Expert Teams' : 'Browse experts'}
+          detail="Search by job, pick a single expert or a coordinated team, then summon it into the task composer."
+        />
+        <div className="relative mt-3">
+          <input
+            aria-label="Search experts"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            className="h-11 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/80 dark:bg-zinc-900/80 pl-10 pr-4 text-sm outline-none focus:border-teal-550 focus:ring-2 focus:ring-teal-100 dark:focus:ring-teal-950/30 transition-all dark:text-white"
+            placeholder="Search experts, roles, skills, connectors..."
+          />
+          <div className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400">
+            🔍
+          </div>
+        </div>
+      </div>
+
+      {/* Most Used Scenarios */}
+      <div className="rounded-2xl border border-amber-205/65 dark:border-amber-900/35 bg-amber-50/40 dark:bg-amber-950/10 p-5">
+        <h3 className="text-xs font-bold uppercase tracking-wider text-amber-900 dark:text-amber-300">Most used</h3>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">
+          {mostUsed.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => summon(item)}
+              className="rounded-xl border border-amber-200 dark:border-amber-900/30 bg-white dark:bg-zinc-900 px-4 py-3 text-left hover:shadow-sm transition-all outline-none"
+            >
+              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-100">{item.name}</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">{item.usageCount} runs</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Grid List */}
+      <div className="grid gap-4 md:grid-cols-2">
+        {visibleExperts.map((item) => (
+          <ExpertCard key={item.id} item={item} summon={summon} />
+        ))}
+      </div>
+    </>
+  );
+}
+function ExpertCard({ item, summon }: { item: ExpertCatalogItem; summon: (item: ExpertCatalogItem) => void }) {
+  const [showDetail, setShowDetail] = useState(false);
+  return (
+    <article data-testid={slugTestId(item.id)} className="rounded-2xl border border-zinc-200 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-5 shadow-sm hover:shadow-md transition-all duration-205 flex flex-col justify-between">
+      <div>
+        <div className="flex items-start gap-3">
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-teal-50 dark:bg-teal-950/40 text-sm font-extrabold text-teal-700 dark:text-teal-450">
+            {itemInitials(item.name)}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-lg font-bold text-zinc-900 dark:text-white leading-normal">{item.name}</h3>
+              <StatusPill>{item.kind === 'team' ? 'Team' : 'Expert'}</StatusPill>
+            </div>
+            <p className="text-[10px] font-bold uppercase tracking-wider text-rose-600 dark:text-rose-455">{item.category}</p>
+          </div>
+        </div>
+        <p className="mt-3 text-xs leading-relaxed text-zinc-650 dark:text-zinc-400">{item.summary}</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {item.strengths.map((strength) => (
+            <span key={strength} className="rounded-lg bg-zinc-100 dark:bg-zinc-800/85 px-2.5 py-1 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+              {strength}
+            </span>
+          ))}
+        </div>
+        {item.members && (
+          <div className="mt-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-950/30 p-3.5">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">Team members</div>
+            <p className="mt-1 text-xs font-semibold text-zinc-700 dark:text-zinc-350">{item.members.join(', ')}</p>
+          </div>
+        )}
+        <div className="mt-4">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 dark:text-zinc-550">Use cases</div>
+          <ul className="mt-2 space-y-1.5 text-xs text-zinc-650 dark:text-zinc-400">
+            {item.examples.map((example) => (
+              <li key={example} className="flex items-start gap-1.5">
+                <span className="text-teal-650 dark:text-teal-500 select-none">•</span>
+                <span>{example}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+        {showDetail && (
+          <div className="mt-4 rounded-xl border border-teal-200/50 dark:border-teal-900/30 bg-teal-50/30 dark:bg-teal-950/20 p-4">
+            <div className="text-[10px] font-bold uppercase tracking-wider text-teal-800 dark:text-teal-400">Expert detail</div>
+            <p className="mt-1 text-xs text-teal-900 dark:text-teal-300">{item.name} uses {item.model} with {item.skills.join(', ')}.</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" onClick={() => summon(item)} className="rounded-lg bg-teal-600 hover:bg-teal-700 text-white px-3 py-1.5 text-xs font-bold transition-all">
+                Summon into chat
+              </button>
+              <button type="button" className="rounded-lg border border-teal-200 dark:border-teal-900/40 bg-white dark:bg-zinc-900 px-3 py-1.5 text-xs font-bold text-teal-800 dark:text-teal-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-all">
+                Favorite
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+      <div className="mt-5 grid grid-cols-2 gap-3 pt-3 border-t border-zinc-100 dark:border-zinc-800/80">
+        <button
+          type="button"
+          onClick={() => setShowDetail((current) => !current)}
+          className="h-9 rounded-xl border border-zinc-350 dark:border-zinc-700 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800/60 transition-colors outline-none"
+        >
+          Details
+        </button>
+        <button
+          type="button"
+          onClick={() => summon(item)}
+          className="h-9 rounded-xl bg-teal-600 hover:bg-teal-700 dark:bg-teal-500 dark:hover:bg-teal-600 text-xs font-bold text-white transition-colors outline-none shadow-sm"
+        >
+          Summon
+        </button>
+      </div>
+    </article>
+  );
+}
+function ComposerPanel({
+  mode,
+  setMode,
+  model,
+  setModel,
+  workspace,
+  setWorkspace,
+  taskPrompt,
+  setTaskPrompt,
+  enabledSkills,
+  enabledConnectors,
+  summonMessage,
+  running,
+  canStart,
+  executionReason,
+  configuredModel,
+  runError,
+  runMessage,
+  contextReferences,
+  setContextReferences,
+  attachments,
+  setAttachments,
+  customProvider,
+  setCustomProvider,
+  workDirectory,
+  setWorkDirectory,
+  outputFormat,
+  setOutputFormat,
+  taskConstraints,
+  setTaskConstraints,
+  startTask,
+}: {
+  mode: Mode;
+  setMode: (mode: Mode) => void;
+  model: string;
+  setModel: (model: string) => void;
+  workspace: string;
+  setWorkspace: (workspace: string) => void;
+  taskPrompt: string;
+  setTaskPrompt: (taskPrompt: string) => void;
+  enabledSkills: string[];
+  enabledConnectors: string[];
+  summonMessage: string;
+  running: boolean;
+  canStart: boolean;
+  executionReason: string;
+  configuredModel?: string;
+  runError: string;
+  runMessage: string;
+  contextReferences: string;
+  setContextReferences: (value: string) => void;
+  attachments: string;
+  setAttachments: (value: string) => void;
+  customProvider: string;
+  setCustomProvider: (value: string) => void;
+  workDirectory: string;
+  setWorkDirectory: (value: string) => void;
+  outputFormat: string;
+  setOutputFormat: (value: string) => void;
+  taskConstraints: string;
+  setTaskConstraints: (value: string) => void;
+  startTask: () => void;
+}) {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <div>
+          <WalkthroughTarget id="agents-composer-title"><h2 className="text-base font-bold text-zinc-900 dark:text-white">Task Composer</h2></WalkthroughTarget>
+          <p className="text-xs font-semibold text-teal-600 dark:text-teal-400">{summonMessage}</p>
+        </div>
+        <span className="text-[10px] font-bold px-2 py-0.5 bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 rounded-md">
+          {configuredModel ?? 'Execution unavailable'}
+        </span>
+      </div>
+
+      {/* Unified Chat Input Frame (Screenshot 2 Style) */}
+      <div className="rounded-2xl border border-zinc-250 dark:border-zinc-700 bg-white dark:bg-zinc-900 p-3 shadow-inner hover:border-zinc-350 dark:hover:border-zinc-650 transition-all flex flex-col gap-2">
+        <textarea
+          id="task-prompt"
+          aria-label="Task prompt"
+          value={taskPrompt}
+          onChange={(event) => setTaskPrompt(event.target.value)}
+          className="min-h-[100px] w-full resize-none bg-transparent text-sm leading-relaxed outline-none dark:text-white placeholder-zinc-400"
+          placeholder="What can I help you with today? Reference files with @, summon tools with /"
+        />
+        
+        {/* Input Tool Bar */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-zinc-100 dark:border-zinc-800">
+          <div className="flex flex-wrap items-center gap-1.5 text-xs">
+            {/* Mode Selector Option */}
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value as Mode)}
+              className="h-7 px-2 rounded-lg bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 font-semibold cursor-pointer outline-none hover:bg-zinc-100 dark:hover:bg-zinc-700"
+            >
+              <option value="Ask">Ask</option>
+              <option value="Craft">Craft</option>
+              <option value="Plan">Plan</option>
+            </select>
+
+            {/* Model Selector Option */}
+            <label className="flex items-center">
+              <span className="sr-only">Model</span>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className="h-7 px-2 rounded-lg bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 font-semibold cursor-pointer outline-none hover:bg-zinc-100 dark:hover:bg-zinc-700"
+              >
+                {Array.from(new Set(['Auto', ...(configuredModel ? [configuredModel] : []), ...modelOptions])).map((opt) => (
+                  <option key={opt} value={opt}>{opt}</option>
+                ))}
+              </select>
+            </label>
+
+            {/* Skills Status */}
+            <span className="h-7 px-2 rounded-lg bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 inline-flex items-center gap-1 font-medium select-none">
+              ⚙️ Skills ({enabledSkills.length})
+            </span>
+
+            {/* Permission Indicator */}
+            <span className="h-7 px-2 rounded-lg bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 inline-flex items-center gap-1 select-none">
+              🔒 Default Safe
+            </span>
+          </div>
+
+          {/* Action Icons right aligned */}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              title="Add Attachments"
+              onClick={() => document.getElementById('attachments-ref')?.focus()}
+              className="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors"
+            >
+              📎
+            </button>
+            <button
+              type="button"
+              title="Voice Input"
+              disabled
+              aria-describedby="task-media-unavailable"
+              className="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors"
+            >
+              🎙️
+            </button>
+            <button
+              type="button"
+              title="Refine Prompt"
+              disabled
+              aria-describedby="task-media-unavailable"
+              className="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors animate-pulse"
+            >
+              ✨
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <p id="task-media-unavailable" className="mt-3 text-xs text-zinc-500">Voice input, prompt refinement, and screenshot capture are not available in this task composer.</p>
+      <div className="mt-4 grid gap-3">
+        <div className="grid grid-cols-2 gap-2">
+          <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+            Custom provider
+            <input
+              aria-label="Custom provider"
+              value={customProvider}
+              onChange={(event) => setCustomProvider(event.target.value)}
+              className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white"
+              placeholder="OpenAI-compatible URL"
+            />
+          </label>
+          <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+            Work directory
+            <input
+              aria-label="Work directory"
+              value={workDirectory}
+              onChange={(event) => setWorkDirectory(event.target.value)}
+              className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white"
+              placeholder="/workspace/current-task"
+            />
+          </label>
+        </div>
+        
+        <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+          Workspace Scoping
+          <select
+            value={workspace}
+            onChange={(event) => setWorkspace(event.target.value)}
+            className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white"
+          >
+            {workspaces.map((option) => (
+              <option key={option} className="dark:bg-zinc-900">{option}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+          Context references (@ tags)
+          <input
+            aria-label="Context references"
+            value={contextReferences}
+            onChange={(event) => setContextReferences(event.target.value)}
+            className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white"
+            placeholder="@orders @inventory @customer-notes"
+          />
+        </label>
+        <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+          Attachments
+          <input
+            id="attachments-ref"
+            aria-label="Attachments"
+            value={attachments}
+            onChange={(event) => setAttachments(event.target.value)}
+            className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white"
+            placeholder="Drop files, screenshots, PDFs, CSVs"
+          />
+        </label>
+        <div className="grid grid-cols-3 gap-2">
+          <button type="button" disabled aria-describedby="task-media-unavailable" className="h-9 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-700 transition-colors">
+            Screenshot
+          </button>
+          <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+            Output format
+            <select
+              aria-label="Output format"
+              value={outputFormat}
+              onChange={(event) => setOutputFormat(event.target.value)}
+              className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-2 text-xs outline-none dark:text-white"
+            >
+              <option className="dark:bg-zinc-900">Brief</option>
+              <option className="dark:bg-zinc-900">Table</option>
+              <option className="dark:bg-zinc-900">Document</option>
+              <option className="dark:bg-zinc-900">Spreadsheet</option>
+            </select>
+          </label>
+          <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+            Task constraints
+            <input
+              aria-label="Task constraints"
+              value={taskConstraints}
+              onChange={(event) => setTaskConstraints(event.target.value)}
+              className="mt-1 h-9 w-full rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-2 text-xs outline-none dark:text-white"
+              placeholder="budget, tone"
+            />
+          </label>
+        </div>
+        <div className="flex flex-wrap gap-1.5 mt-3">
+          {['Text analysis'].map((capability) => (
+            <span key={capability} className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-850 px-2 py-0.5 text-[10px] font-bold text-zinc-650 dark:text-zinc-300">
+              {capability}
+            </span>
+          ))}
+        </div>
+      </div>
+      
+      <div className="mt-4 grid gap-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-4 text-xs">
+        <div>
+          <div className="font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider text-[10px]">Active Skills</div>
+          <p className="mt-1 font-semibold text-zinc-800 dark:text-zinc-200">{enabledSkills.join(', ') || 'None selected'}</p>
+        </div>
+        <div>
+          <div className="font-bold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider text-[10px]">Active Connectors</div>
+          <p className="mt-1 font-semibold text-zinc-800 dark:text-zinc-200">{enabledConnectors.join(', ') || 'None selected'}</p>
+        </div>
+        <p className="text-[10px] text-zinc-450 dark:text-zinc-500 leading-normal pt-2 border-t border-zinc-100 dark:border-zinc-850">
+          Text analysis uses the configured provider and may incur its inference charges. Craft, Plan, workspace actions and tool execution are unavailable.
+        </p>
+      </div>
+
+      <p className="mt-3 text-xs" role="status">{executionReason}</p>
+      {runError && <p className="mt-3 text-xs font-bold text-red-650 dark:text-red-400">{runError}</p>}
+      {runMessage && <p className="mt-3 text-xs font-bold text-emerald-600 dark:text-emerald-400">{runMessage}</p>}
+      
+      <WalkthroughTarget id="activate-agent-btn">
+        <WithTooltip id="activate-agent-btn-tooltip" defaultText="Start task to activate your AI Support Agent">
+      <button
+        type="button"
+        onClick={startTask}
+        disabled={!canStart}
+        className="mt-4 h-11 w-full rounded-xl bg-teal-600 hover:bg-teal-700 dark:bg-teal-500 dark:hover:bg-teal-600 text-sm font-bold text-white transition-colors disabled:cursor-not-allowed disabled:bg-zinc-300 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500 shadow-sm"
+      >
+        {running ? 'Starting...' : 'Start task'}
+      </button>
+      </WithTooltip>
+      </WalkthroughTarget>
+    </section>
+  );
+}
+function ResultsPanel({
+  selected,
+  workflowId,
+  record,
+  resultTab,
+  setResultTab,
+  compact,
+}: {
+  selected: ExpertCatalogItem;
+  workflowId: string;
+  record?: WorkflowRecord;
+  resultTab: string;
+  setResultTab: (tab: string) => void;
+  compact?: boolean;
+}) {
+  const unavailableId = useId();
+  return (
+    <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
+      <SectionHeader
+        title="Results"
+        detail={compact ? undefined : 'Read the actual status and text returned by the accepted analysis.'}
+      />
+      <div className="grid grid-cols-4 gap-2">
+        {resultTabs.map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => setResultTab(tab)}
+            aria-pressed={resultTab === tab}
+            className={`h-9 rounded-md border text-xs font-bold ${
+              resultTab === tab ? 'border-teal-700 bg-teal-700 text-white' : 'border-zinc-200 text-zinc-700'
+            }`}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+      <div className="mt-4 rounded-md border border-zinc-200 bg-zinc-50 p-3">
+        <div className="text-xs font-bold uppercase text-zinc-500">{resultTab}</div>
+        <p className="mt-2 text-sm leading-6 text-zinc-700">
+          {workflowId
+            ? record ? `Workflow ${workflowId}: ${record.status}.` : `Accepted workflow ${workflowId}. Its current execution status has not been loaded.`
+            : `${selected.name} has no accepted task in this view.`}
+        </p>
+      </div>
+      {record?.status === 'completed' && record.output && <pre className="mt-3 whitespace-pre-wrap text-sm">{record.output}</pre>}
+      {record?.error && <p className="mt-3 text-sm" role="status">{record.error}</p>}
+      <p id={unavailableId} className="mt-3 text-xs text-zinc-500">Result sharing, file downloads, workspace copies, and archiving are not available in this workflow view.</p>
+      <div className="mt-4 flex flex-wrap gap-2">
+        {['Share result', 'Download file', 'Copy to workspace', 'Archive task', 'Unarchive'].map((action) => (
+          <button key={action} type="button" disabled aria-describedby={unavailableId} className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs font-bold text-zinc-700">
+            {action}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+function ExtensionShortcuts({ setPanel }: { setPanel: (panel: Panel) => void }) {
+  return (
+    <section className="rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
+      <h2 className="text-lg font-bold text-zinc-950">Extensions</h2>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {[
+          ['remote', 'Remote control'],
+          ['data', 'Data management'],
+          ['workflows', 'Workflows'],
+          ['explore', 'Templates'],
+        ].map(([panel, label]) => (
+          <button
+            key={panel}
+            type="button"
+            onClick={() => setPanel(panel as Panel)}
+            className="h-10 rounded-md border border-zinc-200 bg-zinc-50 text-sm font-semibold text-zinc-700"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+function SkillsPanel({
+  enabledSkills,
+  setEnabledSkills,
+}: {
+  enabledSkills: string[];
+  setEnabledSkills: React.Dispatch<React.SetStateAction<string[]>>;
+}) {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Skill Market" detail="Install, disable, search, upload, or create natural-language skills for experts." />
+      <div className="mb-4 flex flex-wrap gap-2">
+        <button className="rounded-full bg-teal-600 hover:bg-teal-700 text-white px-4 py-2 text-xs font-bold transition-colors" type="button">Find skill</button>
+        <button className="rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors" type="button">Search installed skills</button>
+        <button className="rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors" type="button">Upload local skill</button>
+        <button className="rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors" type="button">Create skill from prompt</button>
+        <button className="rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors" type="button">Disable skill</button>
+        <button className="rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors" type="button">Uninstall skill</button>
+        <button className="rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 transition-colors" type="button">Bulk uninstall</button>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        {skillMarket.map((skill) => {
+          const enabled = enabledSkills.includes(skill.name);
+          return (
+            <button
+              key={skill.id}
+              type="button"
+              aria-pressed={enabled}
+              onClick={() =>
+                setEnabledSkills((current) =>
+                  enabled ? current.filter((name) => name !== skill.name) : [...current, skill.name],
+                )
+              }
+              className={`rounded-2xl border p-5 text-left transition-all hover:shadow-sm ${
+                enabled
+                  ? 'border-teal-500/80 bg-teal-50/20 dark:bg-teal-950/20'
+                  : 'border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="font-bold text-zinc-900 dark:text-white text-sm">{skill.name}</h3>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${enabled ? 'bg-teal-100 dark:bg-teal-900/60 text-teal-800 dark:text-teal-300' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-650 dark:text-zinc-400'}`}>
+                  {enabled ? 'Enabled' : skill.status}
+                </span>
+              </div>
+              <p className="mt-2 text-xs text-zinc-650 dark:text-zinc-400 leading-relaxed">{skill.description}</p>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+function ConnectorsPanel({
+  enabledConnectors,
+  setEnabledConnectors,
+}: {
+  enabledConnectors: string[];
+  setEnabledConnectors: React.Dispatch<React.SetStateAction<string[]>>;
+}) {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Connector Center" detail="Connect external data and service actions for expert tasks." />
+      <div className="mb-4 grid gap-3 md:grid-cols-3">
+        {['Create custom connector', 'MCP endpoint', 'Notification channel'].map((label) => (
+          <label key={label} className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+            {label}
+            <input className="mt-1 h-9 w-full rounded-xl border border-zinc-350 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white" placeholder={label} />
+          </label>
+        ))}
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        {connectors.map((connector) => {
+          const enabled = enabledConnectors.includes(connector.name);
+          return (
+            <button
+              key={connector.id}
+              type="button"
+              aria-pressed={enabled}
+              onClick={() =>
+                setEnabledConnectors((current) =>
+                  enabled ? current.filter((name) => name !== connector.name) : [...current, connector.name],
+                )
+              }
+              className={`rounded-2xl border p-5 text-left transition-all hover:shadow-sm ${
+                enabled
+                  ? 'border-teal-500/80 bg-teal-50/20 dark:bg-teal-950/20'
+                  : 'border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="font-bold text-zinc-900 dark:text-white text-sm">{connector.name}</h3>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${enabled ? 'bg-teal-100 dark:bg-teal-900/60 text-teal-800 dark:text-teal-300' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-650 dark:text-zinc-400'}`}>
+                  {enabled ? 'Selected' : connector.status}
+                </span>
+              </div>
+              <p className="mt-2 text-xs text-zinc-650 dark:text-zinc-400 leading-relaxed">{connector.description}</p>
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+function AutomationsPanel() {
+  const [approved, setApproved] = useState(false);
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Scheduled Tasks" detail="Recurring expert runs require an automation service connection." />
+      
+      <div className="mb-4 grid gap-3 md:grid-cols-3">
+        <label className="text-xs font-bold text-zinc-500 dark:text-zinc-400 uppercase">
+          Schedule rule
+          <input disabled className="mt-1 h-9 w-full cursor-not-allowed rounded-xl border border-zinc-350 dark:border-zinc-700 bg-zinc-100/70 dark:bg-zinc-900/70 px-3 text-xs outline-none dark:text-white" placeholder="Unavailable" />
+        </label>
+        <div className="rounded-xl border border-zinc-250 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-3 text-xs font-bold text-zinc-700 dark:text-zinc-300">Execution history</div>
+        <div className="rounded-xl border border-zinc-250 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/50 p-3 text-xs font-bold text-zinc-700 dark:text-zinc-300">Push notification</div>
+      </div>
+
+      <div className="flex items-center gap-2 mb-6">
+        <button disabled className="cursor-not-allowed rounded-full bg-zinc-200 text-zinc-500 px-4 py-2 text-xs font-bold">+ Add New</button>
+        <button disabled className="cursor-not-allowed rounded-full border border-zinc-250 dark:border-zinc-800 px-4 py-2 text-xs font-bold text-zinc-500">From Template</button>
+      </div>
+
+      <div className="mb-6 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white/80 dark:bg-zinc-900/80 p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h4 className="text-sm font-bold text-zinc-900 dark:text-white">Marketing Campaign Review</h4>
+            <p className="text-xs text-zinc-500">Requires manual sign-off before publishing</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setApproved(true)}
+            className="rounded-lg bg-teal-600 px-4 py-2 text-xs font-bold text-white hover:bg-teal-700"
+          >
+            {approved ? 'Approved' : 'Approve & Post'}
+          </button>
+        </div>
+      </div>
+
+      <p className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/60 dark:bg-zinc-900/60 p-4 text-sm text-zinc-600 dark:text-zinc-400">
+        Scheduled runs and execution history are unavailable because no automation backend is connected.
+      </p>
+    </section>
+  );
+}
+function MemoryPanel() {
+  const [items, setItems] = useState<{ id: string; source_type: string; owner_override: boolean; content: string; reference_count: number; reliability_score: number }[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const fetchMemories = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/v1/memory');
+      const data = await res.json();
+      setItems(Array.isArray(data) ? data : []);
+    } catch (e) {
+      console.error(e);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchMemories();
+  }, []);
+
+  const toggleOverride = async (id: string, currentValue: boolean) => {
+    try {
+      await fetch(`/api/v1/memory/${id}/override`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ override_value: !currentValue }),
+      });
+      fetchMemories();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Consolidated Memory" detail="Review and override what AI agents remember about your business." />
+
+      {loading ? (
+        <p className="text-xs text-zinc-550 dark:text-zinc-400">Loading memories...</p>
+      ) : items.length === 0 ? (
+        <p className="text-xs text-zinc-555 dark:text-zinc-400">No consolidated memories found.</p>
+      ) : (
+        <div className="space-y-3">
+          {items.map((memory) => (
+            <div key={memory.id} className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-4 text-xs flex flex-col gap-2">
+              <div className="flex justify-between items-start">
+                <div className="font-bold text-zinc-900 dark:text-white">{memory.source_type}</div>
+                <button
+                  type="button"
+                  onClick={() => toggleOverride(memory.id, memory.owner_override)}
+                  className={`text-[10px] px-2 py-1 rounded-lg font-bold transition-colors ${memory.owner_override ? 'bg-teal-600 text-white hover:bg-teal-700' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-350 hover:bg-zinc-200 dark:hover:bg-zinc-700'}`}
+                >
+                  {memory.owner_override ? 'Owner Override: ON' : 'Owner Override: OFF'}
+                </button>
+              </div>
+              <p className="whitespace-pre-wrap text-zinc-650 dark:text-zinc-405 leading-relaxed">{memory.content}</p>
+              <div className="text-[10px] text-zinc-450 dark:text-zinc-500 flex gap-4 pt-2 border-t border-zinc-100 dark:border-zinc-850">
+                <span>References: {memory.reference_count}</span>
+                <span>Reliability: {memory.reliability_score}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+function ExplorePanel({ summon }: { summon: (item: ExpertCatalogItem) => void }) {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Explore Templates" detail="Curated templates prefill prompt, expert, skills, and connector choices." />
+      <div className="grid gap-3 md:grid-cols-2">
+        {exploreTemplates.map((template, index) => (
+          <button
+            key={template}
+            type="button"
+            onClick={() => summon(index % 2 === 0 ? expertTeams[0] : experts[0])}
+            className="rounded-2xl border border-zinc-200/85 dark:border-zinc-800 bg-white/80 dark:bg-zinc-900/80 hover:shadow-md hover:border-teal-500/50 p-5 text-left transition-all outline-none"
+          >
+            <h3 className="font-bold text-zinc-900 dark:text-white text-sm">{template}</h3>
+            <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">Make my version with one click.</p>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+function RemotePanel() {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Remote Assistant Control" detail="Summon experts and receive notifications from business chat tools." />
+      <div className="mb-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-950/30 p-3 text-xs font-bold text-teal-700 dark:text-teal-400 font-mono">
+        /summon Growth Strategist
+      </div>
+      <div className="grid gap-3 md:grid-cols-3">
+        {remoteAssistants.map((name) => (
+          <div key={name} className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-4 text-center">
+            <div className="font-bold text-zinc-900 dark:text-white text-xs">{name}</div>
+            <div className="mt-1 text-[10px] text-zinc-450 dark:text-zinc-500 font-medium">Available</div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+function DataPanel() {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Data Management" detail="Manage shared files, task archives, generated outputs, and workspace history." />
+      <div className="grid gap-3 md:grid-cols-3">
+        {['Shared files', 'Archived tasks', 'Generated outputs', 'Workspace history', 'Download center', 'Unshare queue'].map((item) => (
+          <div key={item} className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-4 font-bold text-zinc-900 dark:text-white text-xs text-center cursor-pointer hover:border-teal-500/50 transition-all">
+            {item}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+function OperationsPanel({ selectedId, showAll }: { selectedId: string | null; showAll: () => void }) {
+  const visibleDepartments = selectedId ? departments.filter(department => department.id === selectedId) : departments;
+  return (
+    <section aria-label="Department details" className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="AI Departments" detail="Operational agents stay visible for backwards-compatible business management." />
+      {selectedId && <button type="button" onClick={showAll} className="mb-3 text-sm underline">Show all departments</button>}
+      <div className="grid gap-3 md:grid-cols-2">
+        {visibleDepartments.map((department) => (
+          <article key={department.id} className="text-left rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-5">
+            <div className="flex items-center justify-between gap-3 mb-2">
+              <h3 className="font-bold text-zinc-900 dark:text-white text-sm">{department.name}</h3>
+              <StatusPill>{department.status}</StatusPill>
+            </div>
+            <p className="text-[10px] font-bold uppercase tracking-wider text-rose-600 dark:text-rose-455 mb-2">{department.role}</p>
+            <p className="text-xs text-zinc-650 dark:text-zinc-400 leading-relaxed">{department.description}</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+function CreateWorkflowForm({ onSave }: { onSave: (name: string, task: string) => Promise<void> }) {
+  const [name, setName] = useState('');
+  const [task, setTask] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name || !task) return;
+    setIsSubmitting(true);
+    setError('');
+    try {
+      await onSave(name, task);
+      setName('');
+      setTask('');
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Failed to create workflow');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="mb-6 rounded-xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 p-4 backdrop-blur-[30px]">
+      <h3 className="text-lg font-bold text-zinc-950 dark:text-zinc-100 mb-4">Create Workflow</h3>
+      {error && <p className="mb-3 text-sm text-red-600">{error}</p>}
+      <div className="mb-3">
+        <label htmlFor="workflow-name" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Workflow Name</label>
+        <input
+          id="workflow-name"
+          type="text"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Workflow Name"
+          className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 p-2 text-sm text-zinc-900 dark:text-zinc-100"
+        />
+      </div>
+      <div className="mb-4">
+        <label htmlFor="workflow-task" className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">Task</label>
+        <textarea
+          id="workflow-task"
+          rows={3}
+          value={task}
+          onChange={(e) => setTask(e.target.value)}
+          placeholder="Task description"
+          className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 p-2 text-sm text-zinc-900 dark:text-zinc-100"
+        />
+      </div>
+      <button
+        type="submit"
+        disabled={isSubmitting || !name || !task}
+        className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+      >
+        {isSubmitting ? 'Creating...' : 'Create & Run Workflow'}
+      </button>
+    </form>
+  );
+}
+
+function WorkflowsPanel({ workflows, onSave, readState, older, newer }: { readState: ReadState; workflows: WorkflowRecord[]; onSave: (name: string, task: string) => Promise<void>; older?: () => void; newer?: () => void }) {
+  return (
+    <section className="border border-[rgba(255,255,255,0.4)] bg-[rgba(255,255,255,0.65)] backdrop-blur-[30px] saturate-[210%] p-4">
+      <SectionHeader title="Workflows" detail="Accepted text analyses and their actual execution status. Visual tool workflows require an execution policy that is not available here." />
+
+      <div className="my-3 flex gap-3" aria-label="Workflow history pages">
+        <button type="button" disabled={readState !== 'ready' || !newer} onClick={newer}>Newer analyses</button>
+        <button type="button" disabled={readState !== 'ready' || !older} onClick={older}>Older analyses</button>
+      </div>
+      <CreateWorkflowForm onSave={onSave} />
+
+      <div className="mb-8">
+        <AgentWorkflowBuilder onSave={onSave} />
+      </div>
+      {readState !== 'ready' ? <RecordReadNotice state={readState} /> : workflows.length === 0 ? (
+        <p className="border border-dashed border-zinc-300 p-4 text-sm text-zinc-600">No workflows yet.</p>
+      ) : (
+        <div className="space-y-3">
+          {workflows.map((workflow) => (
+            <div key={workflow.id} className="border border-[rgba(255,255,255,0.4)] bg-[rgba(255,255,255,0.65)] backdrop-blur-[30px] saturate-[210%] p-4">
+              <div className="flex items-center justify-between">
+                <h3 className="font-bold text-zinc-950">{workflow.name}</h3>
+                <StatusPill>{workflow.status}</StatusPill>
+              </div>
+              <p className="mt-1 text-xs font-bold uppercase text-zinc-500">{workflow.workflow}</p>
+              <p className="mt-2 whitespace-pre-wrap text-sm text-zinc-700">{workflow.task}</p>
+              {workflow.output && <pre className="mt-2 whitespace-pre-wrap text-sm">{workflow.output}</pre>}
+              {workflow.error && <p role="status">{workflow.error}</p>}
+              <div className="mt-2 text-xs text-zinc-500">
+                <span className="font-semibold text-zinc-600">Execution mode</span>
+                {workflow.command ? `: ${workflow.command}` : ': text analysis'}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+function FeedPanel({ feed, readState }: { feed: ApprovalItem[]; readState: ReadState }) {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Activity Feed" detail="Realtime expert and department activity." />
+      {readState !== 'ready' ? <RecordReadNotice state={readState} /> : feed.length === 0 ? (
+        <p className="rounded-xl border border-dashed border-zinc-350 dark:border-zinc-750 p-4 text-xs text-zinc-500 dark:text-zinc-400">No activity yet.</p>
+      ) : (
+        <div className="space-y-3">
+          {feed.map((item) => (
+            <div key={item.id} className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-4">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-teal-600 dark:text-teal-400">{item.department}</div>
+              <p className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 leading-relaxed">{item.description}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+function ApprovalsPanel({
+  readState,
+  approvals,
+  decideApproval,
+}: {
+  readState: ReadState;
+  approvals: ApprovalItem[];
+  decideApproval: (id: string, approved: boolean) => void;
+}) {
+  return (
+    <section className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/60 dark:bg-zinc-900/60 backdrop-blur-[30px] p-5 shadow-sm">
+      <SectionHeader title="Needs Approval" detail="Review high-risk drafts before experts execute or send." />
+      {readState !== 'ready' ? <RecordReadNotice state={readState} /> : approvals.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-zinc-350 dark:border-zinc-750 p-5 text-center">
+          <h3 className="font-bold text-zinc-900 dark:text-white text-sm">All Caught Up!</h3>
+          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">Your AI team has no pending approvals.</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {approvals.map((item) => (
+            <div key={item.id} className="rounded-2xl border border-zinc-200/80 dark:border-zinc-800/80 bg-white/80 dark:bg-zinc-900/80 p-5">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-rose-600 dark:text-rose-455">{item.department}</div>
+              <p className="mt-2 text-xs text-zinc-700 dark:text-zinc-300 leading-relaxed">{item.description}</p>
+              <div className="mt-4 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => decideApproval(item.id, false)}
+                  className="h-9 flex-1 rounded-xl border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-xs font-bold text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+                >
+                  Edit Draft
+                </button>
+                <button
+                  type="button"
+                  onClick={() => decideApproval(item.id, true)}
+                  className="h-9 flex-1 rounded-xl bg-teal-600 hover:bg-teal-700 dark:bg-teal-500 dark:hover:bg-teal-600 text-xs font-bold text-white transition-colors"
+                >
+                  Approve & Send
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}

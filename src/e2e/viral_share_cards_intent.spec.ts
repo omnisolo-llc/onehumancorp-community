@@ -1,0 +1,50 @@
+import { test, expect } from './fixtures';
+
+test.describe('Social Share Cards Direct Intents - Owner Journey', () => {
+    test('owner navigates from dashboard to share cards, configures, and verifies social share buttons', async ({ page }) => {
+        // Assume test runner handles login and initial navigation if necessary.
+        // We will directly test the page route for unit verification in UI
+        await page.goto('/share-cards');
+
+        // Verify the copy link button is present
+        const copyButton = page.locator('button', { hasText: 'Copy Link' });
+        await expect(copyButton).toBeVisible();
+
+        // Check for the "OmniSolo" watermark text in the preview
+        const poweredBy = page.locator('span', { hasText: 'OmniSolo' });
+        await expect(poweredBy).toBeVisible();
+
+        // Validate X (Twitter) Share Link
+        const twitterShare = page.locator('a', { hasText: 'Share on X' });
+        await expect(twitterShare).toBeVisible();
+        const twitterHref = await twitterShare.getAttribute('href');
+        expect(twitterHref).toContain('twitter.com/intent/tweet');
+
+        // Ensure "OmniSolo" is embedded in the encoded text, if applicable,
+        // or check that the URL contains the encoded store link logic.
+        expect(twitterHref).toContain('text=');
+        expect(twitterHref).toContain(encodeURIComponent('OmniSolo'));
+
+        // Validate Facebook Share Link
+        const facebookShare = page.locator('a', { hasText: 'Share on Facebook' });
+        await expect(facebookShare).toBeVisible();
+        const fbHref = await facebookShare.getAttribute('href');
+        expect(fbHref).toContain('facebook.com/sharer/sharer.php');
+        expect(fbHref).toContain('quote=');
+        expect(fbHref).toContain(encodeURIComponent('OmniSolo'));
+
+        // Validate WhatsApp Share Link
+        const whatsappShare = page.locator('a', { hasText: 'Share to WhatsApp' });
+        await expect(whatsappShare).toBeVisible();
+        const waHref = await whatsappShare.getAttribute('href');
+        expect(waHref).toContain('wa.me/?text=');
+        expect(waHref).toContain(encodeURIComponent('OmniSolo'));
+
+        // Validate LinkedIn Share Link
+        const linkedinShare = page.locator('a', { hasText: 'Share on LinkedIn' });
+        await expect(linkedinShare).toBeVisible();
+        const liHref = await linkedinShare.getAttribute('href');
+        expect(liHref).toContain('linkedin.com/sharing/share-offsite');
+        expect(liHref).toContain('url=');
+    });
+});

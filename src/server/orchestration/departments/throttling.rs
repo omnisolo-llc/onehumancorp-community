@@ -1,0 +1,166 @@
+use crate::db::{DB, DbStore};
+use chrono::Utc;
+use std::sync::Arc;
+
+pub struct ThrottlingManager {
+    db: Arc<DB>,
+}
+
+impl ThrottlingManager {
+    pub fn new(db: Arc<DB>) -> Self {
+        Self { db }
+    }
+
+    pub async fn check_and_consume_budget(
+        &self,
+        tenant_id: &str,
+        points: i32,
+    ) -> Result<bool, String> {
+        let now = Utc::now();
+        let year_month = now.format("%Y-%m").to_string();
+
+        match &self.db.store {
+            DbStore::Postgres => {
+                let has_plan_tier: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_attribute
+                        WHERE attrelid = to_regclass('tenants')
+                          AND attname = 'plan_tier'
+                          AND NOT attisdropped
+                    )",
+                )
+                .fetch_one(&self.db.pool)
+                .await
+                .unwrap_or(false);
+
+                let limit = if has_plan_tier {
+                    let row: Option<(Option<String>,)> =
+                        sqlx::query_as("SELECT plan_tier FROM tenants WHERE id = $1")
+                            .bind(tenant_id)
+                            .fetch_optional(&self.db.pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    let plan_tier = row.and_then(|(t,)| t).unwrap_or_else(|| "free".to_string());
+                    match plan_tier.to_lowercase().as_str() {
+                        "starter" => 500,
+                        "pro" => 2000,
+                        _ => 1000,
+                    }
+                } else {
+                    1000
+                };
+
+                let has_budgets: bool =
+                    sqlx::query_scalar("SELECT to_regclass('tenant_ai_budgets') IS NOT NULL")
+                        .fetch_one(&self.db.pool)
+                        .await
+                        .unwrap_or(false);
+
+                if !has_budgets {
+                    // Single-tenant Community Edition omits Cloud Layer-2 `plan_tier` and
+                    // `tenant_ai_budgets`; enforce the bounded single-tenant action ceiling.
+                    return Ok(points <= limit);
+                }
+
+                let mut tx = self.db.pool.begin().await.map_err(|e| e.to_string())?;
+                ::server_common::auth_utils::set_org_context(&mut *tx, tenant_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let _ = sqlx::query(
+                    "INSERT INTO tenants (id, name)
+                     VALUES ($1, $2)
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(tenant_id)
+                .bind("Workspace")
+                .execute(&mut *tx)
+                .await;
+
+                let res: Option<(i32,)> = sqlx::query_as(
+                    "INSERT INTO tenant_ai_budgets (tenant_id, year_month, actions_used)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (tenant_id, year_month) DO UPDATE
+                     SET actions_used = tenant_ai_budgets.actions_used + $3,
+                         updated_at = CURRENT_TIMESTAMP
+                     RETURNING actions_used",
+                )
+                .bind(tenant_id)
+                .bind(&year_month)
+                .bind(points)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                tx.commit().await.map_err(|e| e.to_string())?;
+
+                if let Some((actions_used,)) = res {
+                    Ok(actions_used <= limit)
+                } else {
+                    Ok(false)
+                }
+            }
+            DbStore::Sqlite(pool) => {
+                let has_plan_tier: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('tenants') WHERE name = 'plan_tier')",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap_or(false);
+
+                let limit = if has_plan_tier {
+                    let row: Option<(Option<String>,)> =
+                        sqlx::query_as("SELECT plan_tier FROM tenants WHERE id = ?")
+                            .bind(tenant_id)
+                            .fetch_optional(pool)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    let plan_tier = row.and_then(|(t,)| t).unwrap_or_else(|| "free".to_string());
+                    match plan_tier.to_lowercase().as_str() {
+                        "starter" => 500,
+                        "pro" => 2000,
+                        _ => 1000,
+                    }
+                } else {
+                    1000
+                };
+
+                let has_budgets: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tenant_ai_budgets')",
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap_or(false);
+
+                if !has_budgets {
+                    return Ok(points <= limit);
+                }
+
+                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                let res: Option<(i32,)> = sqlx::query_as(
+                    "INSERT INTO tenant_ai_budgets (tenant_id, year_month, actions_used)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT (tenant_id, year_month) DO UPDATE
+                     SET actions_used = tenant_ai_budgets.actions_used + ?,
+                         updated_at = CURRENT_TIMESTAMP
+                     RETURNING actions_used",
+                )
+                .bind(tenant_id)
+                .bind(&year_month)
+                .bind(points)
+                .bind(points)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+                tx.commit().await.map_err(|e| e.to_string())?;
+
+                if let Some((actions_used,)) = res {
+                    Ok(actions_used <= limit)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+}

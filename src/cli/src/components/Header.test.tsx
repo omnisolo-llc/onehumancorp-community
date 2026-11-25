@@ -1,0 +1,11 @@
+import React from 'react';
+import { render } from 'ink-testing-library';
+import { expect, test } from 'vitest';
+import { Header } from './Header.js';
+
+test('renders Header correctly', () => {
+  const { lastFrame } = render(<Header />);
+  expect(lastFrame()).toMatch(/OmniSolo OneHumanCorp/);
+  expect(lastFrame()).not.toMatch(/ONE HUMAN CORP/);
+  expect(lastFrame()).toMatch(/- Standalone Agent Mode/);
+});

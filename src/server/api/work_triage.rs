@@ -1,0 +1,663 @@
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    response::IntoResponse,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::common::auth_utils::UiTenantQuery;
+use crate::db::DB;
+
+fn signed_tenant_id(claims: &::server_common::Claims) -> Option<String> {
+    claims
+        .organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant_id| !tenant_id.is_empty() && !tenant_id.eq_ignore_ascii_case("system"))
+        .map(str::to_string)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SimulateInboundSignalRequest {
+    pub source: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveDailyWorkRequest {
+    pub action_status: String, // "APPROVED" or "DISMISSED"
+}
+
+pub async fn simulate_inbound_signal_handler(
+    State(db): State<Arc<DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+    Json(payload): Json<SimulateInboundSignalRequest>,
+) -> axum::response::Response {
+    let Some(tenant_id) = signed_tenant_id(&claims) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let signal_id = format!("sig-{}", Uuid::new_v4());
+    let work_item_id = format!("wi-{}", Uuid::new_v4());
+
+    // Basic LLM simulation
+    let intent = "inquiry".to_string();
+    let customer_info = serde_json::json!({"name": "Instagram DM", "message": "Do you have vegan chocolate cake available this weekend?"});
+    let suggested_actions = serde_json::json!([
+        {
+            "action_type": "Draft Reply",
+            "message": "Hi! Yes, we have 2 vegan chocolate cakes left for this weekend"
+        }
+    ]);
+
+    match &db.store {
+        crate::db::DbStore::Postgres => {
+            let _ = sqlx::query(
+                "INSERT INTO inbound_signals (id, tenant_id, source, raw_payload, status) VALUES ($1, $2, $3, $4, 'PROCESSED')"
+            )
+            .bind(&signal_id)
+            .bind(&tenant_id)
+            .bind(&payload.source)
+            .bind(sqlx::types::Json(&payload.payload))
+            .execute(&db.pool).await;
+
+            let _ = sqlx::query(
+                "INSERT INTO daily_work_items (id, tenant_id, signal_id, intent, customer_info, suggested_actions, status) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')"
+            )
+            .bind(&work_item_id)
+            .bind(&tenant_id)
+            .bind(&signal_id)
+            .bind(&intent)
+            .bind(sqlx::types::Json(&customer_info))
+            .bind(sqlx::types::Json(&suggested_actions))
+            .execute(&db.pool).await;
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            let _ = sqlx::query(
+                "INSERT INTO inbound_signals (id, tenant_id, source, raw_payload, status) VALUES (?, ?, ?, ?, 'PROCESSED')"
+            )
+            .bind(&signal_id)
+            .bind(&tenant_id)
+            .bind(&payload.source)
+            .bind(serde_json::to_string(&payload.payload).unwrap_or_else(|_| "{}".to_string()))
+            .execute(pool).await;
+
+            let _ = sqlx::query(
+                "INSERT INTO daily_work_items (id, tenant_id, signal_id, intent, customer_info, suggested_actions, status) VALUES (?, ?, ?, ?, ?, ?, 'PENDING')"
+            )
+            .bind(&work_item_id)
+            .bind(&tenant_id)
+            .bind(&signal_id)
+            .bind(&intent)
+            .bind(serde_json::to_string(&customer_info).unwrap_or_else(|_| "{}".to_string()))
+            .bind(serde_json::to_string(&suggested_actions).unwrap_or_else(|_| "{}".to_string()))
+            .execute(pool).await;
+        }
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({"id": work_item_id, "success": true})),
+    )
+        .into_response()
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DailyWorkItemRow {
+    pub id: String,
+    pub signal_id: Option<String>,
+    pub intent: String,
+    pub customer_info: Option<serde_json::Value>,
+    pub suggested_actions: Option<serde_json::Value>,
+    pub status: String,
+}
+
+static DAILY_WORK_CACHE: std::sync::OnceLock<
+    ::server_utils::cache::HybridCache<Vec<serde_json::Value>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) async fn invalidate_daily_work_cache(tenant_id: &str) {
+    if let Some(cache) = DAILY_WORK_CACHE.get() {
+        for mobile in [false, true] {
+            cache
+                .invalidate(&format!("daily_work:{tenant_id}:mobile:{mobile}"))
+                .await;
+        }
+    }
+}
+
+pub async fn get_daily_work_handler(
+    State(db): State<Arc<DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+    Query(query): Query<UiTenantQuery>,
+) -> axum::response::Response {
+    let Some(tenant_id) = signed_tenant_id(&claims) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let mobile_optimized = query.mobile_optimized.unwrap_or(false);
+    let cache_key = format!("daily_work:{}:mobile:{}", tenant_id, mobile_optimized);
+    let cache = DAILY_WORK_CACHE
+        .get_or_init(|| ::server_utils::cache::HybridCache::new(crate::distributed_cache()));
+
+    if query.bypass_cache.unwrap_or(false) {
+        cache.invalidate(&cache_key).await;
+    }
+
+    let items_opt = cache.get_or_fetch_with_swr(&cache_key, std::time::Duration::from_secs(10), {
+        let db = db.clone();
+        let tenant_id = tenant_id.clone();
+        move || async move {
+            let res = match &db.store {
+                crate::db::DbStore::Postgres => {
+                    let pool1 = db.pool.clone();
+                    let pool2 = db.pool.clone();
+                    let t_bg1 = tenant_id.clone();
+                    let t_bg2 = tenant_id.clone();
+                    let pool_env = db.pool.clone();
+                    let t_env = tenant_id.clone();
+                    let cache_t_bg = tenant_id.clone();
+            let (work_res, orders_res, env_res, agent_feed_res) = tokio::join!(
+                tokio::spawn(async move {
+                    let mut tx = pool1.begin().await?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &t_bg1).await?;
+                    let rows = sqlx::query(if mobile_optimized { "SELECT id, signal_id, intent, status FROM daily_work_items WHERE tenant_id = $1 AND status = 'PENDING' ORDER BY created_at DESC" } else { "SELECT id, signal_id, intent, customer_info, suggested_actions, status FROM daily_work_items WHERE tenant_id = $1 AND status = 'PENDING' ORDER BY created_at DESC" }).bind(&t_bg1).fetch_all(&mut *tx).await?;
+                    tx.commit().await?;
+                    use sqlx::Row;
+                    let items: Vec<serde_json::Value> = rows.into_iter().map(|r| {
+                        let mut map = serde_json::Map::new();
+                        map.insert("id".to_string(), serde_json::json!(r.get::<String, _>("id")));
+                        map.insert("signal_id".to_string(), serde_json::json!(r.try_get::<Option<String>, _>("signal_id").ok().flatten()));
+                        map.insert("intent".to_string(), serde_json::json!(r.get::<String, _>("intent")));
+                        map.insert("status".to_string(), serde_json::json!(r.get::<String, _>("status")));
+
+                        if !mobile_optimized {
+                            if let Ok(Some(ci)) = r.try_get::<Option<serde_json::Value>, _>("customer_info") {
+                                map.insert("customer_info".to_string(), ci);
+                            }
+                            if let Ok(Some(sa)) = r.try_get::<Option<serde_json::Value>, _>("suggested_actions") {
+                                map.insert("suggested_actions".to_string(), sa);
+                            }
+                        }
+
+                        serde_json::Value::Object(map)
+                    }).collect();
+                    Ok::<Vec<serde_json::Value>, sqlx::Error>(items)
+                }),
+                tokio::spawn(async move {
+                    let mut tx = pool2.begin().await?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &t_bg2).await?;
+                    let rows = sqlx::query(if mobile_optimized { "SELECT id, status, 0.0 as total_amount FROM orders WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 5" } else { "SELECT id, status, total_amount FROM orders WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 5" }).bind(&t_bg2).fetch_all(&mut *tx).await?;
+                    tx.commit().await?;
+                    use sqlx::Row;
+                    let items: Vec<serde_json::Value> = rows.into_iter().map(|o| {
+                        serde_json::json!({
+                            "id": o.try_get::<String, _>("id").unwrap_or_default(),
+                            "intent": "recent_order",
+                            "status": o.try_get::<String, _>("status").unwrap_or_default()
+                        })
+                    }).collect();
+                    Ok::<Vec<serde_json::Value>, sqlx::Error>(items)
+                }),
+                tokio::spawn(async move {
+                    let mut tx = pool_env.begin().await?;
+                    ::server_common::auth_utils::set_org_context(&mut *tx, &t_env).await?;
+                    let rows = sqlx::query(if mobile_optimized { "SELECT id, status FROM task_envelopes WHERE tenant_id = $1 AND status NOT IN ('COMPLETED', 'APPROVED', 'DISMISSED') ORDER BY created_at DESC" } else { "SELECT id, current_department, status, payload::text AS payload, routing_history::text AS routing_history FROM task_envelopes WHERE tenant_id = $1 AND status NOT IN ('COMPLETED', 'APPROVED', 'DISMISSED') ORDER BY created_at DESC" }).bind(&t_env).fetch_all(&mut *tx).await?;
+                    tx.commit().await?;
+                    use sqlx::Row;
+                    let items: Vec<serde_json::Value> = rows.into_iter().map(|e| {
+                        let mut map = serde_json::Map::new();
+                        map.insert("id".to_string(), serde_json::json!(e.try_get::<String, _>("id").unwrap_or_default()));
+                        map.insert("intent".to_string(), serde_json::json!("task_envelope"));
+                        map.insert("status".to_string(), serde_json::json!(e.try_get::<String, _>("status").unwrap_or_default()));
+
+                        if !mobile_optimized {
+                            let dept = e.try_get::<String, _>("current_department").unwrap_or_default();
+                            map.insert("customer_info".to_string(), serde_json::json!({ "department": dept }));
+                            let payload_str: String = e.try_get("payload").unwrap_or_else(|_| "{}".to_string());
+                            let payload_val: serde_json::Value = serde_json::from_str(&payload_str).unwrap_or_else(|_| serde_json::json!({}));
+                            map.insert("suggested_actions".to_string(), payload_val);
+                        }
+
+                        serde_json::Value::Object(map)
+                    }).collect();
+                    Ok::<Vec<serde_json::Value>, sqlx::Error>(items)
+                }),
+                {
+                    let db_feed = db.clone();
+                    let t_feed = cache_t_bg.clone();
+                    tokio::spawn(async move {
+                        let cache = crate::api::agent_feed::get_agent_feed_cache();
+                        let feed_cache_key = format!("agent_feed:{}:5:0:{}", t_feed, mobile_optimized);
+                        let tag = format!("agent_feed_tenant:{}", t_feed);
+                        let fetched_feed = cache.get_or_fetch_with_tags_swr(
+                            &feed_cache_key,
+                            vec![tag],
+                            std::time::Duration::from_secs(60),
+                            {
+                                let db_bg = db_feed.clone();
+                                let t_bg = t_feed.clone();
+                                move || async move {
+                                    let repo = crate::domain::repository::agent_feed_repo::AgentFeedRepository::new(db_bg);
+                                    match repo.list(&t_bg, 5, 0, mobile_optimized).await {
+                                        Ok(items) => {
+                                            let any_response = if mobile_optimized {
+                                                let mobile_items = items.into_iter().map(|item| crate::api::agent_feed::MobileAgentFeedItem {
+                                                    id: item.id,
+                                                    event_source: item.event_source,
+                                                    context_payload: None,
+                                                    proposed_action: None,
+                                                    lifecycle_state: item.lifecycle_state,
+                                                    created_at: item.created_at,
+                                                }).collect();
+                                                crate::api::agent_feed::AnyAgentFeedListResponse::Mobile(crate::api::agent_feed::MobileAgentFeedListResponse { items: mobile_items })
+                                            } else {
+                                                crate::api::agent_feed::AnyAgentFeedListResponse::Standard(crate::api::agent_feed::AgentFeedListResponse { items })
+                                            };
+                                            Some(any_response)
+                                        },
+                                        Err(_) => None
+                                    }
+                                }
+                            }
+                        ).await;
+
+                        if let Some(cached_feed) = fetched_feed {
+                            if let crate::api::agent_feed::AnyAgentFeedListResponse::Standard(std_resp) = cached_feed {
+                                let items: Vec<serde_json::Value> = std_resp.items.into_iter().map(|i| {
+                                    serde_json::json!({
+                                        "id": i.id,
+                                        "intent": "agent_action",
+                                        "status": i.lifecycle_state,
+                                        "suggested_actions": i.proposed_action
+                                    })
+                                }).collect();
+                                return Ok::<Vec<serde_json::Value>, sqlx::Error>(items);
+                            } else if let crate::api::agent_feed::AnyAgentFeedListResponse::Mobile(mob_resp) = cached_feed {
+                                let items: Vec<serde_json::Value> = mob_resp.items.into_iter().map(|i| {
+                                    serde_json::json!({
+                                        "id": i.id,
+                                        "intent": "agent_action",
+                                        "status": i.lifecycle_state
+                                    })
+                                }).collect();
+                                return Ok::<Vec<serde_json::Value>, sqlx::Error>(items);
+                            }
+                        }
+                        Ok::<Vec<serde_json::Value>, sqlx::Error>(vec![])
+                    })
+                }
+            );
+
+            let mut final_items = work_res.unwrap_or(Ok(vec![])).unwrap_or_default();
+            if let Ok(Ok(orders)) = orders_res {
+                final_items.extend(orders);
+            }
+            if let Ok(Ok(envs)) = env_res {
+                final_items.extend(envs);
+            }
+            if let Ok(Ok(agents)) = agent_feed_res {
+                final_items.extend(agents);
+            }
+            Ok::<Vec<serde_json::Value>, sqlx::Error>(final_items)
+
+                },
+                crate::db::DbStore::Sqlite(pool) => {
+                    let pool1 = pool.clone();
+                    let pool2 = pool.clone();
+                    let t_bg1 = tenant_id.clone();
+                    let t_bg2 = tenant_id.clone();
+                    let pool_env = pool.clone();
+                    let t_env = tenant_id.clone();
+                    let cache_t_bg = tenant_id.clone();
+            let (work_res, orders_res, env_res, agent_feed_res) = tokio::join!(
+                tokio::spawn(async move {
+                    let rows = sqlx::query(if mobile_optimized { "SELECT id, signal_id, intent, status FROM daily_work_items WHERE tenant_id = ? AND status = 'PENDING' ORDER BY created_at DESC" } else { "SELECT id, signal_id, intent, customer_info, suggested_actions, status FROM daily_work_items WHERE tenant_id = ? AND status = 'PENDING' ORDER BY created_at DESC" }).bind(&t_bg1).fetch_all(&pool1).await?;
+                    use sqlx::Row;
+                    let items: Vec<serde_json::Value> = rows.into_iter().map(|r| {
+                        let mut map = serde_json::Map::new();
+                        map.insert("id".to_string(), serde_json::json!(r.get::<String, _>("id")));
+                        map.insert("signal_id".to_string(), serde_json::json!(r.try_get::<Option<String>, _>("signal_id").ok().flatten()));
+                        map.insert("intent".to_string(), serde_json::json!(r.get::<String, _>("intent")));
+                        map.insert("status".to_string(), serde_json::json!(r.get::<String, _>("status")));
+
+                        if !mobile_optimized {
+                            if let Ok(Some(v)) = r.try_get::<Option<serde_json::Value>, _>("customer_info") {
+                                map.insert("customer_info".to_string(), v);
+                            } else if let Ok(Some(s)) = r.try_get::<Option<String>, _>("customer_info")
+                                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                    map.insert("customer_info".to_string(), v);
+                                }
+                            if let Ok(Some(v)) = r.try_get::<Option<serde_json::Value>, _>("suggested_actions") {
+                                map.insert("suggested_actions".to_string(), v);
+                            } else if let Ok(Some(s)) = r.try_get::<Option<String>, _>("suggested_actions")
+                                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                    map.insert("suggested_actions".to_string(), v);
+                                }
+                        }
+
+                        serde_json::Value::Object(map)
+                    }).collect();
+                    Ok::<Vec<serde_json::Value>, sqlx::Error>(items)
+                }),
+                tokio::spawn(async move {
+                    let rows = sqlx::query(if mobile_optimized { "SELECT id, status, 0.0 as total_amount FROM orders WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 5" } else { "SELECT id, status, total_amount FROM orders WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 5" }).bind(&t_bg2).fetch_all(&pool2).await?;
+                    use sqlx::Row;
+                    let items: Vec<serde_json::Value> = rows.into_iter().map(|o| {
+                        serde_json::json!({
+                            "id": o.try_get::<String, _>("id").unwrap_or_default(),
+                            "intent": "recent_order",
+                            "status": o.try_get::<String, _>("status").unwrap_or_default()
+                        })
+                    }).collect();
+                    Ok::<Vec<serde_json::Value>, sqlx::Error>(items)
+                }),
+                tokio::spawn(async move {
+                    let rows = sqlx::query(if mobile_optimized { "SELECT id, status FROM task_envelopes WHERE tenant_id = ? AND status NOT IN ('COMPLETED', 'APPROVED', 'DISMISSED') ORDER BY created_at DESC" } else { "SELECT id, current_department, status, payload, routing_history FROM task_envelopes WHERE tenant_id = ? AND status NOT IN ('COMPLETED', 'APPROVED', 'DISMISSED') ORDER BY created_at DESC" }).bind(&t_env).fetch_all(&pool_env).await?;
+                    use sqlx::Row;
+                    let items: Vec<serde_json::Value> = rows.into_iter().map(|e| {
+                        let mut map = serde_json::Map::new();
+                        map.insert("id".to_string(), serde_json::json!(e.try_get::<String, _>("id").unwrap_or_default()));
+                        map.insert("intent".to_string(), serde_json::json!("task_envelope"));
+                        map.insert("status".to_string(), serde_json::json!(e.try_get::<String, _>("status").unwrap_or_default()));
+
+                        if !mobile_optimized {
+                            let dept = e.try_get::<String, _>("current_department").unwrap_or_default();
+                            map.insert("customer_info".to_string(), serde_json::json!({ "department": dept }));
+                            let payload_str: String = e.try_get("payload").unwrap_or_else(|_| "{}".to_string());
+                            let payload_val: serde_json::Value = serde_json::from_str(&payload_str).unwrap_or_else(|_| serde_json::json!({}));
+                            map.insert("suggested_actions".to_string(), payload_val);
+                        }
+
+                        serde_json::Value::Object(map)
+                    }).collect();
+                    Ok::<Vec<serde_json::Value>, sqlx::Error>(items)
+                }),
+                {
+                    let db_feed = db.clone();
+                    let t_feed = cache_t_bg.clone();
+                    tokio::spawn(async move {
+                        let cache = crate::api::agent_feed::get_agent_feed_cache();
+                        let feed_cache_key = format!("agent_feed:{}:5:0:{}", t_feed, mobile_optimized);
+                        let tag = format!("agent_feed_tenant:{}", t_feed);
+                        let fetched_feed = cache.get_or_fetch_with_tags_swr(
+                            &feed_cache_key,
+                            vec![tag],
+                            std::time::Duration::from_secs(60),
+                            {
+                                let db_bg = db_feed.clone();
+                                let t_bg = t_feed.clone();
+                                move || async move {
+                                    let repo = crate::domain::repository::agent_feed_repo::AgentFeedRepository::new(db_bg);
+                                    match repo.list(&t_bg, 5, 0, mobile_optimized).await {
+                                        Ok(items) => {
+                                            let any_response = if mobile_optimized {
+                                                let mobile_items = items.into_iter().map(|item| crate::api::agent_feed::MobileAgentFeedItem {
+                                                    id: item.id,
+                                                    event_source: item.event_source,
+                                                    context_payload: None,
+                                                    proposed_action: None,
+                                                    lifecycle_state: item.lifecycle_state,
+                                                    created_at: item.created_at,
+                                                }).collect();
+                                                crate::api::agent_feed::AnyAgentFeedListResponse::Mobile(crate::api::agent_feed::MobileAgentFeedListResponse { items: mobile_items })
+                                            } else {
+                                                crate::api::agent_feed::AnyAgentFeedListResponse::Standard(crate::api::agent_feed::AgentFeedListResponse { items })
+                                            };
+                                            Some(any_response)
+                                        },
+                                        Err(_) => None
+                                    }
+                                }
+                            }
+                        ).await;
+
+                        if let Some(cached_feed) = fetched_feed {
+                            if let crate::api::agent_feed::AnyAgentFeedListResponse::Standard(std_resp) = cached_feed {
+                                let items: Vec<serde_json::Value> = std_resp.items.into_iter().map(|i| {
+                                    serde_json::json!({
+                                        "id": i.id,
+                                        "intent": "agent_action",
+                                        "status": i.lifecycle_state,
+                                        "suggested_actions": i.proposed_action
+                                    })
+                                }).collect();
+                                return Ok::<Vec<serde_json::Value>, sqlx::Error>(items);
+                            } else if let crate::api::agent_feed::AnyAgentFeedListResponse::Mobile(mob_resp) = cached_feed {
+                                let items: Vec<serde_json::Value> = mob_resp.items.into_iter().map(|i| {
+                                    serde_json::json!({
+                                        "id": i.id,
+                                        "intent": "agent_action",
+                                        "status": i.lifecycle_state
+                                    })
+                                }).collect();
+                                return Ok::<Vec<serde_json::Value>, sqlx::Error>(items);
+                            }
+                        }
+                        Ok::<Vec<serde_json::Value>, sqlx::Error>(vec![])
+                    })
+                }
+            );
+
+            let mut final_items = work_res.unwrap_or(Ok(vec![])).unwrap_or_default();
+            if let Ok(Ok(orders)) = orders_res {
+                final_items.extend(orders);
+            }
+            if let Ok(Ok(envs)) = env_res {
+                final_items.extend(envs);
+            }
+            if let Ok(Ok(agents)) = agent_feed_res {
+                final_items.extend(agents);
+            }
+            Ok::<Vec<serde_json::Value>, sqlx::Error>(final_items)
+
+                }
+            };
+            res.ok()
+        }
+    }).await;
+
+    let res = items_opt.ok_or_else(|| sqlx::Error::RowNotFound);
+
+    match res {
+        Ok(items) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"items": items})),
+        )
+            .into_response(),
+        Err(error) => {
+            ::server_telemetry::record_error_signal("[bug] Failed to load daily work");
+            tracing::error!("Failed to load daily work: {error:?}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Daily work unavailable"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn approve_daily_work_handler(
+    State(db): State<Arc<DB>>,
+    axum::extract::Extension(claims): axum::extract::Extension<::server_common::Claims>,
+    Path(id): Path<String>,
+    Json(payload): Json<ApproveDailyWorkRequest>,
+) -> axum::response::Response {
+    let Some(tenant_id) = signed_tenant_id(&claims) else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    if id.trim().is_empty() || id.len() > 200 {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
+    let target_status = match payload.action_status.as_str() {
+        "DISMISSED" => "DISMISSED",
+        "APPROVED" => "APPROVED",
+        _ => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    match &db.store {
+        crate::db::DbStore::Postgres => {
+            let mut tx = match db.pool.begin().await {
+                Ok(tx) => tx,
+                Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            if ::server_common::auth_utils::set_org_context(&mut *tx, &tenant_id)
+                .await
+                .is_err()
+            {
+                return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let res = sqlx::query(
+                "UPDATE daily_work_items SET status = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3"
+            )
+            .bind(target_status)
+            .bind(&id)
+            .bind(&tenant_id)
+            .execute(&mut *tx).await;
+
+            let res2 = sqlx::query(
+                "UPDATE task_envelopes SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1 AND tenant_id = $2"
+            )
+            .bind(&id)
+            .bind(&tenant_id)
+            .execute(&mut *tx).await;
+
+            let rows_affected = match (res, res2) {
+                (Ok(first), Ok(second)) => first.rows_affected() + second.rows_affected(),
+                _ => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            if tx.commit().await.is_err() {
+                return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            if rows_affected > 0 {
+                if let Some(cache) = DAILY_WORK_CACHE.get() {
+                    cache
+                        .invalidate(&format!("daily_work:{}:mobile:false", tenant_id))
+                        .await;
+                    cache
+                        .invalidate(&format!("daily_work:{}:mobile:true", tenant_id))
+                        .await;
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({"success": true})),
+                )
+                    .into_response()
+            } else {
+                axum::http::StatusCode::NOT_FOUND.into_response()
+            }
+        }
+        crate::db::DbStore::Sqlite(pool) => {
+            let mut tx = match pool.begin().await {
+                Ok(tx) => tx,
+                Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let res = sqlx::query(
+                "UPDATE daily_work_items SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ?"
+            )
+            .bind(target_status)
+            .bind(&id)
+            .bind(&tenant_id)
+            .execute(&mut *tx).await;
+
+            let res2 = sqlx::query(
+                "UPDATE task_envelopes SET status = 'COMPLETED', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ?"
+            )
+            .bind(&id)
+            .bind(&tenant_id)
+            .execute(&mut *tx).await;
+
+            let rows_affected = match (res, res2) {
+                (Ok(first), Ok(second)) => first.rows_affected() + second.rows_affected(),
+                _ => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            if tx.commit().await.is_err() {
+                return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            if rows_affected > 0 {
+                if let Some(cache) = DAILY_WORK_CACHE.get() {
+                    cache
+                        .invalidate(&format!("daily_work:{}:mobile:false", tenant_id))
+                        .await;
+                    cache
+                        .invalidate(&format!("daily_work:{}:mobile:true", tenant_id))
+                        .await;
+                }
+                (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({"success": true})),
+                )
+                    .into_response()
+            } else {
+                axum::http::StatusCode::NOT_FOUND.into_response()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn daily_work_cache_invalidation_preserves_other_tenants() {
+        let tenant = format!("daily-work-cache-{}", Uuid::new_v4());
+        let other = format!("daily-work-other-{}", Uuid::new_v4());
+        let cache = DAILY_WORK_CACHE.get_or_init(|| ::server_utils::cache::HybridCache::new(None));
+        for owner in [&tenant, &other] {
+            for mobile in [false, true] {
+                cache
+                    .set(
+                        &format!("daily_work:{owner}:mobile:{mobile}"),
+                        vec![serde_json::json!({"id": "pending-work"})],
+                        std::time::Duration::from_secs(60),
+                    )
+                    .await;
+            }
+        }
+        invalidate_daily_work_cache(&tenant).await;
+        for mobile in [false, true] {
+            assert!(
+                cache
+                    .get(&format!("daily_work:{tenant}:mobile:{mobile}"))
+                    .await
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .get(&format!("daily_work:{other}:mobile:{mobile}"))
+                    .await
+                    .is_some()
+            );
+        }
+        invalidate_daily_work_cache(&other).await;
+    }
+
+    #[test]
+    fn daily_work_authority_comes_only_from_signed_claims() {
+        let mut claims = ::server_common::Claims {
+            sub: "user-a".to_string(),
+            exp: i64::MAX,
+            iat: 0,
+            organization_id: Some("tenant-a".to_string()),
+            username: "user-a".to_string(),
+            email: "user-a@example.com".to_string(),
+            roles: vec![],
+            session_id: None,
+            jti: "daily-work-test".to_string(),
+        };
+        assert_eq!(signed_tenant_id(&claims).as_deref(), Some("tenant-a"));
+        claims.organization_id = Some("system".to_string());
+        assert_eq!(signed_tenant_id(&claims), None);
+        claims.organization_id = None;
+        assert_eq!(signed_tenant_id(&claims), None);
+        assert!(
+            serde_json::from_value::<ApproveDailyWorkRequest>(serde_json::json!({
+                "action_status": "APPROVED",
+                "tenant_id": "attacker"
+            }))
+            .is_err()
+        );
+    }
+}

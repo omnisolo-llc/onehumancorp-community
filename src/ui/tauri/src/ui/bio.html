@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <style>
+      .glassmorphism {
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.65);
+        backdrop-filter: blur(40px) saturate(220%);
+        -webkit-backdrop-filter: blur(40px) saturate(220%);
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      }
+      @media (prefers-color-scheme: dark) {
+        .glassmorphism {
+          border-radius: 16px;
+          background: rgba(22, 22, 26, 0.7);
+          backdrop-filter: blur(40px) saturate(220%);
+          -webkit-backdrop-filter: blur(40px) saturate(220%);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+      }
+      .old-glassmorphism {
+        background: rgba(255, 255, 255, 0.65);
+        backdrop-filter: blur(40px) saturate(220%);
+        -webkit-backdrop-filter: blur(40px) saturate(220%);
+        border: 1px solid rgba(255, 255, 255, 0.4);
+        border-radius: 16px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      }
+      .glassmorphism-btn {
+        border-radius: 8px;
+      }
+      .glassmorphism-input {
+        border-radius: 8px;
+      }
+    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Link-in-Bio</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 480px;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 64px 24px 48px;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        .avatar {
+            width: 96px;
+            height: 96px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.65);
+            backdrop-filter: blur(40px) saturate(220%);
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 36px;
+            margin-bottom: 24px;
+            margin-top: 16px;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.06);
+        }
+
+        .title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 30px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            text-align: center;
+        }
+
+        .bio {
+            font-size: 16px;
+            font-weight: 500;
+            opacity: 0.9;
+            text-align: center;
+            margin-bottom: 40px;
+            max-width: 320px;
+            line-height: 1.5;
+        }
+
+        .links-container {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .link-item {
+            width: 100%;
+            padding: 16px 24px;
+            border-radius: 16px;
+            text-align: center;
+            font-weight: 700;
+            font-size: 15px;
+            text-decoration: none;
+            transition: transform 0.2s;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            display: block;
+        }
+
+        .link-item:hover {
+            transform: scale(1.02);
+        }
+
+        .footer {
+            margin-top: auto;
+            padding-top: 48px;
+            padding-bottom: 24px;
+        }
+
+        .footer a {
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            text-decoration: none;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+
+        .footer a:hover {
+            opacity: 1;
+        }
+
+        /* Expandable Badge Styles */
+        .omnisolo-floating-badge {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 99999;
+            background: rgba(255, 255, 255, 0.65);
+            backdrop-filter: blur(40px) saturate(220%);
+            -webkit-backdrop-filter: blur(40px) saturate(220%);
+            border: 1px solid rgba(255, 255, 255, 0.4);
+            border-radius: 9999px;
+            padding: 12px 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #1d1d1f;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            overflow: hidden;
+            width: auto;
+            max-width: 200px; /* Collapsed state max width */
+        }
+
+        .omnisolo-floating-badge:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+        }
+
+        .omnisolo-floating-badge .badge-icon {
+            font-size: 16px;
+        }
+
+        .omnisolo-floating-badge .badge-content {
+            display: none;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(0,0,0,0.1);
+            width: 100%;
+            text-align: left;
+        }
+
+        .omnisolo-floating-badge .badge-content p {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 500;
+            color: #1d1d1f;
+            line-height: 1.4;
+        }
+
+        .omnisolo-floating-badge .badge-cta {
+            display: inline-block;
+            background: #0066FF;
+            color: white;
+            text-decoration: none;
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            text-align: center;
+            transition: background 0.2s;
+            width: 100%;
+        }
+
+        .omnisolo-floating-badge .badge-cta:hover {
+            background: #005ce6;
+        }
+
+        /* Expanded State */
+        .omnisolo-floating-badge.expanded {
+            border-radius: 20px;
+            flex-direction: column;
+            align-items: flex-start;
+            padding: 20px;
+            max-width: 300px; /* Expanded state max width */
+            cursor: default;
+        }
+
+        .omnisolo-floating-badge.expanded:hover {
+            transform: none; /* Disable hover lift when expanded */
+        }
+
+        .omnisolo-floating-badge.expanded .badge-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            width: 100%;
+            cursor: pointer;
+        }
+
+        .omnisolo-floating-badge.expanded .badge-content {
+            display: flex;
+        }
+
+        /* Dark mode overrides if needed based on body background, but since it's glass it adapts well. We can add specific dark mode if required */
+    </style>
+</head>
+<body>
+
+<p id="private-preview-status" role="status">Loading private preview…</p>
+<div id="app" class="container glassmorphism" hidden>
+    <div class="avatar">✨</div>
+    <h1 id="title" class="title">Loading...</h1>
+    <p id="bio" class="bio"></p>
+
+    <div class="links-container" id="links">
+    </div>
+
+    <div class="footer">
+        <!-- Replaced by floating badge -->
+    </div>
+
+    <!-- Expandable Floating Badge -->
+    <div id="ohc-badge" class="omnisolo-floating-badge">
+        <div class="badge-header" id="ohc-badge-header">
+            <span class="badge-icon">⚡</span>
+            <span>OmniSolo</span>
+        </div>
+        <div class="badge-content">
+            <p>This is a private business profile. Explore workspace setup.</p>
+            <a id="badge-cta-link" href="#" class="badge-cta">View setup</a>
+        </div>
+    </div>
+</div>
+
+<script>
+function isSupportedBioUrl(value) {
+    if(typeof value!=='string'||!/^https?:\/\//i.test(value)||/[\s\p{Cc}\\]/u.test(value))return false;
+    try{const url=new URL(value);return (url.protocol==='http:'||url.protocol==='https:')&&url.hostname.length>0;}catch{return false;}
+}
+    document.addEventListener('DOMContentLoaded', async () => {
+        const titleEl=document.getElementById('title'), bioEl=document.getElementById('bio'), linksEl=document.getElementById('links'), appEl=document.getElementById('app'), statusEl=document.getElementById('private-preview-status');
+        let active=true, expiry;
+        const unavailable=message=>{appEl.hidden=true;titleEl.textContent='';bioEl.textContent='';linksEl.replaceChildren();document.getElementById('badge-cta-link').removeAttribute('href');statusEl.setAttribute('role','alert');statusEl.textContent=message;};
+        const retire=()=>{active=false;clearTimeout(expiry);unavailable('Your session changed. Reload to verify private preview access.');};
+        window.addEventListener('omnisolo_auth_changed',retire);window.addEventListener('pagehide',retire);window.addEventListener('storage',event=>{if(event.key===null||event.key==='omnisolo_queue_identity_epoch_v2')retire();});
+        let tenant, data;
+        try {
+            if(!['http:','https:'].includes(location.protocol))throw new Error('Sign in to the owning business in the authenticated app to view this private profile.');
+            const queryTenant=new URLSearchParams(location.search).get('tenant');
+            const last=location.pathname.split('/').pop();tenant=queryTenant || (last && !last.endsWith('.html')?decodeURIComponent(last):'');
+            const identityResponse=await fetch('/api/v1/auth/session-identity',{credentials:'same-origin',cache:'no-store',redirect:'error'});
+            const owner=await identityResponse.json();if(!active)return;
+            if(identityResponse.status!==200 || owner?.error!=null || owner?.success===false || typeof owner?.userId!=='string' || !owner.userId || owner.tenantId!==tenant || !tenant || !Number.isFinite(owner.expiresAt) || owner.expiresAt<=Date.now())throw new Error('Sign in to the owning business to view this private profile.');
+            const expected=new Headers({'x-ohc-expected-user':owner.userId,'x-ohc-expected-tenant':owner.tenantId});
+            if(expected.get('x-ohc-expected-user')!==owner.userId || expected.get('x-ohc-expected-tenant')!==owner.tenantId)throw new Error('Private profile identity is unavailable.');
+            expiry=setTimeout(retire,Math.min(owner.expiresAt-Date.now(),2147483647));
+            const response=await fetch(`/api/v1/growth/link-in-bio/${encodeURIComponent(tenant)}`,{headers:expected,credentials:'same-origin',cache:'no-store',redirect:'error'});
+            if(response.status===404)throw new Error('No saved private profile exists for this business.');
+            if(response.status===401||response.status===403)throw new Error('Sign in to the owning business to view this private profile.');
+            if(response.status!==200)throw new Error('The private profile is unavailable. Try loading it again later.');
+            data=await response.json();if(!active)return;
+            if(data?.error!=null || data?.success===false || typeof data?.store_name!=='string' || typeof data.bio!=='string' || typeof data.theme!=='string' || !Array.isArray(data.links) || data.links.some(link=>!link||typeof link.title!=='string'||typeof link.url!=='string'))throw new Error('The private profile is unavailable.');
+        } catch(error) {if(active)unavailable(error.message || 'The private profile is unavailable.');return;}
+        if(!active)return;
+        appEl.hidden=false;statusEl.textContent='Private preview. Public publication is not available.';
+        // Update UI
+        titleEl.textContent = data.store_name;
+        bioEl.textContent = data.bio;
+
+        // Setup Badge Interactive Logic
+        const badge = document.getElementById('ohc-badge') || document.getElementById('omnisolo-badge');
+        const badgeHeader = document.getElementById('ohc-badge-header') || document.getElementById('omnisolo-badge-header');
+        const ctaLink = document.getElementById('badge-cta-link');
+
+        if (data.remove_branding) {
+            badge.style.display = 'none';
+        } else {
+            ctaLink.href = `/api/v1/growth/referrals/click?target=/onboarding&ref=${encodeURIComponent(tenant)}&source=bio_expandable_badge`;
+
+            badgeHeader.addEventListener('click', () => {
+                badge.classList.toggle('expanded');
+            });
+        }
+
+        let styles = { bg: 'linear-gradient(135deg, #a18cd1 0%, #fbc2eb 100%)', color: '#1D1D1F', linkBg: 'rgba(255, 255, 255, 0.15)', linkBorder: 'rgba(255, 255, 255, 0.3)' };
+        switch(data.theme) {
+            case 'dark': styles = { bg: '#1D1D1F', color: '#ffffff', linkBg: 'rgba(255, 255, 255, 0.15)', linkBorder: 'rgba(255, 255, 255, 0.3)' }; break;
+            case 'light': styles = { bg: '#f3f4f6', color: '#111827', linkBg: '#ffffff', linkBorder: '#e5e7eb' }; break;
+            case 'purple': styles = { bg: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', color: '#ffffff', linkBg: 'rgba(255, 255, 255, 0.15)', linkBorder: 'rgba(255, 255, 255, 0.3)' }; break;
+        }
+
+        document.body.style.background = styles.theme === 'light' ? '#f3f4f6' : '#000';
+        appEl.style.background = styles.bg;
+        appEl.style.color = styles.color;
+
+        data.links.forEach(link => {
+            const supported = isSupportedBioUrl(link.url);
+            const a = document.createElement(supported ? 'a' : 'span');
+            if(supported)a.href = link.url;else a.setAttribute('aria-disabled','true');
+            a.className = 'link-item';
+            a.textContent = link.title + (supported ? '' : ' (unavailable)');
+            a.style.background = styles.linkBg;
+            a.style.border = `1px solid ${styles.linkBorder}`;
+            a.style.color = styles.color;
+            a.style.backdropFilter = 'blur(10px)';
+            linksEl.appendChild(a);
+        });
+    });
+</script>
+  <script src="help-widget.mjs" type="module"></script>
+  </body>
+</html>

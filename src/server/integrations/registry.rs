@@ -1,0 +1,1724 @@
+use chrono::Utc;
+use std::sync::RwLock;
+
+#[path = "registry_config.rs"]
+mod config;
+use config::{RegistryConnectionInput, validate_registry_connection};
+
+pub struct IntegrationCredentials {
+    pub bot_token: String,
+    pub chat_id: String,
+    pub webhook_url: String,
+    pub api_token: String,
+    pub from_phone: String,
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+pub struct IntegrationsRegistry {
+    messages: RwLock<
+        std::collections::HashMap<String, Vec<::server_omnisolo::orchestration::ChatMessage>>,
+    >,
+    instances: RwLock<
+        std::collections::HashMap<String, ::server_omnisolo::orchestration::IntegrationInstance>,
+    >,
+    pull_requests: RwLock<
+        std::collections::HashMap<String, Vec<::server_omnisolo::orchestration::PullRequest>>,
+    >,
+    issues: RwLock<std::collections::HashMap<String, Vec<::server_omnisolo::orchestration::Issue>>>,
+    credentials: RwLock<std::collections::HashMap<String, IntegrationCredentials>>,
+    pub trello_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::trello::provider::TrelloProvider>,
+        >,
+    >,
+    twilio_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::twilio::provider::TwilioProvider>,
+        >,
+    >,
+    meta_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::meta::provider::MetaProvider>,
+        >,
+    >,
+    calendly_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::calendly::provider::CalendlyProvider>,
+        >,
+    >,
+    cal_com_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::cal_com::provider::CalComProvider>,
+        >,
+    >,
+    pub google_workspace_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<
+                crate::integrations::google_workspace::provider::GoogleWorkspaceProvider,
+            >,
+        >,
+    >,
+    google_calendar_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::google_calendar::provider::GoogleCalendarProvider>,
+        >,
+    >,
+    mailchimp_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::mailchimp::provider::MailchimpProvider>,
+        >,
+    >,
+    mercadopago_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::mercadopago::provider::MercadoPagoProvider>,
+        >,
+    >,
+    alipay_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::alipay::provider::AlipayProvider>,
+        >,
+    >,
+    pub razorpay_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::razorpay::provider::RazorpayProvider>,
+        >,
+    >,
+    shippo_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::shippo::provider::ShippoProvider>,
+        >,
+    >,
+    zoom_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::zoom::provider::ZoomProvider>,
+        >,
+    >,
+    doordash_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::doordash::provider::DoorDashProvider>,
+        >,
+    >,
+    resend_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::resend::provider::ResendProvider>,
+        >,
+    >,
+    sendgrid_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::sendgrid::provider::SendGridProvider>,
+        >,
+    >,
+    taxjar_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::taxjar::provider::TaxJarProvider>,
+        >,
+    >,
+    slack_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::slack::provider::SlackProvider>,
+        >,
+    >,
+    google_analytics_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<
+                crate::integrations::google_analytics::provider::GoogleAnalyticsProvider,
+            >,
+        >,
+    >,
+    github_api_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::integrations::github_api::provider::GitHubProvider>,
+        >,
+    >,
+    outlook_calendar_clients: std::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<
+                crate::integrations::outlook_calendar::provider::OutlookCalendarProvider,
+            >,
+        >,
+    >,
+}
+
+impl Default for IntegrationsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IntegrationsRegistry {
+    pub fn new() -> Self {
+        let mut instances = std::collections::HashMap::new();
+        for provider in crate::integrations::catalog::get_catalog() {
+            let id = provider.metadata.id.clone();
+            instances.insert(
+                id.clone(),
+                ::server_omnisolo::orchestration::IntegrationInstance {
+                    id: id.clone(),
+                    name: provider.metadata.name.clone(),
+                    category: provider.metadata.category.clone(),
+                    status: "disconnected".to_string(),
+                    base_url: provider.metadata.base_url.clone(),
+                },
+            );
+        }
+
+        IntegrationsRegistry {
+            messages: RwLock::new(std::collections::HashMap::new()),
+            instances: RwLock::new(instances),
+            pull_requests: RwLock::new(std::collections::HashMap::new()),
+            issues: RwLock::new(std::collections::HashMap::new()),
+            credentials: RwLock::new(std::collections::HashMap::new()),
+            trello_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            twilio_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            meta_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            calendly_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            cal_com_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            google_workspace_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            google_calendar_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            mailchimp_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            mercadopago_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            razorpay_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            alipay_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            shippo_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            zoom_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            doordash_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            resend_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            sendgrid_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            taxjar_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            slack_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            google_analytics_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            github_api_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+            outlook_calendar_clients: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    // Chat methods
+    pub fn test_connection(
+        &self,
+        integration_id: &str,
+        _creds: ::server_omnisolo::orchestration::ChatTestRequest,
+    ) -> Result<(), String> {
+        if integration_id.is_empty() {
+            return Err("integrationId is required".to_string());
+        }
+        Err("Provider verification is not implemented in this registry; configuration alone is not a verified connection".to_string())
+    }
+
+    pub fn chat_messages(
+        &self,
+        integration_id: &str,
+    ) -> Vec<::server_omnisolo::orchestration::ChatMessage> {
+        let msgs = self.messages.read().unwrap();
+        msgs.get(integration_id).cloned().unwrap_or_default()
+    }
+
+    pub fn send_chat_message(
+        &self,
+        integration_id: &str,
+        channel: &str,
+        from_agent: &str,
+        content: &str,
+        thread_id: &str,
+    ) -> Result<::server_omnisolo::orchestration::ChatMessage, String> {
+        let msg = ::server_omnisolo::orchestration::ChatMessage {
+            id: format!("msg-{}", Utc::now().timestamp()),
+            channel: channel.to_string(),
+            from_agent: from_agent.to_string(),
+            content: content.to_string(),
+            thread_id: thread_id.to_string(),
+            timestamp_unix: Utc::now().timestamp(),
+        };
+
+        let mut msgs = self.messages.write().unwrap();
+        msgs.entry(integration_id.to_string())
+            .or_default()
+            .push(msg.clone());
+
+        // Attempt real delivery
+        let creds_map = self.credentials.read().unwrap();
+        if let Some(creds) = creds_map.get(integration_id) {
+            let text = format!("[{}] {}", from_agent, content);
+            match integration_id {
+                "telegram" if !creds.bot_token.is_empty() => {
+                    let chat_id = if !creds.chat_id.is_empty() {
+                        creds.chat_id.clone()
+                    } else {
+                        channel.to_string()
+                    };
+                    tokio::spawn(send_telegram_message(
+                        creds.bot_token.clone(),
+                        chat_id,
+                        text,
+                    ));
+                }
+                "discord" if !creds.webhook_url.is_empty() => {
+                    tokio::spawn(send_discord_webhook(
+                        creds.webhook_url.clone(),
+                        from_agent.to_string(),
+                        content.to_string(),
+                    ));
+                }
+                "slack" if !creds.bot_token.is_empty() => {
+                    let channel_id = if !creds.chat_id.is_empty() {
+                        creds.chat_id.clone()
+                    } else {
+                        channel.to_string()
+                    };
+                    let text = format!("[{}] {}", from_agent, content);
+                    let clients = self.slack_clients.read().unwrap();
+                    if let Some(client) = clients.get(integration_id) {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = client.send_message(&channel_id, &text).await {
+                                ::server_telemetry::record_error_signal(
+                                    "[bug] Failed to send Slack message",
+                                );
+                                tracing::warn!("Failed to send Slack message: {}", e);
+                            }
+                        });
+                    }
+                }
+                "twilio" if !creds.from_phone.is_empty() => {
+                    let to = if !creds.chat_id.is_empty() {
+                        creds.chat_id.clone()
+                    } else {
+                        channel.to_string()
+                    };
+                    let from = creds.from_phone.clone();
+                    let text = content.to_string();
+
+                    let clients = self.twilio_clients.read().unwrap();
+                    if let Some(client) = clients.get(integration_id) {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            let result =
+                                if to.starts_with("whatsapp:") || from.starts_with("whatsapp:") {
+                                    client.send_whatsapp(&to, &from, &text).await
+                                } else {
+                                    client.send_sms(&to, &from, &text).await
+                                };
+                            if let Err(e) = result {
+                                ::server_telemetry::record_error_signal(
+                                    "[bug] Failed to send Twilio SMS",
+                                );
+                                tracing::warn!("Failed to send Twilio SMS: {}", e);
+                            }
+                        });
+                    }
+                }
+                "meta" | "whatsapp" | "whatsapp_cloud_api" if !creds.api_token.is_empty() => {
+                    let to = if !creds.chat_id.is_empty() {
+                        creds.chat_id.clone()
+                    } else {
+                        channel.to_string()
+                    };
+                    let text = content.to_string();
+
+                    let client = {
+                        let clients = self.meta_clients.read().unwrap();
+                        clients.get(integration_id).cloned()
+                    };
+                    if let Some(client) = client {
+                        let client = client.clone();
+                        let is_whatsapp =
+                            integration_id == "whatsapp" || integration_id == "whatsapp_cloud_api";
+                        tokio::spawn(async move {
+                            // For this naive integration, we assume channel might specify the platform like "whatsapp", "instagram"
+                            // Otherwise we default to whatsapp
+                            let platform = if is_whatsapp || to.contains("whatsapp") {
+                                "whatsapp"
+                            } else if to.contains("instagram") {
+                                "instagram"
+                            } else {
+                                "facebook"
+                            };
+                            if let Err(e) = client.send_message(platform, &to, &text).await {
+                                ::server_telemetry::record_error_signal(
+                                    "[bug] Failed to send Meta message",
+                                );
+                                tracing::warn!("Failed to send Meta message: {}", e);
+                            }
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(msg)
+    }
+
+    // Integration methods
+    pub fn instances(&self) -> Vec<::server_omnisolo::orchestration::IntegrationInstance> {
+        let insts = self.instances.read().unwrap();
+        insts.values().cloned().collect()
+    }
+
+    pub fn instances_by_category(
+        &self,
+        category: &str,
+    ) -> Vec<::server_omnisolo::orchestration::IntegrationInstance> {
+        let insts = self.instances.read().unwrap();
+        insts
+            .values()
+            .filter(|i| i.category == category)
+            .cloned()
+            .collect()
+    }
+
+    pub fn connect(
+        &self,
+        integration_id: &str,
+        base_url: &str,
+        creds: ::server_omnisolo::orchestration::ConnectIntegrationRequest,
+    ) -> Result<::server_omnisolo::orchestration::IntegrationInstance, String> {
+        validate_registry_connection(RegistryConnectionInput {
+            integration_id,
+            base_url,
+            bot_token: &creds.bot_token,
+            webhook_url: &creds.webhook_url,
+            api_token: &creds.api_token,
+            api_key: &creds.api_key,
+            api_secret: &creds.api_secret,
+        })
+        .map_err(str::to_string)?;
+        if !creds.integration_id.is_empty() && creds.integration_id != integration_id {
+            return Err("Integration identity does not match the configuration target".to_string());
+        }
+        let catalog_id = if integration_id == "whatsapp" {
+            "whatsapp_cloud_api"
+        } else {
+            integration_id
+        };
+        let metadata = crate::integrations::catalog::get_catalog()
+            .into_iter()
+            .find(|provider| provider.metadata.id == catalog_id)
+            .ok_or_else(|| {
+                "Integration configuration is not supported for this provider".to_string()
+            })?
+            .metadata;
+        let mut insts = self.instances.write().unwrap();
+        let inst = ::server_omnisolo::orchestration::IntegrationInstance {
+            id: integration_id.to_string(),
+            name: metadata.name,
+            category: metadata.category,
+            status: "configured".to_string(),
+            base_url: metadata.base_url,
+        };
+        insts.insert(integration_id.to_string(), inst.clone());
+
+        let mut credentials = self.credentials.write().unwrap();
+        credentials.insert(
+            integration_id.to_string(),
+            IntegrationCredentials {
+                bot_token: creds.bot_token.clone(),
+                chat_id: creds.chat_id.clone(),
+                webhook_url: creds.webhook_url.clone(),
+                api_token: creds.api_token.clone(),
+                from_phone: creds.from_phone.clone(),
+                api_key: creds.api_key.clone(),
+                api_secret: creds.api_secret.clone(),
+            },
+        );
+        if integration_id == "trello" {
+            let mut clients = self.trello_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::trello::provider::TrelloProvider::new(
+                    creds.api_token.clone(),
+                    creds.bot_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "twilio" {
+            let mut clients = self.twilio_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::twilio::provider::TwilioProvider::new(
+                    creds.bot_token.clone(),
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "meta" {
+            let mut clients = self.meta_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::meta::provider::MetaProvider::new(
+                    creds.api_token.clone(),
+                    Some(if !creds.chat_id.is_empty() {
+                        creds.chat_id.clone()
+                    } else {
+                        creds.from_phone.clone()
+                    }),
+                )),
+            );
+        }
+        if integration_id == "whatsapp" || integration_id == "whatsapp_cloud_api" {
+            let mut clients = self.meta_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::meta::provider::MetaProvider::new(
+                    creds.api_token.clone(),
+                    Some(if !creds.chat_id.is_empty() {
+                        creds.chat_id.clone()
+                    } else {
+                        creds.from_phone.clone()
+                    }),
+                )),
+            );
+        }
+        if integration_id == "calendly" {
+            let mut clients = self.calendly_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::calendly::provider::CalendlyProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "cal_com" {
+            let mut clients = self.cal_com_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::cal_com::provider::CalComProvider::new(
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "google_workspace" {
+            let mut clients = self.google_workspace_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::google_workspace::provider::GoogleWorkspaceProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "google_calendar" {
+            let mut clients = self.google_calendar_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::google_calendar::provider::GoogleCalendarProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "mailchimp" {
+            let mut clients = self.mailchimp_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::mailchimp::provider::MailchimpProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "alipay" {
+            let mut clients = self.alipay_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::alipay::provider::AlipayProvider::new(
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "mercadopago" {
+            let mut clients = self.mercadopago_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::mercadopago::provider::MercadoPagoProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+
+        if integration_id == "razorpay" {
+            let mut clients = self.razorpay_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::razorpay::provider::RazorpayProvider::new(
+                        creds.api_key.clone(),
+                        creds.api_secret.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "shippo" {
+            let mut clients = self.shippo_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::shippo::provider::ShippoProvider::new(
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "taxjar" {
+            let mut clients = self.taxjar_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::taxjar::provider::TaxJarProvider::new(
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "zoom" {
+            let mut clients = self.zoom_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::zoom::provider::ZoomProvider::new(
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "doordash" {
+            let mut clients = self.doordash_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::doordash::provider::DoorDashProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "resend" {
+            let mut clients = self.resend_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::resend::provider::ResendProvider::new(
+                    creds.api_token.clone(),
+                )),
+            );
+        }
+
+        if integration_id == "sendgrid" {
+            let mut clients = self.sendgrid_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::sendgrid::provider::SendGridProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "slack" {
+            let mut clients = self.slack_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(crate::integrations::slack::provider::SlackProvider::new(
+                    creds.bot_token.clone(),
+                )),
+            );
+        }
+        if integration_id == "google_analytics" {
+            let mut clients = self.google_analytics_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::google_analytics::provider::GoogleAnalyticsProvider::new(
+                        creds.api_token.clone(),
+                        creds.chat_id.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "github_api" {
+            let mut clients = self.github_api_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::github_api::provider::GitHubProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+        if integration_id == "outlook_calendar" {
+            let mut clients = self.outlook_calendar_clients.write().unwrap();
+            clients.insert(
+                integration_id.to_string(),
+                std::sync::Arc::new(
+                    crate::integrations::outlook_calendar::provider::OutlookCalendarProvider::new(
+                        creds.api_token.clone(),
+                    ),
+                ),
+            );
+        }
+
+        Ok(inst)
+    }
+
+    pub fn disconnect(
+        &self,
+        integration_id: &str,
+    ) -> Result<::server_omnisolo::orchestration::IntegrationInstance, String> {
+        let mut insts = self.instances.write().unwrap();
+        if let Some(inst) = insts.get_mut(integration_id) {
+            inst.status = "disconnected".to_string();
+            return Ok(inst.clone());
+        }
+        Err("integration not found".to_string())
+    }
+
+    pub fn pull_requests(
+        &self,
+        integration_id: &str,
+    ) -> Vec<::server_omnisolo::orchestration::PullRequest> {
+        let prs = self.pull_requests.read().unwrap();
+        prs.get(integration_id).cloned().unwrap_or_default()
+    }
+
+    pub fn create_pull_request(
+        &self,
+        request: &::server_omnisolo::orchestration::CreatePrRequest,
+    ) -> Result<::server_omnisolo::orchestration::PullRequest, String> {
+        let integration_id = request.integration_id.as_str();
+        let title = request.title.as_str();
+        let body = request.body.as_str();
+        let source_branch = request.source_branch.as_str();
+        let target_branch = request.target_branch.as_str();
+        let created_by = request.created_by.as_str();
+        let pr = ::server_omnisolo::orchestration::PullRequest {
+            id: format!("pr-{}", Utc::now().timestamp()),
+            title: title.to_string(),
+            body: body.to_string(),
+            source_branch: source_branch.to_string(),
+            target_branch: target_branch.to_string(),
+            status: "open".to_string(),
+            created_by: created_by.to_string(),
+            created_at_unix: Utc::now().timestamp(),
+        };
+
+        let mut prs = self.pull_requests.write().unwrap();
+        prs.entry(integration_id.to_string())
+            .or_default()
+            .push(pr.clone());
+
+        Ok(pr)
+    }
+
+    pub fn merge_pull_request(
+        &self,
+        pr_id: &str,
+    ) -> Result<::server_omnisolo::orchestration::PullRequest, String> {
+        let mut prs = self.pull_requests.write().unwrap();
+        for v in prs.values_mut() {
+            if let Some(pr) = v.iter_mut().find(|p| p.id == pr_id) {
+                pr.status = "merged".to_string();
+                return Ok(pr.clone());
+            }
+        }
+        Err("pr not found".to_string())
+    }
+
+    pub fn close_pull_request(
+        &self,
+        pr_id: &str,
+    ) -> Result<::server_omnisolo::orchestration::PullRequest, String> {
+        let mut prs = self.pull_requests.write().unwrap();
+        for v in prs.values_mut() {
+            if let Some(pr) = v.iter_mut().find(|p| p.id == pr_id) {
+                pr.status = "closed".to_string();
+                return Ok(pr.clone());
+            }
+        }
+        Err("pr not found".to_string())
+    }
+
+    pub fn issues(&self, integration_id: &str) -> Vec<::server_omnisolo::orchestration::Issue> {
+        let issues = self.issues.read().unwrap();
+        issues.get(integration_id).cloned().unwrap_or_default()
+    }
+
+    pub fn create_issue(
+        &self,
+        request: &::server_omnisolo::orchestration::CreateIssueRequest,
+    ) -> Result<::server_omnisolo::orchestration::Issue, String> {
+        let integration_id = request.integration_id.as_str();
+        let title = request.title.as_str();
+        let description = request.description.as_str();
+        let created_by = request.created_by.as_str();
+        let priority = request.priority.as_str();
+        let labels = request.labels.clone();
+        let issue = ::server_omnisolo::orchestration::Issue {
+            id: format!("issue-{}", Utc::now().timestamp()),
+            title: title.to_string(),
+            description: description.to_string(),
+            status: "open".to_string(),
+            priority: priority.to_string(),
+            labels,
+            assigned_agent: String::new(),
+            created_by: created_by.to_string(),
+            created_at_unix: Utc::now().timestamp(),
+        };
+
+        let mut issues = self.issues.write().unwrap();
+        issues
+            .entry(integration_id.to_string())
+            .or_default()
+            .push(issue.clone());
+
+        Ok(issue)
+    }
+
+    pub fn update_issue_status(
+        &self,
+        issue_id: &str,
+        status: &str,
+    ) -> Result<::server_omnisolo::orchestration::Issue, String> {
+        let mut issues = self.issues.write().unwrap();
+        for v in issues.values_mut() {
+            if let Some(issue) = v.iter_mut().find(|i| i.id == issue_id) {
+                issue.status = status.to_string();
+                return Ok(issue.clone());
+            }
+        }
+        Err("issue not found".to_string())
+    }
+
+    pub fn assign_issue(
+        &self,
+        issue_id: &str,
+        assignee: &str,
+    ) -> Result<::server_omnisolo::orchestration::Issue, String> {
+        let mut issues = self.issues.write().unwrap();
+        for v in issues.values_mut() {
+            if let Some(issue) = v.iter_mut().find(|i| i.id == issue_id) {
+                issue.assigned_agent = assignee.to_string();
+                return Ok(issue.clone());
+            }
+        }
+        Err("issue not found".to_string())
+    }
+
+    pub async fn get_free_busy(
+        &self,
+        integration_id: &str,
+        time_min: &str,
+        time_max: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "google_calendar" {
+                let clients = self.google_calendar_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.get_free_busy(time_min, time_max).await;
+        }
+
+        let cal_client = {
+            if integration_id == "cal_com" {
+                let clients = self.cal_com_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = cal_client {
+            return c.get_free_busy(time_min, time_max).await;
+        }
+
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn generate_meeting_for_booking(
+        &self,
+        integration_id: &str,
+        booking_id: &str,
+        topic: &str,
+    ) -> Result<String, String> {
+        let client_zoom = {
+            if integration_id == "zoom" {
+                let clients = self.zoom_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client_zoom {
+            return c.generate_meeting_for_booking(booking_id, topic).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn fetch_tracking(
+        &self,
+        integration_id: &str,
+        carrier: &str,
+        tracking_number: &str,
+    ) -> Result<crate::integrations::shippo::client::ShippoTrackingStatus, String> {
+        let client = {
+            if integration_id == "shippo" {
+                let clients = self.shippo_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.fetch_tracking(carrier, tracking_number).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn send_whatsapp(
+        &self,
+        integration_id: &str,
+        to: &str,
+        from: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        if integration_id == "twilio" {
+            let client = {
+                let clients = self.twilio_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            };
+            if let Some(c) = client {
+                return c
+                    .send_whatsapp(to, from, body)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+            }
+        } else if integration_id == "meta"
+            || integration_id == "whatsapp"
+            || integration_id == "whatsapp_cloud_api"
+        {
+            let client = {
+                let clients = self.meta_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            };
+            if let Some(c) = client {
+                return c.send_message("whatsapp", to, body).await;
+            }
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn get_delivery_quote(
+        &self,
+        integration_id: &str,
+        pickup_address: &str,
+        dropoff_address: &str,
+    ) -> Result<crate::integrations::doordash::client::DeliveryQuote, String> {
+        let client = {
+            if integration_id == "doordash" {
+                let clients = self.doordash_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.get_delivery_quote(pickup_address, dropoff_address).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn dispatch_delivery(
+        &self,
+        integration_id: &str,
+        pickup_address: &str,
+        dropoff_address: &str,
+        order_id: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "doordash" {
+                let clients = self.doordash_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c
+                .dispatch_delivery(pickup_address, dropoff_address, order_id)
+                .await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn fetch_event_types(&self, integration_id: &str) -> Result<Vec<String>, String> {
+        let client = {
+            if integration_id == "calendly" {
+                let clients = self.calendly_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.fetch_event_types().await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn sync_customer(
+        &self,
+        integration_id: &str,
+        email: &str,
+        tag: &str,
+    ) -> Result<(), String> {
+        let client = {
+            if integration_id == "mailchimp" {
+                let clients = self.mailchimp_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.sync_customer(email, tag).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn send_campaign(
+        &self,
+        integration_id: &str,
+        audience: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let client = {
+            if integration_id == "mailchimp" {
+                let clients = self.mailchimp_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.send_campaign(audience, body).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn send_message(
+        &self,
+        integration_id: &str,
+        platform: &str,
+        to: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let client = {
+            if integration_id == "meta"
+                || integration_id == "whatsapp"
+                || integration_id == "whatsapp_cloud_api"
+            {
+                let clients = self.meta_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.send_message(platform, to, body).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn send_sms(
+        &self,
+        integration_id: &str,
+        to: &str,
+        from: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let client = {
+            if integration_id == "twilio" {
+                let clients = self.twilio_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            let res = if integration_id == "twilio"
+                && (to.starts_with("whatsapp:") || from.starts_with("whatsapp:"))
+            {
+                let r = c.send_whatsapp(to, from, body).await;
+                if r.is_ok() {
+                    let _ = ::server_telemetry::record_api_call_cost(
+                        &crate::db::get_pool(),
+                        "unknown",
+                        "twilio_whatsapp",
+                        0.015,
+                    )
+                    .await;
+                }
+                r
+            } else {
+                let r = c.send_sms(to, from, body).await;
+                if r.is_ok() {
+                    let _ = ::server_telemetry::record_api_call_cost(
+                        &crate::db::get_pool(),
+                        "unknown",
+                        "twilio_sms",
+                        0.01,
+                    )
+                    .await;
+                }
+                r
+            };
+            return res.map(|_| ()).map_err(|error| error.to_string());
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn mercadopago_create_payment(
+        &self,
+        integration_id: &str,
+        amount: f64,
+        description: &str,
+        payer_email: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "mercadopago" {
+                let clients = self.mercadopago_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.create_payment(amount, description, payer_email).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn handle_webhook(&self, integration_id: &str, payload: &str) -> Result<(), String> {
+        let client = {
+            if integration_id == "mercadopago" {
+                let clients = self.mercadopago_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.handle_webhook(payload).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn alipay_create_checkout_preference(
+        &self,
+        integration_id: &str,
+        price_id: &str,
+        tenant_id: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "alipay" {
+                let clients = self.alipay_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.create_checkout_preference(price_id, tenant_id).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn mercadopago_create_checkout_preference(
+        &self,
+        integration_id: &str,
+        price_id: &str,
+        tenant_id: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "mercadopago" {
+                let clients = self.mercadopago_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.create_checkout_preference(price_id, tenant_id).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn razorpay_create_checkout_preference(
+        &self,
+        integration_id: &str,
+        price_id: &str,
+        tenant_id: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "razorpay" {
+                let clients = self.razorpay_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.create_checkout_preference(price_id, tenant_id).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+    pub async fn fetch_rates(
+        &self,
+        integration_id: &str,
+        weight: f64,
+        dimensions: &str,
+    ) -> Result<Vec<crate::integrations::shippo::client::ShippoRate>, String> {
+        let client = {
+            if integration_id == "shippo" {
+                let clients = self.shippo_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.fetch_rates(weight, dimensions).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn purchase_label(
+        &self,
+        integration_id: &str,
+        rate_id: &str,
+    ) -> Result<crate::integrations::shippo::client::PurchaseLabelResponse, String> {
+        let client = {
+            if integration_id == "shippo" {
+                let clients = self.shippo_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.purchase_label(rate_id).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn mercadopago_handle_webhook(
+        &self,
+        integration_id: &str,
+        payload: &str,
+    ) -> Result<(), String> {
+        let client = {
+            if integration_id == "mercadopago" {
+                let clients = self.mercadopago_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.handle_webhook(payload).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn create_meeting(
+        &self,
+        integration_id: &str,
+        topic: &str,
+    ) -> Result<String, String> {
+        let client_zoom = {
+            if integration_id == "zoom" {
+                let clients = self.zoom_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client_zoom {
+            return c.create_meeting(topic).await;
+        }
+
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn create_event(
+        &self,
+        integration_id: &str,
+        summary: &str,
+        start_time: &str,
+        end_time: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "google_calendar" {
+                let clients = self.google_calendar_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.create_event(summary, start_time, end_time).await;
+        }
+
+        let cal_client = {
+            if integration_id == "cal_com" {
+                let clients = self.cal_com_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = cal_client {
+            return c.create_event(summary, start_time, end_time).await;
+        }
+
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn get_booking_link(
+        &self,
+        integration_id: &str,
+        event_type: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "cal_com" {
+                let clients = self.cal_com_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.get_booking_link(event_type).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn send_email(
+        &self,
+        integration_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let resend_client = {
+            if integration_id == "resend" {
+                let clients = self.resend_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = resend_client {
+            return c
+                .send_email(to, "noreply@yourdomain.com", subject, body)
+                .await;
+        }
+
+        let client = {
+            if integration_id == "sendgrid" {
+                let clients = self.sendgrid_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            let res = c.send_email(to, subject, body).await;
+            if res.is_ok() {
+                let _ = ::server_telemetry::record_email_send_cost(
+                    &crate::db::get_pool(),
+                    "unknown",
+                    1,
+                )
+                .await;
+            }
+            return res;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    // --- Google Workspace Methods ---
+
+    pub async fn drive_list_files(
+        &self,
+        integration_id: &str,
+        folder_id: &str,
+        page_size: u32,
+    ) -> Result<Vec<crate::integrations::google_workspace::client::DriveFile>, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.drive_list_files(folder_id, page_size).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn drive_get_file(
+        &self,
+        integration_id: &str,
+        file_id: &str,
+    ) -> Result<crate::integrations::google_workspace::client::DriveFile, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.drive_get_file(file_id).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn drive_create_file(
+        &self,
+        integration_id: &str,
+        name: &str,
+        mime_type: &str,
+        parent_id: &str,
+        content: &[u8],
+    ) -> Result<crate::integrations::google_workspace::client::DriveFile, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c
+                .drive_create_file(name, mime_type, parent_id, content)
+                .await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn sheets_read_range(
+        &self,
+        integration_id: &str,
+        spreadsheet_id: &str,
+        range: &str,
+    ) -> Result<Vec<Vec<String>>, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.sheets_read_range(spreadsheet_id, range).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn sheets_write_range(
+        &self,
+        integration_id: &str,
+        spreadsheet_id: &str,
+        range: &str,
+        values: &[Vec<String>],
+    ) -> Result<(), String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.sheets_write_range(spreadsheet_id, range, values).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn sheets_create_spreadsheet(
+        &self,
+        integration_id: &str,
+        title: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.sheets_create_spreadsheet(title).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn gmail_send_email(
+        &self,
+        integration_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.gmail_send_email(to, subject, body).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn gmail_list_messages(
+        &self,
+        integration_id: &str,
+        query: &str,
+        max_results: u32,
+    ) -> Result<Vec<crate::integrations::google_workspace::client::GmailMessage>, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.gmail_list_messages(query, max_results).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+
+    pub async fn gmail_get_message(
+        &self,
+        integration_id: &str,
+        message_id: &str,
+    ) -> Result<crate::integrations::google_workspace::client::GmailMessage, String> {
+        let client = {
+            if integration_id == "google_workspace" {
+                let clients = self.google_workspace_clients.read().unwrap();
+                clients.get(integration_id).cloned()
+            } else {
+                None
+            }
+        };
+        if let Some(c) = client {
+            return c.gmail_get_message(message_id).await;
+        }
+        Err("integration not found or not supported".to_string())
+    }
+}
+
+async fn send_telegram_message(bot_token: String, chat_id: String, text: String) {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+        }))
+        .send()
+        .await;
+
+    if let Err(e) = res {
+        ::server_telemetry::record_error_signal("[bug] Failed to send Telegram message");
+        tracing::warn!("Failed to send Telegram message: {}", e);
+    }
+}
+
+async fn send_discord_webhook(webhook_url: String, username: String, content: String) {
+    let client = reqwest::Client::new();
+    let res = client
+        .post(&webhook_url)
+        .json(&serde_json::json!({
+            "username": username,
+            "content": content,
+        }))
+        .send()
+        .await;
+
+    if let Err(e) = res {
+        ::server_telemetry::record_error_signal("[bug] Failed to send Discord webhook");
+        tracing::warn!("Failed to send Discord webhook: {}", e);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_configuration_never_creates_an_instance_or_credentials() {
+        let registry = IntegrationsRegistry::new();
+        let initial = registry.instances().len();
+        for integration_id in ["unknown", "restic", "razorpay", "twilio"] {
+            let result = registry.connect(integration_id, "", Default::default());
+            assert!(result.is_err());
+        }
+        assert_eq!(registry.instances().len(), initial);
+        assert!(registry.credentials.read().unwrap().is_empty());
+        assert!(registry.razorpay_clients.read().unwrap().is_empty());
+        assert!(registry.twilio_clients.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_reconfiguration_preserves_the_previous_local_configuration() {
+        let registry = IntegrationsRegistry::new();
+        let request = ::server_omnisolo::orchestration::ConnectIntegrationRequest {
+            integration_id: "twilio".into(),
+            bot_token: "local-test-account".into(),
+            api_token: "local-test-input".into(),
+            ..Default::default()
+        };
+        let configured = registry.connect("twilio", "", request).unwrap();
+        assert_eq!(configured.status, "configured");
+        assert_eq!(configured.category, "sms");
+        assert_eq!(configured.name, "Twilio SMS");
+        let client = registry
+            .twilio_clients
+            .read()
+            .unwrap()
+            .get("twilio")
+            .cloned()
+            .unwrap();
+        assert!(registry.connect("twilio", "", Default::default()).is_err());
+        assert!(std::sync::Arc::ptr_eq(
+            &client,
+            registry
+                .twilio_clients
+                .read()
+                .unwrap()
+                .get("twilio")
+                .unwrap()
+        ));
+        assert!(
+            registry
+                .credentials
+                .read()
+                .unwrap()
+                .get("twilio")
+                .unwrap()
+                .api_token
+                == "local-test-input"
+        );
+        assert!(
+            registry
+                .instances
+                .read()
+                .unwrap()
+                .get("twilio")
+                .unwrap()
+                .status
+                == "configured"
+        );
+    }
+
+    #[test]
+    fn razorpay_stores_only_the_explicit_key_and_secret_pair() {
+        let registry = IntegrationsRegistry::new();
+        let request = ::server_omnisolo::orchestration::ConnectIntegrationRequest {
+            integration_id: "razorpay".into(),
+            api_token: "unrelated-legacy-input".into(),
+            api_key: "local-test-key".into(),
+            api_secret: "local-test-input".into(),
+            ..Default::default()
+        };
+        let configured = registry.connect("razorpay", "", request).unwrap();
+        assert_eq!(configured.status, "configured");
+        assert!(
+            registry
+                .razorpay_clients
+                .read()
+                .unwrap()
+                .contains_key("razorpay")
+        );
+        let credentials = registry.credentials.read().unwrap();
+        let saved = credentials.get("razorpay").unwrap();
+        assert!(saved.api_key == "local-test-key");
+        assert!(saved.api_secret == "local-test-input");
+    }
+
+    #[test]
+    fn configuration_is_not_a_successful_provider_verification() {
+        let registry = IntegrationsRegistry::new();
+        for integration_id in ["", "unknown", "twilio", "razorpay"] {
+            assert!(
+                registry
+                    .test_connection(integration_id, Default::default())
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_twilio_integration() {
+        let registry = IntegrationsRegistry::new();
+        let creds = ::server_omnisolo::orchestration::ConnectIntegrationRequest {
+            integration_id: "twilio".to_string(),
+            base_url: "https://api.twilio.com".to_string(),
+            bot_token: "test_sid".to_string(),
+            chat_id: "".to_string(),
+            webhook_url: "".to_string(),
+            api_token: "test_token".to_string(),
+            from_phone: "+1234567890".to_string(),
+            ..Default::default()
+        };
+        registry
+            .connect("twilio", "https://api.twilio.com", creds)
+            .unwrap();
+
+        let msg = registry
+            .send_chat_message("twilio", "+0987654321", "agent1", "Hello World", "thread1")
+            .unwrap();
+        assert_eq!(msg.content, "Hello World");
+    }
+}

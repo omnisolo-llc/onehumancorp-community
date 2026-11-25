@@ -1,0 +1,25 @@
+[package]
+name = "ohc_core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8.1", features = ["ws", "multipart"] }
+base64 = "0.22"
+chrono = { workspace = true }
+dashmap = "5"
+flate2 = "1"
+hmac = "0.12"
+# Preserve the existing image decoders and WebP output without unused AVIF encoding.
+image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+opentelemetry = { version = "0.32", features = ["metrics", "trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["postgres", "sqlite", "runtime-tokio-rustls", "chrono", "uuid", "macros"] }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }

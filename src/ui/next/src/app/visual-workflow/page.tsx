@@ -1,0 +1,169 @@
+"use client";
+import { errorMessage } from '@/lib/errors';
+
+import { useState } from "react";
+import { useWalkthrough } from "../../components/help";
+import { WalkthroughTarget } from "../../components/Walkthrough";
+
+export default function VisualWorkflowPage() {
+  useWalkthrough();
+  const [nodes, setNodes] = useState<{ id: string; type: string; data: { prompt_template?: string; name?: string } }[]>([]);
+  const [edges, setEdges] = useState<{ id: string; source: string; target: string; condition?: string }[]>([]);
+  const [result, setResult] = useState<string | null>(null);
+  const [inputValue, setInputValue] = useState<string>("Hello world");
+
+  const addNode = (type: string) => {
+    const id = `node-${nodes.length + 1}`;
+    let data = {};
+    if (type === "Llm") data = { prompt_template: "Translate to French: {{input_var}}" };
+    if (type === "Input") data = { name: "input_var" };
+    if (type === "Output") data = {};
+    if (type === "HumanInLoop") data = { prompt_template: "Please approve this text: {{input_var}}" };
+
+    setNodes([...nodes, { id, type, data }]);
+  };
+
+  const addEdge = (source: string, target: string) => {
+    setEdges([...edges, { id: `edge-${edges.length + 1}`, source, target }]);
+  };
+
+  const runWorkflow = async () => {
+    try {
+      // Transform nodes to backend format
+      const formattedNodes = nodes.map(n => ({
+        id: n.id,
+        node_type: { type: n.type, ...n.data }
+      }));
+
+      const formattedEdges = edges.map(e => ({
+        source: e.source,
+        target: e.target
+      }));
+
+      const res = await fetch("/api/v1/workflow/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          graph: { nodes: formattedNodes, edges: formattedEdges },
+          inputs: { input_var: inputValue }
+        })
+      });
+      const data = await res.json();
+      setResult(JSON.stringify(data, null, 2));
+    } catch (e: unknown) {
+      setResult(`Error: ${errorMessage(e)}`);
+    }
+  };
+
+  return (
+    <div className="p-4 md:p-8 max-w-6xl mx-auto min-h-screen bg-[#F5F5F7]">
+      <h1 className="text-3xl font-bold mb-2 text-[#1D1D1F] tracking-tight">Visual Workflow Orchestrator</h1>
+      <p className="mb-8 text-[#86868B] text-lg">AutoGPT Unique Harness Innovations: Block-based visual workflow construction</p>
+
+      <div className="flex flex-col gap-6 mb-8 p-6 rounded-2xl bg-white/70 backdrop-blur-xl border border-white/40 shadow-sm">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4">
+          <label htmlFor="workflow-input-value" className="font-medium text-[#1D1D1F] sm:w-32 text-sm sm:text-base">Input Value:</label>
+          <input
+            id="workflow-input-value"
+            aria-label="Input Value"
+            placeholder="Hello world"
+            type="text"
+            className="border border-[#D2D2D7] rounded-xl px-4 py-2.5 flex-grow focus:outline-none focus:ring-2 focus:ring-[#0071E3] focus:border-[#0071E3] transition-all min-h-[44px] bg-white/50"
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+          />
+        </div>
+        <div className="flex flex-wrap gap-3">
+          <WalkthroughTarget id="vw-add-node">
+            <button
+              className="bg-[#0071E3]/10 text-[#0071E3] hover:bg-[#0071E3]/20 px-4 py-2.5 rounded-full shadow-sm transition-all min-h-[44px] font-medium"
+              onClick={() => addNode("Input")}
+            >
+              + Add Input Node
+            </button>
+          </WalkthroughTarget>
+          <button
+            className="bg-[#5E5CE6]/10 text-[#5E5CE6] hover:bg-[#5E5CE6]/20 px-4 py-2.5 rounded-full shadow-sm transition-all min-h-[44px] font-medium"
+            onClick={() => addNode("Llm")}
+          >
+            + Add LLM Node
+          </button>
+          <button
+            className="bg-[#BF5AF2]/10 text-[#BF5AF2] hover:bg-[#BF5AF2]/20 px-4 py-2.5 rounded-full shadow-sm transition-all min-h-[44px] font-medium"
+            onClick={() => addNode("Output")}
+          >
+            + Add Output Node
+          </button>
+          <button
+            className="bg-[#FF9F0A]/10 text-[#FF9F0A] hover:bg-[#FF9F0A]/20 px-4 py-2.5 rounded-full shadow-sm transition-all min-h-[44px] font-medium"
+            onClick={() => addNode("HumanInLoop")}
+          >
+            + Add Human-In-Loop Node
+          </button>
+
+          <button
+            className="bg-[#0071E3] hover:bg-[#0077ED] text-white px-6 py-2.5 rounded-full shadow-sm transition-all min-h-[44px] sm:ml-auto w-full sm:w-auto font-medium"
+            onClick={runWorkflow}
+            aria-label="▶ Run Workflow"
+          >
+            <span aria-hidden="true">▶ </span>Run Workflow
+          </button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 md:gap-8">
+        <div data-testid="glass-nodes-container" className="border border-white/40 rounded-3xl p-6 min-h-[400px] bg-white/40 backdrop-blur-2xl shadow-sm">
+          <h2 className="text-xl font-semibold mb-4 text-[#1D1D1F]">Workspace Canvas</h2>
+
+          {nodes.length === 0 && (
+            <div className="flex items-center justify-center h-48 text-[#86868B] border-2 border-dashed border-[#D2D2D7] rounded-2xl bg-white/30">
+              Add nodes to start building
+            </div>
+          )}
+
+          <div className="space-y-4">
+            {nodes.map((n, i) => (
+              <div key={n.id} className="bg-white/80 backdrop-blur-md p-4 shadow-sm border border-white/60 rounded-2xl flex items-center justify-between transition-all hover:shadow-md">
+                <div className="flex items-center">
+                  <span className="inline-flex items-center justify-center px-3 py-1 bg-[#F5F5F7] text-xs font-mono rounded-lg mr-3 text-[#1D1D1F] min-w-[3rem] border border-[#D2D2D7]/50">{n.id}</span>
+                  <span className="font-semibold text-[#1D1D1F]">{n.type}</span>
+                </div>
+
+                {i > 0 && (
+                  <button
+                    className="text-sm font-medium text-[#0071E3] hover:text-[#0077ED] transition-colors p-2 -mr-2 min-h-[44px] min-w-[44px]"
+                    onClick={() => addEdge(nodes[i-1].id, n.id)}
+                  >
+                    Connect from previous
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {edges.length > 0 && (
+            <div className="mt-8 pt-6 border-t border-[#D2D2D7]/50">
+              <h3 className="text-xs font-semibold text-[#86868B] uppercase tracking-wider mb-3">Connections</h3>
+              <div className="flex flex-wrap gap-2">
+                {edges.map(e => (
+                  <span key={e.id} className="bg-[#0071E3]/10 text-[#0071E3] border border-[#0071E3]/20 text-xs px-3 py-1.5 rounded-full font-medium">
+                    {e.source} → {e.target}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="border border-white/10 rounded-3xl p-6 bg-[#1D1D1F]/90 backdrop-blur-3xl text-[#F5F5F7] shadow-xl overflow-auto h-[400px] lg:h-[500px]">
+          <h2 className="text-xl font-semibold mb-4 text-white">Execution Result</h2>
+          {result ? (
+            <pre className="text-sm font-mono whitespace-pre-wrap break-all text-gray-300 bg-black/30 p-4 rounded-2xl border border-white/10">{result}</pre>
+          ) : (
+            <div className="flex h-3/4 items-center justify-center text-[#86868B] italic text-sm">Waiting for execution...</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,3721 @@
+use crate::{
+    AuthenticationError, LogoutError, MAX_ACCESS_TOKEN_BYTES, MAX_AUTH_EMAIL_BYTES,
+    MAX_AUTH_ORGANIZATION_BYTES, MAX_AUTH_ROLE_BYTES, MAX_AUTH_ROLES, MAX_AUTH_USER_ID_BYTES,
+    MAX_AUTH_USERNAME_BYTES, Store,
+};
+use axum::{
+    Extension, Router,
+    body::{Body, to_bytes},
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
+    routing::{get, post},
+};
+use base64::Engine as _;
+use chrono::Utc;
+use hmac::{Hmac, Mac};
+use rand::{Rng, RngCore};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const MAX_BODY_BYTES: usize = 4096;
+const MAX_IDENTIFIER_BYTES: usize = 254;
+const MAX_PASSWORD_BYTES: usize = 1024;
+const MAX_ORGANIZATION_BYTES: usize = MAX_AUTH_ORGANIZATION_BYTES;
+const MAX_USER_ID_BYTES: usize = MAX_AUTH_USER_ID_BYTES;
+const MAX_USERNAME_BYTES: usize = MAX_AUTH_USERNAME_BYTES;
+const MAX_EMAIL_BYTES: usize = MAX_AUTH_EMAIL_BYTES;
+const MAX_ROLES: usize = MAX_AUTH_ROLES;
+const MAX_ROLE_BYTES: usize = MAX_AUTH_ROLE_BYTES;
+const MAX_RESPONSE_BYTES: usize = 8192;
+const RATE_WINDOW_SECONDS: u64 = 300;
+const SOURCE_ATTEMPTS: u32 = 5;
+const ACCOUNT_ATTEMPTS: u32 = 20;
+const MAX_RATE_ENTRIES: usize = 4096;
+const MAX_TRUSTED_PROXIES: usize = 32;
+
+type HmacSha256 = Hmac<Sha256>;
+type Clock = dyn Fn() -> u64 + Send + Sync;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditSource {
+    DirectPeer,
+    TrustedProxy,
+    Unclassified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditEvent {
+    LoginSuccess,
+    LoginDenied,
+    LoginThrottled,
+    LoginUnavailable,
+    LogoutSuccess,
+    LogoutDenied,
+    LogoutUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestSource {
+    ip: IpAddr,
+    class: AuditSource,
+}
+
+fn new_audit_id() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn emit_audit(event: AuditEvent, request_id: &str, source: AuditSource) {
+    match event {
+        AuditEvent::LoginSuccess | AuditEvent::LogoutSuccess => {
+            tracing::info!(event = ?event, request_id, source = ?source);
+        }
+        AuditEvent::LoginDenied | AuditEvent::LoginThrottled | AuditEvent::LogoutDenied => {
+            tracing::warn!(event = ?event, request_id, source = ?source);
+        }
+        AuditEvent::LoginUnavailable | AuditEvent::LogoutUnavailable => {
+            tracing::error!(event = ?event, request_id, source = ?source);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpAuthState {
+    store: Arc<Store>,
+    limiter: Arc<Mutex<LoginLimiter>>,
+    hash_key: [u8; 32],
+    trusted_proxies: Arc<HashSet<IpAddr>>,
+    now: Arc<Clock>,
+    cloud: bool,
+    mailer: Arc<dyn crate::email::VerificationMailer>,
+    registration_hash_key: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct LimitConfig {
+    source_attempts: u32,
+    account_attempts: u32,
+    window_seconds: u64,
+    max_entries: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Bucket {
+    started_at: u64,
+    last_seen: u64,
+    attempts: u32,
+}
+
+struct LoginLimiter {
+    sources: Buckets,
+    accounts: Buckets,
+    config: LimitConfig,
+}
+
+struct Buckets {
+    entries: HashMap<[u8; 32], Bucket>,
+    expirations: BTreeSet<(u64, [u8; 32])>,
+    least_recent: BTreeSet<(u64, [u8; 32])>,
+}
+
+impl Buckets {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            expirations: BTreeSet::new(),
+            least_recent: BTreeSet::new(),
+        }
+    }
+
+    fn expire(&mut self, now: u64, window: u64) {
+        while let Some((expires_at, key)) = self.expirations.first().copied() {
+            if expires_at > now {
+                break;
+            }
+            self.expirations.remove(&(expires_at, key));
+            if let Some(bucket) = self.entries.remove(&key) {
+                self.least_recent.remove(&(bucket.last_seen, key));
+                debug_assert_eq!(bucket.started_at.saturating_add(window), expires_at);
+            }
+        }
+    }
+
+    fn retry_after(&self, key: &[u8; 32], now: u64, window: u64, limit: u32) -> Option<u64> {
+        let bucket = self.entries.get(key)?;
+        (bucket.attempts >= limit).then(|| {
+            window
+                .saturating_sub(now.saturating_sub(bucket.started_at))
+                .max(1)
+        })
+    }
+
+    fn saturation_retry(&self, key: &[u8; 32], now: u64, window: u64, max: usize) -> Option<u64> {
+        if max > 0 && (self.entries.contains_key(key) || self.entries.len() < max) {
+            return None;
+        }
+        self.expirations
+            .first()
+            .map(|(expires_at, _)| expires_at.saturating_sub(now).max(1))
+            .or(Some(window.max(1)))
+    }
+
+    fn record(&mut self, key: [u8; 32], now: u64, window: u64) {
+        if let Some(bucket) = self.entries.get_mut(&key) {
+            self.least_recent.remove(&(bucket.last_seen, key));
+            bucket.attempts = bucket.attempts.saturating_add(1);
+            bucket.last_seen = now;
+            self.least_recent.insert((now, key));
+            return;
+        }
+        let bucket = Bucket {
+            started_at: now,
+            last_seen: now,
+            attempts: 1,
+        };
+        self.entries.insert(key, bucket);
+        self.expirations.insert((now.saturating_add(window), key));
+        self.least_recent.insert((now, key));
+    }
+}
+
+impl LoginLimiter {
+    fn new(config: LimitConfig) -> Self {
+        Self {
+            sources: Buckets::new(),
+            accounts: Buckets::new(),
+            config,
+        }
+    }
+
+    fn check_and_record(
+        &mut self,
+        source: [u8; 32],
+        account: [u8; 32],
+        now: u64,
+    ) -> Result<(), u64> {
+        self.sources.expire(now, self.config.window_seconds);
+        self.accounts.expire(now, self.config.window_seconds);
+
+        if let Some(retry) = self.sources.retry_after(
+            &source,
+            now,
+            self.config.window_seconds,
+            self.config.source_attempts,
+        ) {
+            return Err(retry);
+        }
+        if let Some(retry) = self.accounts.retry_after(
+            &account,
+            now,
+            self.config.window_seconds,
+            self.config.account_attempts,
+        ) {
+            return Err(retry);
+        }
+
+        let saturation_retry = self
+            .sources
+            .saturation_retry(
+                &source,
+                now,
+                self.config.window_seconds,
+                self.config.max_entries,
+            )
+            .into_iter()
+            .chain(self.accounts.saturation_retry(
+                &account,
+                now,
+                self.config.window_seconds,
+                self.config.max_entries,
+            ))
+            .max();
+        if let Some(retry) = saturation_retry {
+            return Err(retry);
+        }
+        self.sources.record(source, now, self.config.window_seconds);
+        self.accounts
+            .record(account, now, self.config.window_seconds);
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    username: Option<String>,
+    email: Option<String>,
+    password: String,
+    organization_id: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TenantResolution {
+    Authenticate(String),
+    DummyDeny,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RateLimitDeployment {
+    Standalone,
+    SingleInstance,
+    UpstreamBounded,
+}
+
+#[derive(Serialize)]
+struct LoginUser {
+    id: String,
+    username: String,
+    email: String,
+    roles: Vec<String>,
+    organization_id: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    token: String,
+    expires_at: i64,
+    user: LoginUser,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: &'static str,
+}
+
+/// Cloud uses an in-process limiter only when deployment explicitly guarantees
+/// one backend instance or an upstream gateway enforces equivalent bounds.
+pub fn router(store: Arc<Store>) -> Result<Router, String> {
+    let policy = Arc::new(
+        ::ohc_core::extensions::LocalOwnerAuthPolicy::new("default_tenant")
+            .map_err(|err| err.to_string())?,
+    );
+    router_with_auth_policy(store, policy)
+}
+
+/// Constructs the HTTP auth router using a runtime-injected [`ohc_core::extensions::AuthPolicyProvider`].
+pub fn router_with_auth_policy(
+    store: Arc<Store>,
+    policy: Arc<dyn ::ohc_core::extensions::AuthPolicyProvider>,
+) -> Result<Router, String> {
+    let caps = policy.capabilities();
+    let cloud = caps.oidc_sso || caps.mtls_peer_auth;
+    let deployment = rate_limit_deployment(
+        std::env::var("OMNISOLO_AUTH_RATE_LIMIT_DEPLOYMENT")
+            .ok()
+            .as_deref(),
+        cloud,
+    )
+    .map_err(|error| {
+        tracing::error!(event = "auth.config.invalid");
+        error
+    })?;
+    let trusted_proxies = trusted_proxies_from_env().map_err(|_| {
+        tracing::error!(event = "auth.config.invalid_trusted_proxy");
+        "invalid trusted proxy configuration".to_string()
+    })?;
+    let mailer: Arc<dyn crate::email::VerificationMailer> =
+        match crate::email::SmtpVerificationMailer::from_environment(cloud)? {
+            Some(mailer) => Arc::new(mailer),
+            None => Arc::new(crate::email::UnconfiguredMailer),
+        };
+    tracing::info!(
+        event = "auth.config.ready",
+        deployment = ?deployment,
+        smtp_configured = mailer.configured()
+    );
+    let mut base = router_with_state(HttpAuthState::with_mailer_and_cloud(
+        store,
+        trusted_proxies,
+        mailer,
+        cloud,
+    ));
+    if let Some(extra) = policy.extra_auth_routes() {
+        base = base.merge(extra);
+    }
+    Ok(base)
+}
+
+pub async fn update_authentication_settings_for_store(
+    store: &Arc<Store>,
+    mailer_configured: bool,
+    actor: &str,
+    registration_mode: &str,
+) -> Result<&'static str, (StatusCode, &'static str)> {
+    let _ = mailer_configured;
+    let mode = crate::seaorm_store::RegistrationMode::parse(registration_mode)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid registration mode"))?;
+    let Some(repository) = store.portable_repo() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication settings unavailable",
+        ));
+    };
+    if repository
+        .set_registration_mode(mode, actor, Utc::now())
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication settings unavailable",
+        ));
+    }
+    Ok(mode.as_str())
+}
+
+fn router_with_state(state: HttpAuthState) -> Router {
+    let cloud = state.cloud;
+    let identity_router = Router::new()
+        .route("/api/v1/auth/session-identity", get(session_identity))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.store.clone(),
+            super::strict_bearer_auth_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn(identity_no_store));
+
+    let mut settings_router = Router::new()
+        .route(
+            "/keys",
+            axum::routing::post(generate_api_key).get(list_api_keys),
+        )
+        .route("/keys/{id}", axum::routing::delete(revoke_api_key));
+    if !cloud {
+        settings_router = settings_router.route(
+            "/authentication",
+            get(get_authentication_settings).put(update_authentication_settings),
+        );
+    }
+    let settings_router = settings_router.layer(axum::middleware::from_fn_with_state(
+        state.store.clone(),
+        super::strict_bearer_auth_middleware,
+    ));
+
+    let admin_router = Router::new()
+        .route("/usage", axum::routing::get(list_member_usage_analytics))
+        .layer(axum::middleware::from_fn_with_state(
+            state.store.clone(),
+            super::strict_bearer_auth_middleware,
+        ));
+
+    let mut app = Router::new()
+        .merge(identity_router)
+        .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/logout", post(logout));
+    if !cloud {
+        app = app.route(
+            "/api/v1/auth/public-settings",
+            get(public_authentication_settings),
+        );
+    }
+    app.route(
+        "/api/v1/auth/registration/email/start",
+        post(start_email_verification),
+    )
+    .route("/api/v1/auth/registration/email/verify", post(verify_email))
+    .route("/api/v1/auth/register", post(register))
+    .nest("/api/v1/settings", settings_router)
+    .nest("/api/v1/ui/admin", admin_router)
+    .with_state(state)
+}
+
+// The strict bearer layer has already checked signature, revocation and current
+// active membership. This bounded read never treats request headers as identity.
+async fn session_identity(Extension(claims): Extension<::server_common::Claims>) -> Response {
+    use axum::response::IntoResponse;
+    let Some(expires_at) = claims
+        .exp
+        .checked_mul(1000)
+        .filter(|_| claims.exp > Utc::now().timestamp())
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    no_store_json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "userId": claims.sub,
+            "tenantId": claims.organization_id,
+            "expiresAt": expires_at,
+        }),
+    )
+}
+
+async fn identity_no_store(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert(header::VARY, "Authorization".parse().unwrap());
+    response
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateKeyRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct CreateKeyResponse {
+    raw_key: String,
+    name: String,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct ApiKeyMetadata {
+    id: String,
+    name: String,
+    created_at: String,
+    expires_at: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct InMemoryApiKey {
+    pub id: String,
+    pub key_hash: String,
+    pub name: String,
+    pub member_id: String,
+    pub organization_id: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Default)]
+pub struct InMemoryKeyLifecycle {
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked: bool,
+}
+
+static IN_MEMORY_API_KEYS: OnceLock<Mutex<Vec<InMemoryApiKey>>> = OnceLock::new();
+static IN_MEMORY_API_KEY_LIFECYCLE: OnceLock<Mutex<HashMap<String, InMemoryKeyLifecycle>>> =
+    OnceLock::new();
+
+pub fn get_in_memory_keys() -> &'static Mutex<Vec<InMemoryApiKey>> {
+    IN_MEMORY_API_KEYS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn set_in_memory_key_lifecycle(
+    key_hash: &str,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    revoked: bool,
+) {
+    let mut map = IN_MEMORY_API_KEY_LIFECYCLE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        key_hash.to_string(),
+        InMemoryKeyLifecycle {
+            expires_at,
+            revoked,
+        },
+    );
+}
+
+pub(crate) fn in_memory_key_lifecycle(key_hash: &str) -> InMemoryKeyLifecycle {
+    IN_MEMORY_API_KEY_LIFECYCLE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key_hash)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub(crate) fn has_postgres_db() -> bool {
+    std::env::var("DATABASE_URL")
+        .ok()
+        .or_else(|| std::env::var("OMNISOLO_DATABASE_URL").ok())
+        .map(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
+        .unwrap_or(false)
+}
+
+async fn generate_api_key(
+    Extension(claims): Extension<::server_common::Claims>,
+    axum::Json(payload): axum::Json<CreateKeyRequest>,
+) -> Response {
+    let Some(organization_id) = ::server_common::auth_utils::signed_tenant_id(&claims) else {
+        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    };
+
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+
+    let raw_key = format!(
+        "ohc_gwy_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+    );
+
+    let key_hash = format!("{:x}", Sha256::digest(raw_key.as_bytes()));
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let key_id = uuid::Uuid::new_v4().to_string();
+
+    let has_db = has_postgres_db();
+
+    if has_db {
+        let pool = crate::db::get_pool();
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(event = "auth.api_key.create_tx_failed", error = %e);
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to create api key",
+                );
+            }
+        };
+        if let Err(e) = sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(&organization_id)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::error!(event = "auth.api_key.create_rls_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create api key",
+            );
+        }
+        let insert_res = sqlx::query(
+            "INSERT INTO api_keys (id, key_hash, name, member_id, organization_id) VALUES ($1, $2, $3, $4, $5)"
+        )
+        .bind(uuid::Uuid::parse_str(&key_id).unwrap_or_default())
+        .bind(&key_hash)
+        .bind(&payload.name)
+        .bind(&claims.sub)
+        .bind(&organization_id)
+        .execute(&mut *tx)
+        .await;
+
+        if let Err(e) = insert_res {
+            tracing::error!(event = "auth.api_key.create_insert_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create api key",
+            );
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::error!(event = "auth.api_key.create_commit_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create api key",
+            );
+        }
+    }
+
+    let mut keys = get_in_memory_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    set_in_memory_key_lifecycle(&key_hash, None, false);
+    keys.push(InMemoryApiKey {
+        id: key_id.clone(),
+        key_hash,
+        name: payload.name.clone(),
+        member_id: claims.sub.clone(),
+        organization_id,
+        created_at: created_at.clone(),
+    });
+
+    let resp = CreateKeyResponse {
+        raw_key,
+        name: payload.name,
+        created_at,
+    };
+
+    no_store_json(StatusCode::CREATED, &resp)
+}
+
+async fn list_api_keys(Extension(claims): Extension<::server_common::Claims>) -> Response {
+    let Some(organization_id) = ::server_common::auth_utils::signed_tenant_id(&claims) else {
+        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    };
+    let mut api_keys = Vec::new();
+    let has_db = has_postgres_db();
+
+    if has_db {
+        let pool = crate::db::get_pool();
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(event = "auth.api_key.list_tx_failed", error = %e);
+                return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to list api keys");
+            }
+        };
+        if let Err(e) = sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(&organization_id)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::error!(event = "auth.api_key.list_rls_failed", error = %e);
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to list api keys");
+        }
+        let query_res = sqlx::query(
+            "SELECT id, name, created_at, expires_at FROM api_keys WHERE member_id = $1 AND organization_id = $2 AND revoked_at IS NULL"
+        )
+        .bind(&claims.sub)
+        .bind(&organization_id)
+        .fetch_all(&mut *tx)
+        .await;
+
+        match query_res {
+            Ok(rows) => {
+                for row in rows {
+                    use sqlx::Row;
+                    let id: uuid::Uuid = row.get(0);
+                    let name: String = row.get(1);
+                    let created_at: chrono::DateTime<chrono::Utc> = row.get(2);
+                    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get(3);
+
+                    api_keys.push(ApiKeyMetadata {
+                        id: id.to_string(),
+                        name,
+                        created_at: created_at.to_rfc3339(),
+                        expires_at: expires_at.map(|dt| dt.to_rfc3339()),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::error!(event = "auth.api_key.list_query_failed", error = %e);
+                return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to list api keys");
+            }
+        }
+    } else {
+        let keys = get_in_memory_keys()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for k in keys.iter() {
+            let lifecycle = in_memory_key_lifecycle(&k.key_hash);
+            if !lifecycle.revoked
+                && k.member_id == claims.sub
+                && k.organization_id == organization_id
+            {
+                api_keys.push(ApiKeyMetadata {
+                    id: k.id.clone(),
+                    name: k.name.clone(),
+                    created_at: k.created_at.clone(),
+                    expires_at: lifecycle.expires_at.map(|dt| dt.to_rfc3339()),
+                });
+            }
+        }
+    }
+
+    no_store_json(StatusCode::OK, &api_keys)
+}
+
+async fn revoke_api_key(
+    Extension(claims): Extension<::server_common::Claims>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(organization_id) = ::server_common::auth_utils::signed_tenant_id(&claims) else {
+        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    };
+    let is_admin = claims
+        .roles
+        .iter()
+        .any(|role| role.eq_ignore_ascii_case("admin"));
+    let has_db = has_postgres_db();
+
+    if has_db {
+        let pool = crate::db::get_pool();
+        let key_uuid = match uuid::Uuid::parse_str(&id) {
+            Ok(u) => u,
+            Err(_) => {
+                return no_store_json(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({ "error": "invalid key id" }),
+                );
+            }
+        };
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(event = "auth.api_key.revoke_tx_failed", error = %e);
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to revoke api key",
+                );
+            }
+        };
+        if let Err(e) = sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(&organization_id)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::error!(event = "auth.api_key.revoke_rls_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to revoke api key",
+            );
+        }
+        let delete_res = if is_admin {
+            sqlx::query("DELETE FROM api_keys WHERE id = $1 AND organization_id = $2")
+                .bind(key_uuid)
+                .bind(&organization_id)
+                .execute(&mut *tx)
+                .await
+        } else {
+            sqlx::query(
+                "DELETE FROM api_keys WHERE id = $1 AND member_id = $2 AND organization_id = $3",
+            )
+            .bind(key_uuid)
+            .bind(&claims.sub)
+            .bind(&organization_id)
+            .execute(&mut *tx)
+            .await
+        };
+
+        if let Err(e) = delete_res {
+            tracing::error!(event = "auth.api_key.revoke_delete_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to revoke api key",
+            );
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::error!(event = "auth.api_key.revoke_commit_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to revoke api key",
+            );
+        }
+    }
+
+    let mut keys = get_in_memory_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    keys.retain(|k| {
+        let should_revoke = k.id == id
+            && k.organization_id == organization_id
+            && (is_admin || k.member_id == claims.sub);
+        if should_revoke {
+            set_in_memory_key_lifecycle(&k.key_hash, None, true);
+        }
+        !should_revoke
+    });
+
+    no_store_json(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+#[derive(Serialize)]
+struct MemberUsageAggregate {
+    username: String,
+    feature: String,
+    tokens_used: i32,
+    computed_cost: f64,
+}
+
+#[derive(Clone)]
+struct InMemoryUsageLog {
+    username: String,
+    feature: String,
+    tokens_used: i32,
+    computed_cost: f64,
+    organization_id: String,
+}
+
+static IN_MEMORY_USAGE_LOGS: OnceLock<Mutex<Vec<InMemoryUsageLog>>> = OnceLock::new();
+
+fn get_in_memory_usage_logs() -> &'static Mutex<Vec<InMemoryUsageLog>> {
+    IN_MEMORY_USAGE_LOGS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+async fn list_member_usage_analytics(
+    Extension(claims): Extension<::server_common::Claims>,
+) -> Response {
+    if !claims
+        .roles
+        .iter()
+        .any(|role| role.eq_ignore_ascii_case("admin"))
+    {
+        return error(StatusCode::FORBIDDEN, "admin access required");
+    }
+
+    let mut analytics = Vec::new();
+    let has_db = has_postgres_db();
+    let Some(organization_id) = ::server_common::auth_utils::signed_tenant_id(&claims) else {
+        return error(StatusCode::UNAUTHORIZED, "authentication required");
+    };
+
+    if has_db {
+        let pool = crate::db::get_pool();
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(event = "auth.usage.tx_failed", error = %e);
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to load usage analytics",
+                );
+            }
+        };
+        if let Err(e) = sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(&organization_id)
+            .execute(&mut *tx)
+            .await
+        {
+            tracing::error!(event = "auth.usage.rls_failed", error = %e);
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load usage analytics",
+            );
+        }
+
+        let query_res = sqlx::query(
+            "SELECT u.username, l.feature, SUM(l.tokens_used), CAST(SUM(l.computed_cost) AS double precision) \
+             FROM user_usage_logs l \
+             JOIN users u ON l.user_id = u.id \
+             WHERE l.organization_id = $1 \
+             GROUP BY u.username, l.feature"
+        )
+        .bind(&organization_id)
+        .fetch_all(&mut *tx)
+        .await;
+
+        match query_res {
+            Ok(rows) => {
+                for row in rows {
+                    use sqlx::Row;
+                    let username: String = row.get(0);
+                    let feature: String = row.get(1);
+                    let tokens_used_sum: i64 = row.get(2);
+                    let computed_cost_sum: f64 = row.get(3);
+
+                    analytics.push(MemberUsageAggregate {
+                        username,
+                        feature,
+                        tokens_used: tokens_used_sum as i32,
+                        computed_cost: computed_cost_sum,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::error!(event = "auth.usage.query_failed", error = %e);
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to load usage analytics",
+                );
+            }
+        }
+    } else {
+        let logs = get_in_memory_usage_logs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for l in logs.iter() {
+            if l.organization_id == organization_id {
+                analytics.push(MemberUsageAggregate {
+                    username: l.username.clone(),
+                    feature: l.feature.clone(),
+                    tokens_used: l.tokens_used,
+                    computed_cost: l.computed_cost,
+                });
+            }
+        }
+    }
+
+    no_store_json(StatusCode::OK, &analytics)
+}
+
+impl HttpAuthState {
+    #[cfg(test)]
+    fn new(store: Arc<Store>, trusted_proxies: HashSet<IpAddr>) -> Self {
+        Self::with_mailer(
+            store,
+            trusted_proxies,
+            Arc::new(crate::email::UnconfiguredMailer),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_mailer(
+        store: Arc<Store>,
+        trusted_proxies: HashSet<IpAddr>,
+        mailer: Arc<dyn crate::email::VerificationMailer>,
+    ) -> Self {
+        Self::with_mailer_and_cloud(store, trusted_proxies, mailer, false)
+    }
+
+    fn with_mailer_and_cloud(
+        store: Arc<Store>,
+        trusted_proxies: HashSet<IpAddr>,
+        mailer: Arc<dyn crate::email::VerificationMailer>,
+        cloud: bool,
+    ) -> Self {
+        let mut hash_key = [0_u8; 32];
+        rand::thread_rng().fill_bytes(&mut hash_key);
+        let registration_hash_key = store.registration_hash_key();
+        let relax_for_local_test = !cloud
+            && std::env::var("OMNISOLO_ENV")
+                .map(|v| v.eq_ignore_ascii_case("test"))
+                .unwrap_or(false)
+            && std::env::var("OMNISOLO_ALLOW_RELAXED_TEST_RATE_LIMIT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        Self {
+            store,
+            limiter: Arc::new(Mutex::new(LoginLimiter::new(LimitConfig {
+                source_attempts: if relax_for_local_test {
+                    1000
+                } else {
+                    SOURCE_ATTEMPTS
+                },
+                account_attempts: if relax_for_local_test {
+                    2000
+                } else {
+                    ACCOUNT_ATTEMPTS
+                },
+                window_seconds: RATE_WINDOW_SECONDS,
+                max_entries: MAX_RATE_ENTRIES,
+            }))),
+            hash_key,
+            trusted_proxies: Arc::new(trusted_proxies),
+            now: Arc::new(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }),
+            cloud,
+            mailer,
+            registration_hash_key,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterRequest {
+    registration_ticket: String,
+    #[serde(rename = "organization_id")]
+    _client_organization_id: String,
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartEmailVerificationRequest {
+    email: String,
+    invitation_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyEmailRequest {
+    challenge_id: String,
+    code: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateAuthenticationSettingsRequest {
+    registration_mode: String,
+}
+
+#[derive(Serialize)]
+struct PublicAuthenticationSettingsResponse {
+    registration_mode: &'static str,
+    registration_available: bool,
+    email_verification_required: bool,
+    providers: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct AdminAuthenticationSettingsResponse {
+    registration_mode: &'static str,
+    registration_available: bool,
+    email_verification_required: bool,
+    providers: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct StartEmailVerificationResponse {
+    challenge_id: String,
+    expires_in_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct VerifyEmailResponse {
+    registration_ticket: String,
+    expires_in_seconds: u64,
+}
+
+async fn public_authentication_settings(State(state): State<HttpAuthState>) -> Response {
+    let Some(repository) = state.store.portable_repo() else {
+        return no_store_json(
+            StatusCode::OK,
+            &PublicAuthenticationSettingsResponse {
+                registration_mode: "closed",
+                registration_available: false,
+                email_verification_required: true,
+                providers: Vec::new(),
+            },
+        );
+    };
+    let mode = match repository.registration_mode().await {
+        Ok(mode) => mode,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication settings unavailable",
+            );
+        }
+    };
+    no_store_json(
+        StatusCode::OK,
+        &PublicAuthenticationSettingsResponse {
+            registration_mode: mode.as_str(),
+            registration_available: mode != crate::seaorm_store::RegistrationMode::Closed
+                && state.mailer.configured(),
+            email_verification_required: true,
+            providers: Vec::new(),
+        },
+    )
+}
+
+/// Instance-wide authentication and OIDC provider configuration is a platform-operator
+/// control. A hosted tenant administrator is not a platform operator and cannot inspect
+/// or mutate global registration mode or IdP providers in multi-tenant mode.
+fn require_platform_operator(
+    state: &HttpAuthState,
+    claims: &::server_common::Claims,
+) -> Result<(), Response> {
+    let is_platform_operator = claims.roles.iter().any(|role| {
+        role.eq_ignore_ascii_case(crate::ROLE_PLATFORM_OPERATOR)
+            || role.eq_ignore_ascii_case("superadmin")
+    });
+    if state.cloud && !is_platform_operator {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "hosted_global_control_unavailable",
+        ));
+    }
+    let is_admin = claims
+        .roles
+        .iter()
+        .any(|role| role.eq_ignore_ascii_case("admin"));
+    if !is_platform_operator && !is_admin {
+        return Err(error(StatusCode::FORBIDDEN, "admin access required"));
+    }
+    Ok(())
+}
+
+async fn get_authentication_settings(
+    State(state): State<HttpAuthState>,
+    Extension(claims): Extension<::server_common::Claims>,
+) -> Response {
+    if let Err(response) = require_platform_operator(&state, &claims) {
+        return response;
+    }
+    let Some(repository) = state.store.portable_repo() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication settings unavailable",
+        );
+    };
+    let mode = match repository.registration_mode().await {
+        Ok(mode) => mode,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication settings unavailable",
+            );
+        }
+    };
+    no_store_json(
+        StatusCode::OK,
+        &AdminAuthenticationSettingsResponse {
+            registration_mode: mode.as_str(),
+            registration_available: mode != crate::seaorm_store::RegistrationMode::Closed
+                && state.mailer.configured(),
+            email_verification_required: true,
+            providers: Vec::new(),
+        },
+    )
+}
+
+async fn update_authentication_settings(
+    State(state): State<HttpAuthState>,
+    Extension(claims): Extension<::server_common::Claims>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(response) = require_platform_operator(&state, &claims) {
+        return response;
+    }
+    let payload: UpdateAuthenticationSettingsRequest = match decode_json(&headers, request).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let mode = match crate::seaorm_store::RegistrationMode::parse(&payload.registration_mode) {
+        Ok(mode) => mode,
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid registration mode"),
+    };
+    let Some(repository) = state.store.portable_repo() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication settings unavailable",
+        );
+    };
+    if repository
+        .set_registration_mode(mode, &claims.sub, Utc::now())
+        .await
+        .is_err()
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication settings unavailable",
+        );
+    }
+    tracing::info!(event = "auth.settings.registration_mode_changed", actor = %claims.sub, mode = mode.as_str());
+    no_store_json(
+        StatusCode::OK,
+        &serde_json::json!({ "registration_mode": mode.as_str() }),
+    )
+}
+
+async fn start_email_verification(
+    State(state): State<HttpAuthState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let payload: StartEmailVerificationRequest = match decode_json(&headers, request).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let email = match crate::validation::normalize_email(&payload.email) {
+        Ok(email) => email,
+        Err(message) => {
+            return no_store_json(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({ "error": message }),
+            );
+        }
+    };
+    let Some(repository) = state.store.portable_repo() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable");
+    };
+    let mode = match repository.registration_mode().await {
+        Ok(mode) => mode,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable"),
+    };
+    if mode == crate::seaorm_store::RegistrationMode::Closed {
+        return error(StatusCode::FORBIDDEN, "registration closed");
+    }
+    if !state.mailer.configured() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable");
+    }
+
+    let now = Utc::now();
+    let invitation_id = if mode == crate::seaorm_store::RegistrationMode::InviteOnly {
+        let raw_token = payload.invitation_token.as_deref().unwrap_or_default();
+        if raw_token.len() < 16
+            || raw_token.len() > 256
+            || raw_token.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            return error(StatusCode::FORBIDDEN, "invitation required");
+        }
+        let token_hash = registration_hash_hex(
+            &state.registration_hash_key,
+            b"registration-invitation",
+            &[raw_token.as_bytes()],
+        );
+        match repository
+            .active_invitation_id_by_token(&email, &token_hash, now)
+            .await
+        {
+            Ok(Some(invitation_id)) => Some(invitation_id),
+            Ok(None) => return error(StatusCode::FORBIDDEN, "invitation required"),
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable"),
+        }
+    } else {
+        None
+    };
+    let challenge_id = uuid::Uuid::new_v4().to_string();
+    let code = format!("{:06}", rand::thread_rng().gen_range(0_u32..1_000_000));
+    let code_hash = registration_hash_hex(
+        &state.registration_hash_key,
+        b"email-code",
+        &[challenge_id.as_bytes(), code.as_bytes()],
+    );
+    let source = match request_source(&headers, peer.ip(), &state.trusted_proxies) {
+        Ok(source) => source,
+        Err(()) => return error(StatusCode::BAD_REQUEST, "invalid request"),
+    };
+    let source_hash = hex::encode(keyed_hash(
+        &state.registration_hash_key,
+        source.ip.to_string().as_bytes(),
+    ));
+    let challenge = crate::seaorm_store::NewEmailChallenge {
+        id: challenge_id.clone(),
+        email: email.clone(),
+        code_hash,
+        source_hash,
+        created_at: now,
+        expires_at: now + chrono::Duration::minutes(15),
+        resend_after: now + chrono::Duration::seconds(60),
+        invitation_id,
+    };
+    match repository.create_email_challenge(challenge).await {
+        Ok(crate::seaorm_store::EmailChallengeCreation::Created) => {}
+        Ok(crate::seaorm_store::EmailChallengeCreation::Throttled {
+            retry_after_seconds,
+        }) => {
+            return error_with_retry(
+                StatusCode::TOO_MANY_REQUESTS,
+                "verification recently sent",
+                retry_after_seconds,
+            );
+        }
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable"),
+    }
+    if state
+        .mailer
+        .send_verification_code(&email, &code)
+        .await
+        .is_err()
+    {
+        let _ = repository.delete_email_challenge(&challenge_id).await;
+        return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable");
+    }
+    tracing::info!(event = "auth.registration.verification_sent", challenge_id = %challenge_id, source = ?source.class);
+    no_store_json(
+        StatusCode::ACCEPTED,
+        &StartEmailVerificationResponse {
+            challenge_id,
+            expires_in_seconds: 15 * 60,
+        },
+    )
+}
+
+async fn verify_email(
+    State(state): State<HttpAuthState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let payload: VerifyEmailRequest = match decode_json(&headers, request).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    if payload.challenge_id.len() > 64
+        || payload.code.len() != 6
+        || !payload.code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid verification code");
+    }
+    let Some(repository) = state.store.portable_repo() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable");
+    };
+    let challenge = match repository.email_challenge(&payload.challenge_id).await {
+        Ok(Some(challenge)) => challenge,
+        Ok(None) => return error(StatusCode::BAD_REQUEST, "invalid verification code"),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable"),
+    };
+    let now = Utc::now();
+    if challenge.expires_at <= now || challenge.attempts >= 5 || challenge.verified_at.is_some() {
+        return error(StatusCode::BAD_REQUEST, "invalid verification code");
+    }
+    let expected_hash = registration_hash_hex(
+        &state.registration_hash_key,
+        b"email-code",
+        &[payload.challenge_id.as_bytes(), payload.code.as_bytes()],
+    );
+    if expected_hash != challenge.code_hash {
+        let _ = repository
+            .record_challenge_failure(&payload.challenge_id, challenge.attempts)
+            .await;
+        return error(StatusCode::BAD_REQUEST, "invalid verification code");
+    }
+
+    let mut ticket_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut ticket_bytes);
+    let raw_ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ticket_bytes);
+    let ticket_hash = registration_hash_hex(
+        &state.registration_hash_key,
+        b"registration-ticket",
+        &[raw_ticket.as_bytes()],
+    );
+    let ticket = crate::seaorm_store::NewRegistrationTicket {
+        id: uuid::Uuid::new_v4().to_string(),
+        email: challenge.email,
+        token_hash: ticket_hash,
+        issued_at: now,
+        expires_at: now + chrono::Duration::minutes(20),
+        invitation_id: challenge.invitation_id,
+    };
+    if repository
+        .verify_challenge_and_issue_ticket(&payload.challenge_id, &expected_hash, ticket)
+        .await
+        .is_err()
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid verification code");
+    }
+    tracing::info!(event = "auth.registration.email_verified", challenge_id = %payload.challenge_id);
+    no_store_json(
+        StatusCode::OK,
+        &VerifyEmailResponse {
+            registration_ticket: raw_ticket,
+            expires_in_seconds: 20 * 60,
+        },
+    )
+}
+
+async fn register(
+    State(state): State<HttpAuthState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let payload: RegisterRequest = match decode_json(&headers, request).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    if payload.registration_ticket.is_empty() || payload.registration_ticket.len() > 128 {
+        return error(StatusCode::BAD_REQUEST, "invalid registration");
+    }
+    let username = match crate::validation::normalize_username(&payload.username) {
+        Ok(username) => username,
+        Err(message) => {
+            return no_store_json(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({ "error": message }),
+            );
+        }
+    };
+    let Some(repository) = state.store.portable_repo() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable");
+    };
+    let mode = match repository.registration_mode().await {
+        Ok(mode) => mode,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable"),
+    };
+    if mode == crate::seaorm_store::RegistrationMode::Closed {
+        return error(StatusCode::FORBIDDEN, "registration closed");
+    }
+    let ticket_hash = registration_hash_hex(
+        &state.registration_hash_key,
+        b"registration-ticket",
+        &[payload.registration_ticket.as_bytes()],
+    );
+    let ticket = match repository.registration_ticket_by_hash(&ticket_hash).await {
+        Ok(Some(ticket)) if ticket.consumed_at.is_none() && ticket.expires_at > Utc::now() => {
+            ticket
+        }
+        Ok(_) => return error(StatusCode::BAD_REQUEST, "invalid registration"),
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "registration unavailable"),
+    };
+    if mode == crate::seaorm_store::RegistrationMode::InviteOnly && ticket.invitation_id.is_none() {
+        return error(StatusCode::FORBIDDEN, "invitation required");
+    }
+    if let Err(message) =
+        crate::validation::validate_password(&payload.password, &username, &ticket.email)
+    {
+        return no_store_json(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({ "error": message }),
+        );
+    }
+
+    let create_result = state
+        .store
+        .create_verified_user(
+            username,
+            ticket.email,
+            payload.password,
+            vec![super::ROLE_ADMIN.to_string()],
+            &ticket_hash,
+        )
+        .await;
+
+    let user = match create_result {
+        Ok(user) => user,
+        Err(err) => {
+            return no_store_json(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({ "error": err }),
+            );
+        }
+    };
+
+    let response_user = LoginUser {
+        id: user.id.clone(),
+        username: user.username.clone(),
+        email: user.email.clone(),
+        roles: user.roles.clone(),
+        organization_id: user.organization_id.clone().unwrap_or_default(),
+    };
+
+    let (token, expires_at) = match state.store.issue_token_with_expiry(&user) {
+        Ok(result) => result,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication unavailable",
+            );
+        }
+    };
+
+    let response = LoginResponse {
+        token,
+        expires_at,
+        user: response_user,
+    };
+
+    no_store_json(StatusCode::CREATED, &response)
+}
+
+async fn login(
+    State(state): State<HttpAuthState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let request_id = new_audit_id();
+    if !has_exact_json_content_type(&headers) {
+        emit_audit(
+            AuditEvent::LoginDenied,
+            &request_id,
+            AuditSource::Unclassified,
+        );
+        return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid request");
+    }
+    let source = match request_source(&headers, peer.ip(), &state.trusted_proxies) {
+        Ok(source) => source,
+        Err(()) => {
+            emit_audit(
+                AuditEvent::LoginDenied,
+                &request_id,
+                AuditSource::Unclassified,
+            );
+            return error(StatusCode::BAD_REQUEST, "invalid request");
+        }
+    };
+    let bytes = match to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            emit_audit(AuditEvent::LoginDenied, &request_id, source.class);
+            return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid request");
+        }
+    };
+    let payload: LoginRequest = match serde_json::from_slice(&bytes) {
+        Ok(payload) => payload,
+        Err(_) => {
+            emit_audit(AuditEvent::LoginDenied, &request_id, source.class);
+            return error(StatusCode::BAD_REQUEST, "invalid request");
+        }
+    };
+    let identifier = match (&payload.username, &payload.email) {
+        (Some(username), None) | (None, Some(username)) => username.trim(),
+        _ => {
+            emit_audit(AuditEvent::LoginDenied, &request_id, source.class);
+            return error(StatusCode::BAD_REQUEST, "invalid request");
+        }
+    };
+    let default_tenant = std::env::var("OMNISOLO_DEFAULT_TENANT_ID").ok();
+    let organization = resolve_organization(
+        payload.organization_id.as_deref(),
+        default_tenant.as_deref(),
+        state.cloud,
+    );
+    let organization_id = match &organization {
+        TenantResolution::Authenticate(value) => value.as_str(),
+        TenantResolution::DummyDeny => "",
+    };
+    if identifier.is_empty()
+        || identifier.len() > MAX_IDENTIFIER_BYTES
+        || payload.password.is_empty()
+        || payload.password.len() > MAX_PASSWORD_BYTES
+        || organization_id.len() > MAX_ORGANIZATION_BYTES
+    {
+        emit_audit(AuditEvent::LoginDenied, &request_id, source.class);
+        return error(StatusCode::BAD_REQUEST, "invalid request");
+    }
+
+    let source_key = keyed_hash(&state.hash_key, source.ip.to_string().as_bytes());
+    let normalized_account = format!(
+        "{}\0{}",
+        organization_id.to_lowercase(),
+        identifier.to_lowercase()
+    );
+    let account_key = keyed_hash(&state.hash_key, normalized_account.as_bytes());
+    let retry_after = {
+        let mut limiter = state.limiter.lock().expect("login limiter lock poisoned");
+        limiter
+            .check_and_record(source_key, account_key, (state.now)())
+            .err()
+    };
+    if let Some(retry_after) = retry_after {
+        emit_audit(AuditEvent::LoginThrottled, &request_id, source.class);
+        return error_with_retry(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests",
+            retry_after,
+        );
+    }
+
+    let authentication = match &organization {
+        TenantResolution::Authenticate(_) => {
+            state
+                .store
+                .authenticate(identifier, &payload.password, organization_id)
+                .await
+        }
+        TenantResolution::DummyDeny => state.store.authenticate_dummy(&payload.password).await,
+    };
+    let user = match authentication {
+        Ok(user) => user,
+        Err(AuthenticationError::InvalidCredentials) => {
+            emit_audit(AuditEvent::LoginDenied, &request_id, source.class);
+            return error(StatusCode::UNAUTHORIZED, "invalid credentials");
+        }
+        Err(AuthenticationError::Unavailable(_)) => {
+            emit_audit(AuditEvent::LoginUnavailable, &request_id, source.class);
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication unavailable",
+            );
+        }
+    };
+    let response_user = LoginUser {
+        id: user.id.clone(),
+        username: user.username.clone(),
+        email: user.email.clone(),
+        roles: user.roles.clone(),
+        organization_id: user.organization_id.clone().unwrap_or_default(),
+    };
+    if !bounded_login_user(&response_user, state.cloud) || !Store::user_access_token_fits(&user) {
+        emit_audit(AuditEvent::LoginUnavailable, &request_id, source.class);
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication unavailable",
+        );
+    }
+    let (token, expires_at) = match state.store.issue_token_with_expiry(&user) {
+        Ok(result) if bounded_access_token(&result.0) => result,
+        Ok(_) | Err(_) => {
+            emit_audit(AuditEvent::LoginUnavailable, &request_id, source.class);
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication unavailable",
+            );
+        }
+    };
+    let response = LoginResponse {
+        token,
+        expires_at,
+        user: response_user,
+    };
+    let encoded = serde_json::to_vec(&response).expect("bounded login response serializes");
+    if encoded.len() > MAX_RESPONSE_BYTES {
+        emit_audit(AuditEvent::LoginUnavailable, &request_id, source.class);
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication unavailable",
+        );
+    }
+    emit_audit(AuditEvent::LoginSuccess, &request_id, source.class);
+    no_store_json(StatusCode::OK, &response)
+}
+
+async fn logout(
+    State(state): State<HttpAuthState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Response {
+    let request_id = new_audit_id();
+    let source = match request_source(&headers, peer.ip(), &state.trusted_proxies) {
+        Ok(source) => source.class,
+        Err(()) => {
+            emit_audit(
+                AuditEvent::LogoutDenied,
+                &request_id,
+                AuditSource::Unclassified,
+            );
+            return error(StatusCode::BAD_REQUEST, "invalid request");
+        }
+    };
+    let body = match to_bytes(request.into_body(), 1).await {
+        Ok(body) => body,
+        Err(_) => {
+            emit_audit(AuditEvent::LogoutDenied, &request_id, source);
+            return error(StatusCode::BAD_REQUEST, "invalid request");
+        }
+    };
+    if !body.is_empty() {
+        emit_audit(AuditEvent::LogoutDenied, &request_id, source);
+        return error(StatusCode::BAD_REQUEST, "invalid request");
+    }
+    let token = match bearer_token(&headers) {
+        Some(token) => token.to_string(),
+        None => {
+            emit_audit(AuditEvent::LogoutDenied, &request_id, source);
+            return error(StatusCode::UNAUTHORIZED, "invalid token");
+        }
+    };
+    match state.store.logout_token(&token).await {
+        Ok(()) => {
+            emit_audit(AuditEvent::LogoutSuccess, &request_id, source);
+            no_store_json(StatusCode::OK, &serde_json::json!({ "ok": true }))
+        }
+        Err(LogoutError::ValidationUnavailable) => {
+            emit_audit(AuditEvent::LogoutUnavailable, &request_id, source);
+            error(StatusCode::SERVICE_UNAVAILABLE, "logout unavailable")
+        }
+        Err(LogoutError::RevocationUnavailable) => {
+            emit_audit(AuditEvent::LogoutUnavailable, &request_id, source);
+            error(StatusCode::SERVICE_UNAVAILABLE, "logout unavailable")
+        }
+        Err(LogoutError::InvalidToken) => {
+            emit_audit(AuditEvent::LogoutDenied, &request_id, source);
+            error(StatusCode::UNAUTHORIZED, "invalid token")
+        }
+    }
+}
+
+fn resolve_organization(
+    explicit: Option<&str>,
+    default: Option<&str>,
+    cloud: bool,
+) -> TenantResolution {
+    if let Some(value) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        return TenantResolution::Authenticate(value.to_string());
+    }
+    if cloud {
+        return TenantResolution::DummyDeny;
+    }
+    TenantResolution::Authenticate(default.map(str::trim).unwrap_or_default().to_string())
+}
+
+fn rate_limit_deployment(value: Option<&str>, cloud: bool) -> Result<RateLimitDeployment, String> {
+    if !cloud {
+        return Ok(RateLimitDeployment::Standalone);
+    }
+    match value {
+        Some("single-instance") => Ok(RateLimitDeployment::SingleInstance),
+        Some("upstream-bounded") => Ok(RateLimitDeployment::UpstreamBounded),
+        _ => Err("cloud authentication requires OMNISOLO_AUTH_RATE_LIMIT_DEPLOYMENT=single-instance or upstream-bounded".into()),
+    }
+}
+
+fn bounded_login_user(user: &LoginUser, cloud: bool) -> bool {
+    !user.id.is_empty()
+        && user.id.len() <= MAX_USER_ID_BYTES
+        && !user.username.is_empty()
+        && user.username.len() <= MAX_USERNAME_BYTES
+        && !user.email.is_empty()
+        && user.email.len() <= MAX_EMAIL_BYTES
+        && (!cloud || !user.organization_id.is_empty())
+        && user.organization_id.len() <= MAX_ORGANIZATION_BYTES
+        && user.roles.len() <= MAX_ROLES
+        && user
+            .roles
+            .iter()
+            .all(|role| !role.is_empty() && role.len() <= MAX_ROLE_BYTES)
+}
+
+fn bounded_access_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= MAX_ACCESS_TOKEN_BYTES
+}
+
+fn has_exact_json_content_type(headers: &HeaderMap) -> bool {
+    if headers.get_all(header::CONTENT_TYPE).iter().count() != 1 {
+        return false;
+    }
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
+        return None;
+    }
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    (!token.is_empty()
+        && token.len() <= 4096
+        && !token.bytes().any(|byte| byte.is_ascii_whitespace()))
+    .then_some(token)
+}
+
+fn request_source(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trusted_proxies: &HashSet<IpAddr>,
+) -> Result<RequestSource, ()> {
+    let forwarded_count = headers.get_all("forwarded").iter().count();
+    let xff_count = headers.get_all("x-forwarded-for").iter().count();
+    if !trusted_proxies.contains(&peer) {
+        return Ok(RequestSource {
+            ip: peer,
+            class: AuditSource::DirectPeer,
+        });
+    }
+    if forwarded_count + xff_count == 0 {
+        return Ok(RequestSource {
+            ip: peer,
+            class: AuditSource::DirectPeer,
+        });
+    }
+    if forwarded_count + xff_count != 1 {
+        return Err(());
+    }
+    if xff_count == 1 {
+        let value = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .ok_or(())?;
+        if value.contains(',') || value.trim() != value {
+            return Err(());
+        }
+        return value
+            .parse()
+            .map(|ip| RequestSource {
+                ip,
+                class: AuditSource::TrustedProxy,
+            })
+            .map_err(|_| ());
+    }
+    let value = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(())?;
+    if value.contains(',') || value.contains(';') || !value.starts_with("for=") {
+        return Err(());
+    }
+    value[4..]
+        .parse()
+        .map(|ip| RequestSource {
+            ip,
+            class: AuditSource::TrustedProxy,
+        })
+        .map_err(|_| ())
+}
+
+fn trusted_proxies_from_env() -> Result<HashSet<IpAddr>, String> {
+    let Some(value) = std::env::var_os("OMNISOLO_AUTH_TRUSTED_PROXY_IPS") else {
+        return Ok(HashSet::new());
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "trusted proxy setting is not UTF-8".to_string())?;
+    if value.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let parts: Vec<_> = value.split(',').collect();
+    if parts.len() > MAX_TRUSTED_PROXIES {
+        return Err("too many trusted proxy addresses".to_string());
+    }
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.trim() != part || part.is_empty() {
+                return Err("invalid trusted proxy address".to_string());
+            }
+            part.parse()
+                .map_err(|_| "invalid trusted proxy address".to_string())
+        })
+        .collect()
+}
+
+fn keyed_hash(key: &[u8; 32], value: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(value);
+    mac.finalize().into_bytes().into()
+}
+
+fn registration_hash_hex(key: &[u8; 32], purpose: &[u8], values: &[&[u8]]) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(&(purpose.len() as u64).to_be_bytes());
+    mac.update(purpose);
+    for value in values {
+        mac.update(&(value.len() as u64).to_be_bytes());
+        mac.update(value);
+    }
+    hex::encode(mac.finalize().into_bytes())
+}
+
+async fn decode_json<T: DeserializeOwned>(
+    headers: &HeaderMap,
+    request: axum::extract::Request,
+) -> Result<T, Response> {
+    if !has_exact_json_content_type(headers) {
+        return Err(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid request"));
+    }
+    let bytes = to_bytes(request.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|_| error(StatusCode::PAYLOAD_TOO_LARGE, "invalid request"))?;
+    serde_json::from_slice(&bytes).map_err(|_| error(StatusCode::BAD_REQUEST, "invalid request"))
+}
+
+fn no_store_json<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    let body = serde_json::to_vec(value).expect("response serialization cannot fail");
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::PRAGMA, "no-cache")
+        .body(Body::from(body))
+        .expect("valid authentication response")
+}
+
+fn error(status: StatusCode, message: &'static str) -> Response {
+    no_store_json(status, &ErrorResponse { error: message })
+}
+
+fn error_with_retry(status: StatusCode, message: &'static str, retry_after: u64) -> Response {
+    let mut response = error(status, message);
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        retry_after
+            .to_string()
+            .parse()
+            .expect("integer retry-after is a valid header"),
+    );
+    response
+}
+
+#[cfg(test)]
+fn router_for_test() -> Router {
+    router_with_state(HttpAuthState::new(Arc::new(Store::new()), HashSet::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{User, seaorm_store::entities, user_repository::UserRepository};
+    use async_trait::async_trait;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use chrono::{DateTime, Utc};
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, Database, EntityTrait, PaginatorTrait, Schema, Set,
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tower::ServiceExt;
+
+    static REG_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_peer(mut request: Request<Body>, peer: IpAddr) -> Request<Body> {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer, 1234)));
+        request
+    }
+
+    fn json_request(path: &str, body: impl Into<Body>) -> Request<Body> {
+        with_peer(
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(body.into())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+    }
+
+    async fn app_with_user() -> (Router, Arc<Store>, User) {
+        let store = Arc::new(Store::new());
+        let uid = uuid::Uuid::new_v4().to_string();
+        let org_id = format!("tenant-{}", &uid[..8]);
+        let user = store
+            .create_user(
+                format!("Alice_{}", &uid[..8]),
+                format!("alice_{}@example.test", &uid[..8]),
+                "correct horse".into(),
+                vec!["ADMIN".into()],
+                org_id.clone(),
+            )
+            .await
+            .unwrap();
+
+        let has_db =
+            std::env::var("DATABASE_URL").is_ok() || std::env::var("OMNISOLO_DATABASE_URL").is_ok();
+        if has_db {
+            let pool = crate::db::get_pool();
+            let mut tx_opt = None;
+            for _ in 0..10 {
+                if let Ok(tx) = pool.begin().await {
+                    tx_opt = Some(tx);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if let Some(mut tx) = tx_opt {
+                let _ = sqlx::query(
+                    "INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                )
+                .bind(&org_id)
+                .bind("Test Tenant")
+                .execute(&mut *tx)
+                .await;
+                let _ = sqlx::query(
+                    "INSERT INTO users (id, username, email, password_hash, roles, active, tenant_id) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING"
+                )
+                .bind(&user.id)
+                .bind(&user.username)
+                .bind(&user.email)
+                .bind(&user.password_hash)
+                .bind(&user.roles)
+                .bind(user.active)
+                .bind(&org_id)
+                .execute(&mut *tx)
+                .await;
+                let _ = tx.commit().await;
+            }
+        }
+
+        (
+            router_with_state(HttpAuthState::new(store.clone(), HashSet::new())),
+            store,
+            user,
+        )
+    }
+
+    fn identity_request(token: Option<&str>) -> Request<Body> {
+        let mut request = Request::get("/api/v1/auth/session-identity")
+            .header("origin", "https://untrusted.example")
+            .header("x-tenant-id", "attacker-tenant")
+            .header("x-user-id", "attacker-user");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    fn assert_identity_privacy(response: &Response) {
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            response.headers().get(header::VARY).unwrap(),
+            "Authorization"
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_identity_returns_only_verified_current_tenant_identity() {
+        let (app, store, user) = app_with_user().await;
+        let (token, expires_at) = store.issue_token_with_expiry(&user).unwrap();
+        let response = app.oneshot(identity_request(Some(&token))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_identity_privacy(&response);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "userId": user.id, "tenantId": user.organization_id.unwrap(),
+                "expiresAt": expires_at * 1000,
+            })
+        );
+        assert!(!String::from_utf8(body.to_vec()).unwrap().contains(&token));
+    }
+
+    #[tokio::test]
+    async fn session_identity_denies_missing_forged_and_duplicate_bearers() {
+        let (app, store, user) = app_with_user().await;
+        let token = store.issue_token(&user).unwrap();
+        let (prefix, signature) = token.rsplit_once('.').unwrap();
+        let replacement = if signature.starts_with('A') { "B" } else { "A" };
+        let forged = format!("{prefix}.{replacement}{}", &signature[1..]);
+        let mut duplicate = identity_request(Some(&token));
+        duplicate.headers_mut().append(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        for request in [
+            identity_request(None),
+            identity_request(Some(&forged)),
+            duplicate,
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_identity_privacy(&response);
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_identity_denies_expired_and_revoked_tokens() {
+        let (app, store, user) = app_with_user().await;
+        let now = Utc::now().timestamp();
+        let mut claims = store
+            .validate_token(&store.issue_token(&user).unwrap())
+            .await
+            .unwrap();
+        claims.iat = now - 7200;
+        claims.exp = now - 3600;
+        let expired = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&store.secret),
+        )
+        .unwrap();
+        // Token validation allows a short clock leeway; the identity read must
+        // never report an already-expired session as active.
+        claims.exp = now - 1;
+        let just_expired = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&store.secret),
+        )
+        .unwrap();
+        let revoked = store.issue_token(&user).unwrap();
+        store.logout_token(&revoked).await.unwrap();
+        for token in [expired, just_expired, revoked] {
+            let response = app
+                .clone()
+                .oneshot(identity_request(Some(&token)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_identity_privacy(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_identity_denies_inactive_and_wrong_tenant_membership() {
+        let (app, store, mut user) = app_with_user().await;
+        let valid = store.issue_token(&user).unwrap();
+        let mut wrong_tenant = user.clone();
+        wrong_tenant.organization_id = Some("different-tenant".into());
+        let wrong = store.issue_token(&wrong_tenant).unwrap();
+        let response = app
+            .clone()
+            .oneshot(identity_request(Some(&wrong)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_identity_privacy(&response);
+        user.active = false;
+        store.users.write().unwrap().insert(user.id.clone(), user);
+        let response = app.oneshot(identity_request(Some(&valid))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_identity_privacy(&response);
+    }
+
+    #[tokio::test]
+    async fn session_identity_does_not_enable_cross_origin_preflight() {
+        let (app, _, _) = app_with_user().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/v1/auth/session-identity")
+                    .header(header::ORIGIN, "https://untrusted.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        );
+    }
+
+    #[tokio::test]
+    async fn login_rejects_non_json_and_sets_no_store() {
+        let request = with_peer(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "text/plain")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"admin","organization_id":"tenant"}"#,
+                ))
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+
+        let response = router_for_test().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"invalid request"}"#);
+    }
+
+    #[tokio::test]
+    async fn login_accepts_email_through_store_and_returns_bounded_user_contract() {
+        let (app, _, user) = app_with_user().await;
+        let org_id = user.organization_id.clone().unwrap_or_default();
+        let payload = serde_json::json!({
+            "email": user.email,
+            "password": "correct horse",
+            "organization_id": org_id,
+        });
+        let request = json_request("/api/v1/auth/login", payload.to_string());
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body["token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        );
+        assert_eq!(body["user"]["username"], user.username);
+        assert_eq!(body["user"]["organization_id"], org_id);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_unknown_fields_missing_tenant_and_oversized_bodies_generically() {
+        let bodies = [
+            r#"{"username":"admin","password":"admin","organization_id":"tenant","extra":true}"#
+                .to_string(),
+            format!(
+                r#"{{"username":"admin","password":"{}","organization_id":"tenant"}}"#,
+                "p".repeat(MAX_PASSWORD_BYTES + 1)
+            ),
+        ];
+        for body in bodies {
+            let response = router_for_test()
+                .oneshot(json_request("/api/v1/auth/login", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(body.as_ref(), br#"{"error":"invalid request"}"#);
+        }
+
+        let response = router_for_test()
+            .oneshot(json_request(
+                "/api/v1/auth/login",
+                vec![b' '; MAX_BODY_BYTES + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn login_uses_the_same_generic_denial_for_unknown_user_and_wrong_password() {
+        let (app, _, _) = app_with_user().await;
+        for body in [
+            r#"{"username":"nobody","password":"wrong","organization_id":"tenant-7"}"#,
+            r#"{"username":"Alice","password":"wrong","organization_id":"tenant-7"}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(json_request("/api/v1/auth/login", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(body.as_ref(), br#"{"error":"invalid credentials"}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_missing_tenant_uses_generic_dummy_denial() {
+        let store = Arc::new(Store::new());
+        store
+            .create_user(
+                "NoTenant".into(),
+                "no-tenant@example.test".into(),
+                "correct horse".into(),
+                vec!["ADMIN".into()],
+                String::new(),
+            )
+            .await
+            .unwrap();
+        let mut state = HttpAuthState::new(store, HashSet::new());
+        state.cloud = true;
+        let response = router_with_state(state)
+            .oneshot(json_request(
+                "/api/v1/auth/login",
+                r#"{"username":"NoTenant","password":"correct horse"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"invalid credentials"}"#);
+    }
+
+    #[tokio::test]
+    async fn router_throttles_normalized_account_across_sources_with_retry_after() {
+        let store = Arc::new(Store::new());
+        let mut state = HttpAuthState::new(store, HashSet::new());
+        state.limiter = Arc::new(Mutex::new(LoginLimiter::new(LimitConfig {
+            source_attempts: 10,
+            account_attempts: 1,
+            window_seconds: 60,
+            max_entries: 100,
+        })));
+        state.now = Arc::new(|| 100);
+        let app = router_with_state(state);
+
+        let first = with_peer(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":" Alice ","password":"wrong","organization_id":" Tenant-7 "}"#,
+                ))
+                .unwrap(),
+            "192.0.2.1".parse().unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let second = with_peer(
+            Request::post("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":"alice","password":"wrong","organization_id":"tenant-7"}"#,
+                ))
+                .unwrap(),
+            "192.0.2.2".parse().unwrap(),
+        );
+        let response = app.oneshot(second).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
+    }
+
+    #[test]
+    fn limiter_keeps_source_and_account_buckets_independent_with_retry_and_expiry() {
+        let mut limiter = LoginLimiter::new(LimitConfig {
+            source_attempts: 2,
+            account_attempts: 1,
+            window_seconds: 10,
+            max_entries: 10,
+        });
+        let source_a = [1; 32];
+        let source_b = [2; 32];
+        let account_a = [3; 32];
+        let account_b = [4; 32];
+
+        assert_eq!(limiter.check_and_record(source_a, account_a, 100), Ok(()));
+        assert_eq!(limiter.check_and_record(source_b, account_a, 101), Err(9));
+        assert_eq!(limiter.check_and_record(source_a, account_b, 101), Ok(()));
+        assert_eq!(limiter.check_and_record(source_a, [5; 32], 102), Err(8));
+        assert_eq!(limiter.check_and_record(source_a, account_a, 110), Ok(()));
+    }
+
+    #[test]
+    fn tenant_resolution_fails_cloud_missing_through_dummy_path_and_allows_explicit_standalone_authority()
+     {
+        assert_eq!(
+            resolve_organization(None, None, true),
+            TenantResolution::DummyDeny
+        );
+        assert_eq!(
+            resolve_organization(Some(" "), Some("tenant-default"), true),
+            TenantResolution::DummyDeny
+        );
+        assert_eq!(
+            resolve_organization(Some("tenant-7"), None, true),
+            TenantResolution::Authenticate("tenant-7".into())
+        );
+        assert_eq!(
+            resolve_organization(None, Some("tenant-default"), false),
+            TenantResolution::Authenticate("tenant-default".into())
+        );
+        assert_eq!(
+            resolve_organization(None, None, false),
+            TenantResolution::Authenticate(String::new())
+        );
+    }
+
+    #[test]
+    fn source_limit_is_lower_and_cannot_exhaust_one_account_bucket() {
+        assert!(SOURCE_ATTEMPTS < ACCOUNT_ATTEMPTS);
+        let mut limiter = LoginLimiter::new(LimitConfig {
+            source_attempts: SOURCE_ATTEMPTS,
+            account_attempts: ACCOUNT_ATTEMPTS,
+            window_seconds: 60,
+            max_entries: 100,
+        });
+        for account in 0..SOURCE_ATTEMPTS {
+            assert_eq!(
+                limiter.check_and_record([1; 32], [account as u8; 32], 10),
+                Ok(())
+            );
+        }
+        assert!(limiter.check_and_record([1; 32], [99; 32], 10).is_err());
+        assert_eq!(limiter.accounts.entries.get(&[0; 32]).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn cloud_rate_limit_deployment_requires_an_explicit_supported_contract() {
+        assert!(rate_limit_deployment(None, true).is_err());
+        assert!(rate_limit_deployment(Some(""), true).is_err());
+        assert!(rate_limit_deployment(Some("redis"), true).is_err());
+        assert_eq!(
+            rate_limit_deployment(Some("single-instance"), true).unwrap(),
+            RateLimitDeployment::SingleInstance
+        );
+        assert_eq!(
+            rate_limit_deployment(Some("upstream-bounded"), true).unwrap(),
+            RateLimitDeployment::UpstreamBounded
+        );
+        assert_eq!(
+            rate_limit_deployment(None, false).unwrap(),
+            RateLimitDeployment::Standalone
+        );
+    }
+
+    #[test]
+    fn response_user_contract_accepts_exact_bounds_and_rejects_every_overage() {
+        let exact = LoginUser {
+            id: "i".repeat(MAX_USER_ID_BYTES),
+            username: "u".repeat(MAX_USERNAME_BYTES),
+            email: "e".repeat(MAX_EMAIL_BYTES),
+            roles: vec!["r".repeat(MAX_ROLE_BYTES); MAX_ROLES],
+            organization_id: "o".repeat(MAX_ORGANIZATION_BYTES),
+        };
+        assert!(bounded_login_user(&exact, true));
+        let mut over = exact;
+        over.id.push('i');
+        assert!(!bounded_login_user(&over, true));
+        over.id.truncate(MAX_USER_ID_BYTES);
+        over.roles.push("role".into());
+        assert!(!bounded_login_user(&over, true));
+        over.roles.truncate(MAX_ROLES);
+        over.organization_id.clear();
+        assert!(bounded_login_user(&over, false));
+        assert!(!bounded_login_user(&over, true));
+
+        assert!(bounded_access_token(&"t".repeat(MAX_ACCESS_TOKEN_BYTES)));
+        assert!(!bounded_access_token(""));
+        assert!(!bounded_access_token(
+            &"t".repeat(MAX_ACCESS_TOKEN_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn rust_and_next_share_the_same_access_token_ceiling() {
+        let limits: serde_json::Value =
+            serde_json::from_str(include_str!("../../ui/next/src/lib/auth/authLimits.json"))
+                .unwrap();
+        assert_eq!(
+            limits["maxAccessTokenBytes"].as_u64(),
+            Some(MAX_ACCESS_TOKEN_BYTES as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_user_claims_always_fit_the_shared_token_ceiling() {
+        let store = Arc::new(Store::new());
+        let roles = vec!["r".repeat(MAX_ROLE_BYTES); 12];
+        let user = store
+            .create_user(
+                "bounded-user".into(),
+                "bounded@example.test".into(),
+                "correct horse".into(),
+                roles.clone(),
+                "tenant-7".into(),
+            )
+            .await
+            .unwrap();
+        assert!(Store::user_access_token_fits(&user));
+        let (token, _) = store.issue_token_with_expiry(&user).unwrap();
+        assert!(token.len() <= MAX_ACCESS_TOKEN_BYTES);
+
+        let oversized_roles = vec!["r".repeat(MAX_ROLE_BYTES); MAX_ROLES];
+        assert!(
+            store
+                .update_user(
+                    &user.id,
+                    None,
+                    Some(oversized_roles.clone()),
+                    None,
+                    "tenant-7",
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.get_user(&user.id, "tenant-7").await.unwrap().roles,
+            roles
+        );
+        assert!(
+            store
+                .create_user(
+                    "oversized-user".into(),
+                    "oversized@example.test".into(),
+                    "correct horse".into(),
+                    oversized_roles,
+                    "tenant-7".into(),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn token_expiry_in_login_response_exactly_matches_signed_claim() {
+        let (app, store, user) = app_with_user().await;
+        let org_id = user.organization_id.clone().unwrap_or_default();
+        let payload = serde_json::json!({
+            "username": user.username,
+            "password": "correct horse",
+            "organization_id": org_id,
+        });
+        let response = app
+            .oneshot(json_request("/api/v1/auth/login", payload.to_string()))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let claims = store
+            .validate_token(body["token"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body["expires_at"].as_i64().unwrap(), claims.exp);
+    }
+
+    #[tokio::test]
+    async fn logout_returns_typed_invalid_token() {
+        let store = Store::new();
+        assert_eq!(
+            store.logout_token("not-a-token").await,
+            Err(crate::LogoutError::InvalidToken)
+        );
+    }
+
+    #[test]
+    fn limiter_uses_indexed_expiry_and_fails_closed_at_capacity() {
+        let mut limiter = LoginLimiter::new(LimitConfig {
+            source_attempts: 10,
+            account_attempts: 10,
+            window_seconds: 100,
+            max_entries: 2,
+        });
+        limiter.check_and_record([1; 32], [11; 32], 1).unwrap();
+        limiter.check_and_record([2; 32], [12; 32], 2).unwrap();
+        assert_eq!(limiter.check_and_record([3; 32], [13; 32], 3), Err(98));
+        assert_eq!(limiter.sources.entries.len(), 2);
+        assert!(limiter.sources.entries.contains_key(&[1; 32]));
+        assert_eq!(limiter.sources.expirations.len(), 2);
+        assert_eq!(limiter.sources.least_recent.len(), 2);
+        limiter.check_and_record([3; 32], [13; 32], 101).unwrap();
+        assert!(!limiter.sources.entries.contains_key(&[1; 32]));
+        assert!(limiter.sources.entries.contains_key(&[3; 32]));
+
+        let key = [9; 32];
+        assert_eq!(
+            keyed_hash(&key, b" tenant-7\0Alice "),
+            keyed_hash(&key, b" tenant-7\0Alice ")
+        );
+        assert_ne!(
+            keyed_hash(&key, b" tenant-7\0Alice "),
+            keyed_hash(&key, b"tenant-7\0alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn login_fails_fast_when_password_hash_capacity_is_exhausted() {
+        let (base_app, store, _) = app_with_user().await;
+        drop(base_app);
+        let permits = store
+            .password_slots
+            .clone()
+            .acquire_many_owned(crate::MAX_PASSWORD_HASH_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let response = router_with_state(HttpAuthState::new(store, HashSet::new()))
+            .oneshot(json_request(
+                "/api/v1/auth/login",
+                r#"{"username":"Alice","password":"correct horse","organization_id":"tenant-7"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        drop(permits);
+    }
+
+    #[test]
+    fn forwarding_headers_are_ignored_by_default_and_bounded_for_exact_trusted_peers() {
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let client: IpAddr = "203.0.113.9".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        assert_eq!(
+            request_source(&headers, peer, &HashSet::new()),
+            Ok(RequestSource {
+                ip: peer,
+                class: AuditSource::DirectPeer,
+            })
+        );
+
+        let trusted = HashSet::from([peer]);
+        assert_eq!(
+            request_source(&headers, peer, &trusted),
+            Ok(RequestSource {
+                ip: client,
+                class: AuditSource::TrustedProxy,
+            })
+        );
+        headers.insert("x-forwarded-for", "203.0.113.9, 10.0.0.1".parse().unwrap());
+        assert_eq!(request_source(&headers, peer, &trusted), Err(()));
+        headers.insert("forwarded", "for=203.0.113.9".parse().unwrap());
+        assert_eq!(request_source(&headers, peer, &trusted), Err(()));
+    }
+
+    #[test]
+    fn duplicate_content_type_and_authorization_headers_are_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.append(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        assert!(!has_exact_json_content_type(&headers));
+
+        headers.append(header::AUTHORIZATION, "Bearer first".parse().unwrap());
+        headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn audit_context_is_random_coarse_and_cannot_carry_request_identity() {
+        let first = new_audit_id();
+        let second = new_audit_id();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+
+        let context = format!(
+            "{:?}:{:?}",
+            AuditEvent::LoginDenied,
+            AuditSource::TrustedProxy
+        );
+        for raw in ["Alice", "tenant-7", "correct horse", "Bearer"] {
+            assert!(!context.contains(raw));
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_requires_strict_bearer_and_is_idempotent() {
+        let (app, store, user) = app_with_user().await;
+        let token = store.issue_token(&user).unwrap();
+
+        let missing = with_peer(
+            Request::post("/api/v1/auth/logout")
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        for authorization in ["bearer token", "Bearer has space", "Basic token"] {
+            let malformed = with_peer(
+                Request::post("/api/v1/auth/logout")
+                    .header("authorization", authorization)
+                    .body(Body::empty())
+                    .unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            );
+            assert_eq!(
+                app.clone().oneshot(malformed).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let (prefix, signature) = token.rsplit_once('.').unwrap();
+        let replacement = if signature.starts_with('A') { "B" } else { "A" };
+        let forged = format!("{prefix}.{replacement}{}", &signature[1..]);
+        let forged_request = with_peer(
+            Request::post("/api/v1/auth/logout")
+                .header("authorization", format!("Bearer {forged}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let forged_response = app.clone().oneshot(forged_request).await.unwrap();
+        assert_eq!(forged_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            forged_response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        let forged_body = to_bytes(forged_response.into_body(), 1024).await.unwrap();
+        assert_eq!(forged_body.as_ref(), br#"{"error":"invalid token"}"#);
+
+        for _ in 0..2 {
+            let request = with_peer(
+                Request::post("/api/v1/auth/logout")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            );
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        }
+        assert!(store.validate_token(&token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_rejects_legacy_unverified_payloads() {
+        let response = router_for_test()
+            .oneshot(json_request(
+                "/api/v1/auth/register",
+                r#"{"username":"testuser","email":"test@example.com","password":"long-enough-password"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_fails_closed_without_portable_persistence() {
+        let response = router_for_test()
+            .oneshot(json_request(
+                "/api/v1/auth/register",
+                r#"{"registration_ticket":"not-a-real-ticket","organization_id":"test-workspace","username":"testuser","password":"long-enough-password"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"registration unavailable"}"#);
+    }
+
+    async fn registration_test_app(
+        mode: crate::seaorm_store::RegistrationMode,
+        invitation_creator: Option<User>,
+    ) -> (
+        Router,
+        Arc<crate::seaorm_store::SeaOrmAuthRepository>,
+        String,
+    ) {
+        registration_test_app_with_mailer(
+            mode,
+            invitation_creator,
+            Arc::new(crate::email::UnconfiguredMailer),
+        )
+        .await
+    }
+
+    async fn registration_test_app_with_mailer(
+        mode: crate::seaorm_store::RegistrationMode,
+        invitation_creator: Option<User>,
+        mailer: Arc<dyn crate::email::VerificationMailer>,
+    ) -> (
+        Router,
+        Arc<crate::seaorm_store::SeaOrmAuthRepository>,
+        String,
+    ) {
+        let connection = Database::connect("sqlite::memory:").await.unwrap();
+        let schema = Schema::new(connection.get_database_backend());
+        for statement in [
+            schema.create_table_from_entity(entities::tenant::Entity),
+            schema.create_table_from_entity(entities::user::Entity),
+            schema.create_table_from_entity(entities::application_setting::Entity),
+            schema.create_table_from_entity(entities::email_challenge::Entity),
+            schema.create_table_from_entity(entities::registration_ticket::Entity),
+            schema.create_table_from_entity(entities::invitation::Entity),
+            schema.create_table_from_entity(entities::identity_email_claim::Entity),
+            schema.create_table_from_entity(entities::identity_user_role::Entity),
+            schema.create_table_from_entity(entities::revoked_token::Entity),
+        ] {
+            connection
+                .execute(connection.get_database_backend().build(&statement))
+                .await
+                .unwrap();
+        }
+        connection
+            .execute(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "ALTER TABLE users ADD COLUMN roles TEXT NOT NULL DEFAULT '[]'".to_string(),
+            ))
+            .await
+            .unwrap();
+        connection
+            .execute(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_email_verification_challenges_email ON email_verification_challenges (email)"
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let repository = Arc::new(crate::seaorm_store::SeaOrmAuthRepository::new(connection));
+        let store = Arc::new(Store::with_portable_repo(repository.clone()));
+        let raw_ticket = "verified-registration-ticket".to_string();
+        let ticket_hash = registration_hash_hex(
+            &store.registration_hash_key(),
+            b"registration-ticket",
+            &[raw_ticket.as_bytes()],
+        );
+        let now = Utc::now();
+        entities::application_setting::ActiveModel {
+            key: Set("registration_mode".to_string()),
+            value: Set(mode.as_str().to_string()),
+            updated_at: Set(now),
+            updated_by: Set(None),
+        }
+        .insert(repository.connection())
+        .await
+        .unwrap();
+
+        let invitation_id = if let Some(creator) = invitation_creator {
+            let creator_id = creator.id.clone();
+            let creator_tenant_id = creator.organization_id.clone().unwrap_or_default();
+            let creator_roles = creator.roles.clone();
+            entities::user::ActiveModel {
+                id: Set(creator.id),
+                username: Set(creator.username),
+                email: Set(creator.email),
+                password_hash: Set(creator.password_hash),
+                active: Set(creator.active),
+                tenant_id: Set(creator_tenant_id.clone()),
+                created_at: Set(creator.created_at),
+                updated_at: Set(creator.updated_at),
+            }
+            .insert(repository.connection())
+            .await
+            .unwrap();
+            for (position, role_name) in creator_roles.into_iter().enumerate() {
+                entities::identity_user_role::ActiveModel {
+                    user_id: Set(creator_id.clone()),
+                    role_name: Set(role_name),
+                    tenant_id: Set(creator_tenant_id.clone()),
+                    position: Set(position as i32),
+                }
+                .insert(repository.connection())
+                .await
+                .unwrap();
+            }
+            let invitation_id = "invitation-7".to_string();
+            entities::invitation::ActiveModel {
+                id: Set(invitation_id.clone()),
+                email: Set("new.user@example.test".to_string()),
+                token_hash: Set("invitation-hash".to_string()),
+                created_at: Set(now),
+                expires_at: Set(now + chrono::Duration::hours(1)),
+                consumed_at: Set(None),
+                created_by: Set(creator_id),
+            }
+            .insert(repository.connection())
+            .await
+            .unwrap();
+            Some(invitation_id)
+        } else {
+            None
+        };
+
+        entities::registration_ticket::ActiveModel {
+            id: Set("ticket-7".to_string()),
+            email: Set("new.user@example.test".to_string()),
+            token_hash: Set(ticket_hash),
+            issued_at: Set(now),
+            expires_at: Set(now + chrono::Duration::hours(1)),
+            consumed_at: Set(None),
+            invitation_id: Set(invitation_id),
+            consumed_by_user_id: Set(None),
+            consumed_by_tenant_id: Set(None),
+        }
+        .insert(repository.connection())
+        .await
+        .unwrap();
+
+        (
+            router_with_state(HttpAuthState::with_mailer(store, HashSet::new(), mailer)),
+            repository,
+            raw_ticket,
+        )
+    }
+
+    struct RecordingMailer;
+
+    #[async_trait]
+    impl crate::email::VerificationMailer for RecordingMailer {
+        async fn send_verification_code(
+            &self,
+            _recipient: &str,
+            _code: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn configured(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn email_verification_start_is_throttled_atomically_with_retry_after() {
+        let (app, repository, _ticket) = registration_test_app_with_mailer(
+            crate::seaorm_store::RegistrationMode::Open,
+            None,
+            Arc::new(RecordingMailer),
+        )
+        .await;
+        let request = |email: &str| {
+            json_request(
+                "/api/v1/auth/registration/email/start",
+                serde_json::json!({ "email": email }).to_string(),
+            )
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request("new.user@example.test"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let second = app.oneshot(request("new.user@example.test")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().get(header::RETRY_AFTER).is_some());
+
+        assert_eq!(
+            entities::email_challenge::Entity::find()
+                .count(repository.connection())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    fn registration_creator(active: bool, roles: Vec<String>) -> User {
+        let now = Utc::now();
+        User {
+            id: "creator-7".to_string(),
+            username: "tenant-owner".to_string(),
+            email: "owner@example.test".to_string(),
+            password_hash: "unused".to_string(),
+            roles,
+            active,
+            organization_id: Some("trusted-tenant".to_string()),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_registration_ignores_client_tenant_and_creates_a_fresh_tenant() {
+        let (app, repository, ticket) =
+            registration_test_app(crate::seaorm_store::RegistrationMode::Open, None).await;
+        let response = app
+            .oneshot(json_request(
+                "/api/v1/auth/register",
+                serde_json::json!({
+                    "registration_ticket": ticket,
+                    "organization_id": "victim-tenant",
+                    "username": "new-user",
+                    "password": "violet river cabin orbit"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let organization_id = body["user"]["organization_id"].as_str().unwrap();
+        assert_ne!(organization_id, "victim-tenant");
+        assert!(uuid::Uuid::parse_str(organization_id).is_ok());
+        // Later rewards must use an immutable registration source identity,
+        // never infer historical ownership from a mutable email address.
+        let proof = repository
+            .connection()
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT consumed_by_user_id, consumed_by_tenant_id FROM registration_tickets WHERE id = 'ticket-7'".to_string(),
+            ))
+            .await
+            .expect("verified registration must persist its source owner")
+            .unwrap();
+        assert_eq!(
+            proof.try_get::<String>("", "consumed_by_user_id").unwrap(),
+            body["user"]["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            proof
+                .try_get::<String>("", "consumed_by_tenant_id")
+                .unwrap(),
+            organization_id
+        );
+    }
+
+    #[tokio::test]
+    async fn invited_registration_uses_the_active_admin_creators_tenant() {
+        let creator = registration_creator(true, vec![super::super::ROLE_ADMIN.to_string()]);
+        let (app, repository, ticket) = registration_test_app(
+            crate::seaorm_store::RegistrationMode::InviteOnly,
+            Some(creator),
+        )
+        .await;
+        let response = app
+            .oneshot(json_request(
+                "/api/v1/auth/register",
+                serde_json::json!({
+                    "registration_ticket": ticket,
+                    "organization_id": "attacker-chosen-tenant",
+                    "username": "new-user",
+                    "password": "violet river cabin orbit"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let persisted = repository
+            .get_by_email("new.user@example.test", "trusted-tenant")
+            .await
+            .unwrap();
+        assert_eq!(persisted.organization_id.as_deref(), Some("trusted-tenant"));
+        let proof = entities::registration_ticket::Entity::find_by_id("ticket-7")
+            .one(repository.connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            proof.consumed_by_user_id.as_deref(),
+            Some(persisted.id.as_str())
+        );
+        assert_eq!(
+            proof.consumed_by_tenant_id.as_deref(),
+            Some("trusted-tenant")
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_source_failure_rolls_back_the_real_http_registration() {
+        let (app, repository, ticket) =
+            registration_test_app(crate::seaorm_store::RegistrationMode::Open, None).await;
+        repository.connection().execute_unprepared(
+            "CREATE TRIGGER deny_source_receipt BEFORE UPDATE OF consumed_by_user_id ON registration_tickets BEGIN SELECT RAISE(ABORT,'owned fixture denies source receipt'); END",
+        ).await.unwrap();
+        let response = app
+            .oneshot(json_request(
+                "/api/v1/auth/register",
+                serde_json::json!({
+                    "registration_ticket": ticket, "username": "new-user",
+                    "password": "violet river cabin orbit"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            entities::tenant::Entity::find()
+                .count(repository.connection())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            entities::user::Entity::find()
+                .count(repository.connection())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            entities::identity_user_role::Entity::find()
+                .count(repository.connection())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            entities::identity_email_claim::Entity::find()
+                .count(repository.connection())
+                .await
+                .unwrap(),
+            0
+        );
+        let proof = entities::registration_ticket::Entity::find_by_id("ticket-7")
+            .one(repository.connection())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(proof.consumed_at.is_none());
+        assert!(proof.consumed_by_user_id.is_none());
+        assert!(proof.consumed_by_tenant_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn invited_registration_fails_without_an_active_admin_creator() {
+        for creator in [
+            registration_creator(false, vec![super::super::ROLE_ADMIN.to_string()]),
+            registration_creator(true, vec![super::super::ROLE_VIEWER.to_string()]),
+        ] {
+            let (app, repository, ticket) = registration_test_app(
+                crate::seaorm_store::RegistrationMode::InviteOnly,
+                Some(creator),
+            )
+            .await;
+            let response = app
+                .oneshot(json_request(
+                    "/api/v1/auth/register",
+                    serde_json::json!({
+                        "registration_ticket": ticket,
+                        "organization_id": "attacker-chosen-tenant",
+                        "username": "new-user",
+                        "password": "violet river cabin orbit"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                entities::registration_ticket::Entity::find_by_id("ticket-7")
+                    .one(repository.connection())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .consumed_at
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_transaction_rechecks_closed_mode_before_consuming_ticket() {
+        let creator = registration_creator(true, vec![super::super::ROLE_ADMIN.to_string()]);
+        let (_, repository, _) =
+            registration_test_app(crate::seaorm_store::RegistrationMode::Closed, Some(creator))
+                .await;
+        let ticket_hash = entities::registration_ticket::Entity::find_by_id("ticket-7")
+            .one(repository.connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .token_hash;
+        let now = Utc::now();
+        let candidate = User {
+            id: "new-user-id".to_string(),
+            username: "new-user".to_string(),
+            email: "new.user@example.test".to_string(),
+            password_hash: "unused".to_string(),
+            roles: vec![super::super::ROLE_ADMIN.to_string()],
+            active: true,
+            organization_id: Some(uuid::Uuid::new_v4().to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            repository
+                .consume_ticket_and_create_user(&ticket_hash, now, candidate)
+                .await
+                .unwrap_err(),
+            "registration closed"
+        );
+        assert!(
+            entities::registration_ticket::Entity::find_by_id("ticket-7")
+                .one(repository.connection())
+                .await
+                .unwrap()
+                .unwrap()
+                .consumed_at
+                .is_none()
+        );
+    }
+
+    struct FailingRepo {
+        lookup_fails: bool,
+        revocation_fails: bool,
+    }
+
+    #[async_trait]
+    impl UserRepository for FailingRepo {
+        async fn create_user(&self, _: User, _: &str) -> Result<(), String> {
+            Err("unavailable".into())
+        }
+        async fn get_by_id(&self, _: &str, _: &str) -> Result<User, String> {
+            Err("unavailable".into())
+        }
+        async fn get_by_username(&self, _: &str, _: &str) -> Result<User, String> {
+            Err("unavailable".into())
+        }
+        async fn get_by_email(&self, _: &str, _: &str) -> Result<User, String> {
+            Err("unavailable".into())
+        }
+        async fn get_by_login_identifier(&self, _: &str, _: &str) -> Result<Option<User>, String> {
+            if self.lookup_fails {
+                Err("database unavailable".into())
+            } else {
+                Ok(None)
+            }
+        }
+        async fn list_users(&self, _: &str) -> Result<Vec<User>, String> {
+            Err("unavailable".into())
+        }
+        async fn update_user(&self, _: User, _: &str) -> Result<(), String> {
+            Err("unavailable".into())
+        }
+        async fn delete_user(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("unavailable".into())
+        }
+        async fn revoke_token(&self, _: String, _: DateTime<Utc>, _: &str) -> Result<(), String> {
+            if self.revocation_fails {
+                Err("database unavailable".into())
+            } else {
+                Ok(())
+            }
+        }
+        async fn is_revoked(&self, _: &str, _: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_failures_are_generic_and_fail_closed() {
+        let store = Arc::new(Store::with_repo(Arc::new(FailingRepo {
+            lookup_fails: true,
+            revocation_fails: true,
+        })));
+        let app = router(store.clone()).unwrap();
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "/api/v1/auth/login",
+                r#"{"username":"Alice","password":"wrong","organization_id":"tenant-7"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"authentication unavailable"}"#);
+
+        let user = User {
+            id: "user-7".into(),
+            username: "Alice".into(),
+            email: "alice@example.test".into(),
+            password_hash: String::new(),
+            roles: vec![],
+            active: true,
+            organization_id: Some("tenant-7".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let token = store.issue_token(&user).unwrap();
+        let request = with_peer(
+            Request::post("/api/v1/auth/logout")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"logout unavailable"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_api_keys_workflow() {
+        let (app, store, user) = app_with_user().await;
+        let token = store.issue_token(&user).unwrap();
+
+        // 1. Creating a key requires authentication (unauthorized returns 401)
+        let unauthorized_request = with_peer(
+            Request::post("/api/v1/settings/keys")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"Test Key"}"#))
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(unauthorized_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Successfully creates a key for authenticated users
+        let authorized_request = with_peer(
+            Request::post("/api/v1/settings/keys")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"My Test Key"}"#))
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(authorized_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let raw_key = body["raw_key"].as_str().unwrap();
+        assert!(raw_key.starts_with("ohc_gwy_"));
+        assert_eq!(body["name"], "My Test Key");
+        assert!(body["created_at"].as_str().is_some());
+
+        // Verify correctly hashing it in the database
+        // SHA256 of raw_key
+        let expected_hash = format!("{:x}", Sha256::digest(raw_key.as_bytes()));
+
+        // Check our in-memory fallback list to verify the hash is correct
+        {
+            let keys = get_in_memory_keys().lock().unwrap();
+            let key = keys.iter().find(|k| k.name == "My Test Key").unwrap();
+            assert_eq!(key.key_hash, expected_hash);
+            assert_eq!(key.member_id, user.id);
+        }
+
+        // 3. Listing keys returns all created keys
+        let list_request = with_peer(
+            Request::get("/api/v1/settings/keys")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(list_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let list_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let list_array = list_body.as_array().unwrap();
+        assert!(!list_array.is_empty());
+        let created_key_meta = list_array
+            .iter()
+            .find(|k| k["name"] == "My Test Key")
+            .unwrap();
+        let key_id = created_key_meta["id"].as_str().unwrap().to_string();
+
+        // 4. Revoking a key deletes it
+        let delete_request = with_peer(
+            Request::delete(format!("/api/v1/settings/keys/{}", key_id))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(delete_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let delete_body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delete_body["ok"], true);
+
+        // Verify it is no longer listed
+        let list_request2 = with_peer(
+            Request::get("/api/v1/settings/keys")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response2 = app.clone().oneshot(list_request2).await.unwrap();
+        assert_eq!(response2.status(), StatusCode::OK);
+
+        let list_body2: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response2.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let list_array2 = list_body2.as_array().unwrap();
+        assert!(list_array2.iter().all(|k| k["id"] != key_id));
+    }
+
+    #[tokio::test]
+    async fn test_member_usage_analytics_auth_and_restriction() {
+        let _lock = REG_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (app, store, user) = app_with_user().await;
+
+        // 1. Unauthenticated request returns 401
+        let unauthorized_request = with_peer(
+            Request::get("/api/v1/ui/admin/usage")
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(unauthorized_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Authenticated non-admin user returns 403
+        let viewer_user = store
+            .create_user(
+                "ViewerBob".into(),
+                "viewer@example.test".into(),
+                "password".into(),
+                vec!["VIEWER".into()],
+                "tenant-7".into(),
+            )
+            .await
+            .unwrap();
+        let viewer_token = store.issue_token(&viewer_user).unwrap();
+
+        let forbidden_request = with_peer(
+            Request::get("/api/v1/ui/admin/usage")
+                .header("authorization", format!("Bearer {viewer_token}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(forbidden_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"admin access required"}"#);
+
+        // 3. Authenticated admin user returns 200 and listed analytics
+        let admin_token = store.issue_token(&user).unwrap();
+
+        // Populate a mock log
+        let org_id = user.organization_id.clone().unwrap_or_default();
+        {
+            let mut logs = get_in_memory_usage_logs().lock().unwrap();
+            logs.push(InMemoryUsageLog {
+                username: user.username.clone(),
+                feature: "gateway_run".to_string(),
+                tokens_used: 1250,
+                computed_cost: 0.0025,
+                organization_id: org_id.clone(),
+            });
+        }
+        if std::env::var("DATABASE_URL").is_ok() || std::env::var("OMNISOLO_DATABASE_URL").is_ok() {
+            let pool = crate::db::get_pool();
+            let mut tx_opt = None;
+            for _ in 0..10 {
+                if let Ok(tx) = pool.begin().await {
+                    tx_opt = Some(tx);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if let Some(mut tx) = tx_opt {
+                sqlx::query(
+                    "INSERT INTO user_usage_logs (user_id, organization_id, feature, tokens_used, computed_cost) VALUES ($1, $2, $3, $4, $5)"
+                )
+                .bind(&user.id)
+                .bind(&org_id)
+                .bind("gateway_run")
+                .bind(1250)
+                .bind(0.0025)
+                .execute(&mut *tx)
+                .await
+                .expect("INSERT INTO user_usage_logs failed");
+                tx.commit().await.expect("analytics test commit failed");
+            }
+        }
+
+        let success_request = with_peer(
+            Request::get("/api/v1/ui/admin/usage")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let response = app.clone().oneshot(success_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let array = body.as_array().unwrap();
+        assert!(!array.is_empty());
+        assert_eq!(array[0]["username"], user.username);
+        assert_eq!(array[0]["feature"], "gateway_run");
+        assert_eq!(array[0]["tokens_used"], 1250);
+        assert_eq!(array[0]["computed_cost"], 0.0025);
+    }
+
+    #[tokio::test]
+    async fn platform_operator_guard_blocks_tenant_admin_when_cloud_policy_enabled() {
+        let (_, repository, _) =
+            registration_test_app(crate::seaorm_store::RegistrationMode::InviteOnly, None).await;
+
+        let store = Arc::new(Store::with_portable_repo(repository.clone()));
+        let tenant_admin = store
+            .create_user(
+                "tenant.admin".to_string(),
+                "tenant.admin@example.test".to_string(),
+                "violet river cabin orbit".to_string(),
+                vec![crate::ROLE_ADMIN.to_string()],
+                "tenant-self-reg".to_string(),
+            )
+            .await
+            .unwrap();
+        let platform_op = store
+            .create_user(
+                "platform.op".to_string(),
+                "platform.op@example.test".to_string(),
+                "violet river cabin orbit".to_string(),
+                vec![
+                    crate::ROLE_ADMIN.to_string(),
+                    crate::ROLE_PLATFORM_OPERATOR.to_string(),
+                ],
+                "tenant-ops".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let mut cloud_state = HttpAuthState::new(store.clone(), HashSet::new());
+        cloud_state.cloud = true;
+
+        let tenant_claims = store
+            .validate_token(&store.issue_token(&tenant_admin).unwrap())
+            .await
+            .unwrap();
+        let op_claims = store
+            .validate_token(&store.issue_token(&platform_op).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            require_platform_operator(&cloud_state, &tenant_claims)
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(require_platform_operator(&cloud_state, &op_claims).is_ok());
+
+        let oss_app = router_with_state(HttpAuthState::new(store, HashSet::new()));
+        let tenant_token = format!("Bearer {}", tenant_admin.id);
+        let _ = tenant_token;
+        let oss_admin_token = cloud_state.store.issue_token(&tenant_admin).unwrap();
+        let oss_put = oss_app
+            .oneshot(
+                Request::put("/api/v1/settings/authentication")
+                    .header(header::AUTHORIZATION, format!("Bearer {oss_admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"registration_mode":"closed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oss_put.status(), StatusCode::OK);
+        assert_eq!(
+            repository.registration_mode().await.unwrap(),
+            crate::seaorm_store::RegistrationMode::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_in_memory_enforces_tenant_and_owner_isolation() {
+        let store = Arc::new(Store::new());
+        let user_a = store
+            .create_user(
+                "alice.key".into(),
+                "alice.key@example.test".into(),
+                "violet river cabin orbit".into(),
+                vec![crate::ROLE_VIEWER.into()],
+                "tenant-alpha".into(),
+            )
+            .await
+            .unwrap();
+        let user_b = store
+            .create_user(
+                "bob.key".into(),
+                "bob.key@example.test".into(),
+                "violet river cabin orbit".into(),
+                vec![crate::ROLE_ADMIN.into()],
+                "tenant-beta".into(),
+            )
+            .await
+            .unwrap();
+
+        let app = router_with_state(HttpAuthState::new(store.clone(), HashSet::new()));
+        let token_a = store.issue_token(&user_a).unwrap();
+        let token_b = store.issue_token(&user_b).unwrap();
+
+        let victim_key_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut keys = get_in_memory_keys()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            keys.push(InMemoryApiKey {
+                id: victim_key_id.clone(),
+                key_hash: "victim-hash-idor-test".into(),
+                name: "Victim Key".into(),
+                member_id: user_a.id.clone(),
+                organization_id: "tenant-alpha".into(),
+                created_at: Utc::now().to_rfc3339(),
+            });
+        }
+
+        // Cross-tenant admin in tenant-beta MUST NOT revoke tenant-alpha's key.
+        let cross_tenant_revoke = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/settings/keys/{victim_key_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token_b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_revoke.status(), StatusCode::OK);
+        assert!(
+            get_in_memory_keys()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|k| k.id == victim_key_id),
+            "cross-tenant revoke must not delete another tenant's key"
+        );
+
+        // Key owner in tenant-alpha CAN revoke their own key.
+        let owner_revoke = app
+            .oneshot(
+                Request::delete(format!("/api/v1/settings/keys/{victim_key_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token_a}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_revoke.status(), StatusCode::OK);
+        assert!(
+            get_in_memory_keys()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .all(|k| k.id != victim_key_id),
+            "owner must be able to revoke their own key"
+        );
+    }
+
+    #[test]
+    fn ci_environment_variable_does_not_relax_login_rate_limits() {
+        let store = Arc::new(Store::new());
+        temp_env::with_vars(
+            [
+                ("CI", Some("true")),
+                ("OMNISOLO_ENV", Some("test")),
+                ("OMNISOLO_ALLOW_RELAXED_TEST_RATE_LIMIT", None),
+            ],
+            || {
+                let state = HttpAuthState::new(store.clone(), HashSet::new());
+                let limiter = state.limiter.lock().unwrap();
+                assert_eq!(limiter.config.source_attempts, SOURCE_ATTEMPTS);
+                assert_eq!(limiter.config.account_attempts, ACCOUNT_ATTEMPTS);
+            },
+        );
+    }
+
+    #[test]
+    fn relaxed_rate_limit_applies_only_to_local_non_cloud_test_runs() {
+        let store = Arc::new(Store::new());
+        // Cloud mode MUST NEVER relax login rate limits even with both env vars set.
+        temp_env::with_vars(
+            [
+                ("OMNISOLO_ENV", Some("test")),
+                ("OMNISOLO_ALLOW_RELAXED_TEST_RATE_LIMIT", Some("1")),
+            ],
+            || {
+                let cloud_state = HttpAuthState::with_mailer_and_cloud(
+                    store.clone(),
+                    HashSet::new(),
+                    Arc::new(crate::email::UnconfiguredMailer),
+                    true,
+                );
+                let cloud_limiter = cloud_state.limiter.lock().unwrap();
+                assert_eq!(cloud_limiter.config.source_attempts, SOURCE_ATTEMPTS);
+                assert_eq!(cloud_limiter.config.account_attempts, ACCOUNT_ATTEMPTS);
+
+                let local_test_state = HttpAuthState::with_mailer_and_cloud(
+                    store.clone(),
+                    HashSet::new(),
+                    Arc::new(crate::email::UnconfiguredMailer),
+                    false,
+                );
+                let local_limiter = local_test_state.limiter.lock().unwrap();
+                assert_eq!(local_limiter.config.source_attempts, 1000);
+                assert_eq!(local_limiter.config.account_attempts, 2000);
+            },
+        );
+
+        // Non-test OMNISOLO_ENV MUST NOT relax login rate limits even when flag is set.
+        temp_env::with_vars(
+            [
+                ("OMNISOLO_ENV", Some("production")),
+                ("OMNISOLO_ALLOW_RELAXED_TEST_RATE_LIMIT", Some("1")),
+            ],
+            || {
+                let prod_state = HttpAuthState::new(store.clone(), HashSet::new());
+                let prod_limiter = prod_state.limiter.lock().unwrap();
+                assert_eq!(prod_limiter.config.source_attempts, SOURCE_ATTEMPTS);
+                assert_eq!(prod_limiter.config.account_attempts, ACCOUNT_ATTEMPTS);
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_session_route_is_absent_under_local_owner_auth_policy() {
+        let store = Arc::new(Store::new());
+        let policy = Arc::new(
+            ::ohc_core::extensions::LocalOwnerAuthPolicy::new("workspace-solo-1").unwrap(),
+        );
+        let app = router_with_auth_policy(store, policy).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/auth/oidc/session")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"keycloak","id_token":"opaque-token"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

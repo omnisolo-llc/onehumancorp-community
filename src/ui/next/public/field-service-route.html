@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Today's Route - OmniSolo OneHumanCorp</title>
+  <style>
+    :root {
+      --bg: #FAFAFA;
+      --surface: #FFFFFF;
+      --text-primary: #111111;
+      --text-secondary: #666666;
+      --border: rgba(0, 0, 0, 0.08);
+      --primary: #000000;
+      --primary-inverse: #FFFFFF;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 24px;
+      --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.04);
+      --glass-bg: rgba(255, 255, 255, 0.7);
+      --glass-border: rgba(255, 255, 255, 0.5);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text-primary);
+      -webkit-font-smoothing: antialiased;
+      line-height: 1.5;
+    }
+
+    /* Layout starts at 375px mobile-first */
+    .app-container {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 16px;
+      padding-bottom: 80px;
+    }
+
+    .header {
+      padding: 16px 0;
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .header-title {
+      font-size: 24px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    .header-subtitle {
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+    }
+
+    /* Glassmorphism Cards */
+    .route-card {
+      background: var(--glass-bg);
+      backdrop-filter: blur(20px) saturate(200%);
+      -webkit-backdrop-filter: blur(20px) saturate(200%);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .job-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .job-address {
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .job-time {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      background: rgba(0,0,0,0.05);
+      padding: 4px 8px;
+      border-radius: var(--radius-sm);
+      display: inline-block;
+      margin-bottom: 16px;
+    }
+
+    .job-status {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 4px 8px;
+      border-radius: 4px;
+      display: inline-block;
+      margin-bottom: 12px;
+    }
+
+    .status-pending { background: #F3F4F6; color: #4B5563; }
+    .status-en_route { background: #DBEAFE; color: #1D4ED8; }
+    .status-on_site { background: #FEF3C7; color: #B45309; }
+    .status-done { background: #D1FAE5; color: #065F46; }
+    .status-cancelled { background: #FEE2E2; color: #B91C1C; }
+
+    /* Touch Targets */
+    .actions-row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      min-width: 44px;
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: var(--radius-md);
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      border: 1px solid transparent;
+      flex: 1;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: var(--primary-inverse);
+    }
+
+    .btn-primary:active {
+      transform: scale(0.98);
+      background: #333;
+    }
+
+    .btn-secondary {
+      background: #FFFFFF;
+      color: var(--text-primary);
+      border-color: var(--border);
+    }
+
+    .btn-secondary:active {
+      background: #F5F5F5;
+    }
+
+    #loading-state, #empty-state {
+      text-align: center;
+      padding: 48px 20px;
+      color: var(--text-secondary);
+    }
+
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 2px solid var(--border);
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 16px;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (min-width: 768px) {
+      .route-list {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 16px;
+      }
+      .route-card {
+        margin-bottom: 0;
+      }
+
+    @media (min-width: 1024px) {
+      .route-list {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="app-container">
+
+    <!-- Offline Indicator Banner -->
+    <div id="network-status-indicator" class="hidden mb-4 items-center justify-between px-4 py-2" style="background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(20px) saturate(200%); border-bottom: 1px solid rgba(0,0,0,0.05);">
+      <div class="flex items-center gap-2 w-full justify-center">
+        <div id="network-status-dot" class="w-2 h-2 rounded-full bg-yellow-400" style="width: 8px; height: 8px; border-radius: 50%; background-color: #FF9500; display: inline-block; margin-right: 6px;"></div>
+        <span id="network-status-text" style="font-size: 14px; font-weight: 600; color: #111;">Working Offline</span>
+      </div>
+    </div>
+    <div class="header">
+      <h1 class="header-title">Today's Route</h1>
+      <div class="header-subtitle" id="date-display">Loading...</div>
+    </div>
+
+    <div id="loading-state">
+      <div class="spinner"></div>
+      <p>Loading your schedule...</p>
+    </div>
+
+    <div id="empty-state" style="display: none;">
+      <p>No jobs scheduled for today.</p>
+    </div>
+
+    <div class="actions-row"><button class="btn btn-secondary" id="reload-routes">Reload server state</button><button class="btn btn-secondary" id="retry-sync" hidden>Retry unconfirmed changes</button></div>
+    <div class="route-list" id="route-container"></div>
+  </div>
+
+  <script>
+    // Maintained standalone compatibility source. Keep the four Next public
+    // aliases and the Tauri HTML copy byte-identical; package-web copies public.
+    const DB_NAME = 'OMNISOLO_Offline_Queue_FieldService';
+    const STORE_NAME = 'actions';
+    const IDENTITY_EPOCH_KEY = 'omnisolo_queue_identity_epoch_v2';
+    const statuses = ['pending', 'en_route', 'on_site', 'done', 'completed', 'cancelled'];
+    let currentRoutesData = null;
+    let owner = null;
+    let generation = 0;
+    let leaseTimer;
+    let controller = new AbortController();
+    let syncPromise = null;
+    let syncRequested = false;
+    let queueError = '';
+    let viewSequence = 0;
+    let snapshotRevision = 0;
+    let routeReadSequence = 0;
+    const addingJobs = new Set();
+    const confirmed = new Set();
+    const sending = new Set();
+
+    function sameOwner(a, b) { return !!a && !!b && a.userId === b.userId && a.tenantId === b.tenantId; }
+    function preciseTime(value) {
+      if (typeof value !== 'string') return null;
+      const parts = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)$/.exec(value);
+      if (!parts) return null;
+      const seconds = Date.parse(parts[1] + parts[3]);
+      if (!Number.isFinite(seconds)) return null;
+      // Date.parse alone truncates PostgreSQL's microseconds. Preserve the full
+      // RFC3339 fraction and normalize offsets before comparing CAS receipts.
+      return BigInt(seconds) * 1000000n + BigInt((parts[2] || '').padEnd(9, '0'));
+    }
+    function validTime(value) { return preciseTime(value) !== null; }
+    function active(expected = owner, epoch = generation) {
+      return epoch === generation && sameOwner(owner, expected) && owner.expiresAt > Date.now()
+        && owner.storageEpoch === localStorage.getItem(IDENTITY_EPOCH_KEY);
+    }
+    function retire() {
+      generation++; viewSequence++; clearTimeout(leaseTimer); controller.abort(); controller = new AbortController();
+      owner = null; currentRoutesData = null; confirmed.clear();
+      document.getElementById('route-container').replaceChildren();
+      document.getElementById('empty-state').style.display = 'none';
+      document.getElementById('loading-state').style.display = 'block';
+      document.getElementById('loading-state').textContent = 'Sign in and reload to verify the current business.';
+      showNetwork('Identity unavailable. Pending changes have not been confirmed.', '#FF9500');
+    }
+    async function verifyOwner() {
+      const epoch = generation;
+      const storageEpoch = localStorage.getItem(IDENTITY_EPOCH_KEY);
+      if (!navigator.onLine) {
+        if (!active()) throw new Error('Connect to verify the current business before editing.');
+        return { ...owner };
+      }
+      let response, identity;
+      try {
+        response = await fetch('/api/v1/auth/session-identity', {
+          credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
+        });
+        identity = await response.json();
+      } catch {
+        if (epoch === generation) retire();
+        throw new Error('Current business identity could not be verified.');
+      }
+      if (epoch !== generation || storageEpoch !== localStorage.getItem(IDENTITY_EPOCH_KEY)) throw new Error('Business context changed.');
+      if (response.status !== 200 || !identity || typeof identity !== 'object' || Array.isArray(identity) || identity.error != null || ('success' in identity && identity.success !== true)
+        || typeof identity.userId !== 'string' || !identity.userId || typeof identity.tenantId !== 'string' || !identity.tenantId
+        || !Number.isSafeInteger(identity.expiresAt) || identity.expiresAt <= Date.now()) {
+        retire(); throw new Error('Current business identity could not be verified.');
+      }
+      if (owner && !sameOwner(owner, identity)) { retire(); throw new Error('Business changed. Reload before editing.'); }
+      owner = { userId: identity.userId, tenantId: identity.tenantId, expiresAt: identity.expiresAt, storageEpoch };
+      clearTimeout(leaseTimer);
+      leaseTimer = setTimeout(retire, Math.min(owner.expiresAt - Date.now(), 2147483647));
+      return { ...owner };
+    }
+    function headersFor(expected, key) {
+      const headers = new Headers({ 'x-ohc-expected-user': expected.userId, 'x-ohc-expected-tenant': expected.tenantId });
+      if (headers.get('x-ohc-expected-user') !== expected.userId || headers.get('x-ohc-expected-tenant') !== expected.tenantId) throw new Error('Invalid business context.');
+      if (key) { headers.set('Content-Type', 'application/json'); headers.set('Idempotency-Key', key); }
+      return headers;
+    }
+    function getDB() {
+      return new Promise((resolve, reject) => {
+        if (!window.indexedDB) { reject(new Error('Offline storage is unavailable.')); return; }
+        const request = indexedDB.open(DB_NAME, 1);
+        request.onerror = () => reject(request.error);
+        request.onblocked = () => reject(new Error('Offline storage is blocked.'));
+        request.onsuccess = () => resolve(request.result);
+        request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains(STORE_NAME)) request.result.createObjectStore(STORE_NAME, { keyPath: 'id' }); };
+      });
+    }
+    async function queueTransaction(mode, use) {
+      const db = await getDB();
+      try {
+        return await new Promise((resolve, reject) => {
+          const tx = db.transaction([STORE_NAME], mode);
+          let value;
+          tx.oncomplete = () => resolve(value);
+          tx.onerror = tx.onabort = () => reject(tx.error || new Error('Offline storage transaction failed.'));
+          const store = tx.objectStore(STORE_NAME);
+          const request = store.getAll();
+          request.onsuccess = () => {
+            try { value = use(store, request.result || []); }
+            catch (error) { tx.abort(); reject(error); }
+          };
+        });
+      } finally { db.close(); }
+    }
+    function getQueue() { return queueTransaction('readonly', (_store, rows) => rows); }
+    function owned(row, expected = owner) { return row.schema === 2 && sameOwner(row.owner, expected) && row.type === 'job_status'; }
+    function ordered(rows) { return rows.slice().sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id)); }
+    function findJob(id) { return currentRoutesData?.flatMap(route => route.jobs || []).find(job => job.id === id); }
+    function showNetwork(message, color = '#0066FF') {
+      const indicator = document.getElementById('network-status-indicator');
+      indicator.style.display = message ? 'flex' : 'none'; indicator.classList.toggle('hidden', !message);
+      document.getElementById('network-status-text').textContent = message;
+      document.getElementById('network-status-dot').style.backgroundColor = color;
+    }
+    async function updateOfflineStatus() {
+      const sequence = ++viewSequence;
+      const epoch = generation;
+      try {
+        const rows = await getQueue();
+        if (sequence !== viewSequence || epoch !== generation) return;
+        const mine = active() ? ordered(rows.filter(row => owned(row))) : [];
+        const blocked = mine.some(row => row.state === 'blocked');
+        const unknown = mine.some(row => row.state === 'unknown' && !sending.has(row.id));
+        const unowned = rows.some(row => row.schema !== 2 || !row.owner);
+        const message = queueError || (!active() ? 'Verify the current business before editing.' : blocked ? 'Change not saved. Review the blocked job before retrying.'
+          : unknown ? 'Save outcome unknown. Retry the same request to reconcile.' : !navigator.onLine ? (mine.length ? 'Working Offline - Changes Saved Locally; confirmation pending' : 'Working Offline')
+          : mine.length ? 'Syncing changes; confirmation pending...' : unowned ? 'Older unverified changes need review; they will not be sent.' : '');
+        showNetwork(message, queueError || blocked || unknown || !navigator.onLine ? '#FF9500' : '#0066FF');
+        document.getElementById('retry-sync').hidden = !active() || !navigator.onLine || !unknown;
+        if (active() && currentRoutesData) renderRoutes(currentRoutesData, mine);
+      } catch {
+        if (sequence !== viewSequence || epoch !== generation) return;
+        queueError = 'Offline storage unavailable; changes cannot be confirmed.';
+        showNetwork(queueError, '#FF9500');
+        for (const card of document.querySelectorAll('.route-card')) {
+          card.querySelector('.job-receipt').textContent = 'Offline storage unavailable; confirmation unavailable.';
+          card.querySelectorAll('button').forEach(button => { button.disabled = true; });
+        }
+      }
+    }
+    async function updateJobStatus(jobId, newStatus) {
+      if (addingJobs.has(jobId)) return;
+      addingJobs.add(jobId);
+      const expectedOwner = owner && { ...owner };
+      const epoch = generation;
+      try {
+        if (!active(expectedOwner, epoch)) throw new Error('Verify the current business before editing.');
+        const job = findJob(jobId);
+        if (!job || !validTime(job.updated_at) || !statuses.includes(newStatus)) throw new Error('Reload the job to obtain its current version.');
+        // Retire the previous receipt synchronously, before IndexedDB can yield.
+        // This intent is not durable yet, so do not claim it is saved locally.
+        confirmed.delete(jobId);
+        const card = [...document.querySelectorAll('.route-card')].find(card => card.dataset.testid === `job-card-${jobId}`);
+        if (card) {
+          card.querySelector('.job-receipt').textContent = 'Saving change locally; confirmation pending.';
+          card.querySelectorAll('button').forEach(button => { button.disabled = true; });
+        }
+        await queueTransaction('readwrite', (store, rows) => {
+          if (!active(expectedOwner, epoch)) throw new Error('Business context changed.');
+          const previous = ordered(rows.filter(row => owned(row, expectedOwner) && row.jobId === jobId)).at(-1);
+          if (previous && previous.state !== 'pending') throw new Error('Resolve the pending outcome before changing this job.');
+          const current = previous?.status || job.status;
+          if (['done', 'completed', 'cancelled'].includes(current) || current === newStatus) throw new Error('Reload and review the current job status.');
+          store.put({ schema: 2, id: crypto.randomUUID(), type: 'job_status', owner: { userId: expectedOwner.userId, tenantId: expectedOwner.tenantId },
+            jobId, status: newStatus, expected_updated_at: previous ? null : job.updated_at, dependsOn: previous?.id || null,
+            timestamp: Math.max(Date.now(), ...rows.map(row => Number(row.timestamp) + 1 || 0)), state: 'pending' });
+        });
+        if (!active(expectedOwner, epoch)) return;
+        queueError = ''; snapshotRevision++;
+        await updateOfflineStatus();
+        if (navigator.onLine) await syncOfflineQueue();
+      } catch (error) {
+        if (epoch === generation) queueError = error.message || 'Change not saved.';
+      } finally {
+        addingJobs.delete(jobId);
+        if (epoch === generation) await updateOfflineStatus();
+      }
+    }
+    async function setQueueState(mutation, state) {
+      await queueTransaction('readwrite', (store, rows) => {
+        const row = rows.find(item => item.id === mutation.id && owned(item, mutation.owner));
+        if (row) store.put({ ...row, state });
+      });
+    }
+    async function acknowledge(mutation, receipt, epoch) {
+      await queueTransaction('readwrite', (store, rows) => {
+        if (!active(mutation.owner, epoch)) throw new Error('Business context changed.');
+        // Delete only the acknowledged entry. A newly queued dependent obtains
+        // its version solely from this exact committed predecessor receipt.
+        for (const row of rows) {
+          if (owned(row, mutation.owner) && row.jobId === mutation.jobId && row.dependsOn === mutation.id) {
+            store.put({ ...row, dependsOn: null, expected_updated_at: receipt.updated_at });
+          }
+        }
+        store.delete(mutation.id);
+      });
+      if (!active(mutation.owner, epoch)) return;
+      const job = findJob(mutation.jobId);
+      if (job) { job.status = receipt.status; job.updated_at = receipt.updated_at; }
+      confirmed.add(mutation.jobId); snapshotRevision++;
+    }
+    function exactReceipt(response, data, mutation) {
+      return response.status === 200 && data && !Array.isArray(data) && data.success === true && data.error === null
+        && data.id === mutation.jobId && data.status === mutation.status && validTime(data.updated_at)
+        && validTime(mutation.expected_updated_at) && preciseTime(data.updated_at) > preciseTime(mutation.expected_updated_at);
+    }
+    async function drainQueue(attempted) {
+      while (navigator.onLine && active()) {
+        const rows = ordered(await getQueue());
+        const mutation = rows.find(row => owned(row) && !row.dependsOn && ['pending', 'unknown'].includes(row.state) && !attempted.has(row.id));
+        if (!mutation) break;
+        attempted.add(mutation.id);
+        if (!validTime(mutation.expected_updated_at) || !statuses.includes(mutation.status) || typeof mutation.jobId !== 'string' || !mutation.jobId) {
+          await setQueueState(mutation, 'blocked'); continue;
+        }
+        const epoch = generation;
+        const current = await verifyOwner();
+        if (!active(mutation.owner, epoch) || !sameOwner(current, mutation.owner)) break;
+        // Durable uncertainty precedes transport. Restarts retry the identical
+        // version, owner, payload and key; never manufacture a fresh CAS version.
+        await setQueueState(mutation, 'unknown');
+        if (!active(mutation.owner, epoch)) break;
+        sending.add(mutation.id); await updateOfflineStatus();
+        try {
+          const response = await fetch(`/api/v1/field-service-routing/jobs/${encodeURIComponent(mutation.jobId)}/status`, {
+            method: 'POST', headers: headersFor(mutation.owner, mutation.id), credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
+            body: JSON.stringify({ status: mutation.status, expected_updated_at: mutation.expected_updated_at }),
+          });
+          if (!active(mutation.owner, epoch)) break;
+          if ([400, 401, 403, 404, 409, 422, 428].includes(response.status)) {
+            await setQueueState(mutation, 'blocked');
+            if ([401, 403].includes(response.status)) retire();
+          } else {
+            const receipt = await response.json();
+            if (!active(mutation.owner, epoch)) break;
+            if (exactReceipt(response, receipt, mutation)) await acknowledge(mutation, receipt, epoch);
+          }
+        } catch { /* Transport/body/commit failure retains the exact unknown request. */ }
+        finally { sending.delete(mutation.id); await updateOfflineStatus(); }
+      }
+    }
+    function syncOfflineQueue() {
+      if (!navigator.onLine) return Promise.resolve();
+      if (syncPromise) { syncRequested = true; return syncPromise; }
+      const attempted = new Set();
+      syncPromise = (async () => {
+        do { syncRequested = false; await drainQueue(attempted); } while (syncRequested);
+      })().catch(error => { queueError = error.message || 'Sync unavailable; changes remain unconfirmed.'; })
+        .finally(async () => { syncPromise = null; await updateOfflineStatus(); });
+      return syncPromise;
+    }
+    async function discardBlocked(jobId) {
+      const expected = owner && { ...owner }; const epoch = generation;
+      try {
+        if (!active(expected, epoch)) return;
+        await queueTransaction('readwrite', (store, rows) => {
+          if (!active(expected, epoch)) throw new Error('Business context changed.');
+          const mine = rows.filter(row => owned(row, expected) && row.jobId === jobId);
+          if (!mine.some(row => row.state === 'blocked') || mine.some(row => row.state === 'unknown')) throw new Error('Reconcile the unknown outcome first.');
+          for (const row of mine) store.delete(row.id);
+        });
+        queueError = ''; await fetchRoutes();
+      } catch (error) { queueError = error.message; await updateOfflineStatus(); }
+    }
+    async function fetchRoutes() {
+      const sequence = ++routeReadSequence;
+      try {
+        const expected = await verifyOwner(); const epoch = generation; const revision = snapshotRevision;
+        const response = await fetch('/api/v1/field-service-routing/routes/today', {
+          headers: headersFor(expected), credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
+        });
+        if ([401, 403].includes(response.status)) { if (active(expected, epoch)) retire(); return; }
+        const data = await response.json();
+        if (!active(expected, epoch) || sequence !== routeReadSequence || revision !== snapshotRevision) return;
+        if (response.status !== 200 || data.error != null || !Array.isArray(data.routes)) throw new Error('Routes unavailable. Reload to try again.');
+        currentRoutesData = data.routes; confirmed.clear();
+        queueError = ''; await updateOfflineStatus();
+        await syncOfflineQueue();
+      } catch (error) {
+        if (!currentRoutesData) document.getElementById('loading-state').textContent = error.message || 'Routes unavailable.';
+      }
+    }
+    function formatTime(value) { return value ? new Date(value).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : ''; }
+    function renderRoutes(routes, queue = []) {
+      const container = document.getElementById('route-container');
+      const jobs = routes.flatMap(route => route.jobs || []);
+      document.getElementById('loading-state').style.display = 'none';
+      document.getElementById('empty-state').style.display = jobs.length ? 'none' : 'block';
+      container.replaceChildren();
+      for (const job of jobs) {
+        const pending = queue.filter(row => row.jobId === job.id);
+        const blocked = pending.some(row => row.state === 'blocked');
+        const unknown = pending.some(row => row.state === 'unknown' && !sending.has(row.id));
+        const status = pending.at(-1)?.status || job.status;
+        const card = document.createElement('div'); card.className = 'route-card'; card.dataset.testid = `job-card-${job.id}`;
+        function textElement(tag, className, text, testid) {
+          const element = document.createElement(tag); element.className = className; element.textContent = text;
+          if (testid) element.dataset.testid = testid;
+          card.append(element); return element;
+        }
+        textElement('div', `job-status status-${status}`, String(status).replaceAll('_', ' '), `job-status-${job.id}`);
+        textElement('h2', 'job-title', job.job_title);
+        textElement('div', 'job-address', `📍 ${job.address}`);
+        textElement('div', 'job-time', `${formatTime(job.scheduled_start)}${job.scheduled_end ? ' - ' + formatTime(job.scheduled_end) : ''}`);
+        const saving = addingJobs.has(job.id) && !pending.length && !confirmed.has(job.id);
+        const receipt = textElement('p', 'job-receipt', saving ? 'Saving change locally; confirmation pending.' : blocked ? 'Change not saved (blocked). Reload and review before retrying.'
+          : unknown ? 'Save outcome unknown; confirmation pending. Retry to reconcile.'
+          : pending.length ? 'Saved locally; confirmation pending.' : confirmed.has(job.id) ? 'Confirmed by server.' : 'Current server snapshot.', `job-receipt-${job.id}`);
+        receipt.setAttribute('role', 'status');
+        const actions = textElement('div', 'actions-row', '');
+        function button(label, target, testid) {
+          const button = document.createElement('button'); button.className = `btn ${target ? 'btn-primary' : 'btn-secondary'}`; button.textContent = label;
+          if (testid) button.dataset.testid = `btn-${testid}-${job.id}`;
+          if (target) { button.disabled = addingJobs.has(job.id) || blocked || unknown || pending.some(row => sending.has(row.id)) || !validTime(job.updated_at); button.onclick = () => updateJobStatus(job.id, target); }
+          actions.append(button); return button;
+        }
+        if (status === 'pending') button('Start Travel', 'en_route', 'start-travel');
+        else if (status === 'en_route') button('Arrived On-Site', 'on_site', 'arrived');
+        else if (status === 'on_site') { button('Generate Quote'); button('Job Done', 'done', 'job-done'); }
+        else if (status === 'done' || status === 'completed') button('Tap to Pay');
+        if (blocked) { const reload = button('Discard blocked changes and reload'); reload.onclick = () => discardBlocked(job.id); }
+        container.append(card);
+      }
+    }
+    window.addEventListener('omnisolo_auth_changed', retire);
+    window.addEventListener('pagehide', retire);
+    window.addEventListener('storage', event => { if (event.key === null || event.key === IDENTITY_EPOCH_KEY) retire(); });
+    window.addEventListener('online', () => { updateOfflineStatus(); syncOfflineQueue(); });
+    window.addEventListener('offline', () => { updateOfflineStatus(); });
+    document.getElementById('retry-sync').onclick = () => { queueError = ''; syncOfflineQueue(); };
+    document.getElementById('reload-routes').onclick = () => fetchRoutes();
+    document.getElementById('date-display').textContent = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+    fetchRoutes();
+  </script>
+  <script src="help-widget.mjs" type="module"></script>
+  </body>
+</html>

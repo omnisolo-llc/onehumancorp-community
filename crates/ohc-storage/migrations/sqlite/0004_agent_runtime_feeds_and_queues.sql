@@ -1,0 +1,458 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- Unified Single-Tenant OSS Migration 0004 (SQLite):
+-- Agent runtime registry, approval feeds, action queues, shared task graphs,
+-- session context, knowledge embeddings, memory stores, event subscriptions,
+-- sub-agent queue, job queue, universal ledger, and local integrations.
+
+CREATE TABLE IF NOT EXISTS agents (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'IDLE',
+    provider_type TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS agent_status (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_heartbeat TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS agent_feed (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    priority TEXT,
+    title TEXT,
+    description TEXT,
+    payload TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'PENDING_APPROVAL',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_feed_tenant ON agent_feed (tenant_id, state);
+
+CREATE TABLE IF NOT EXISTS agent_feed_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    event_source TEXT NOT NULL,
+    context_payload TEXT NOT NULL DEFAULT '{}',
+    proposed_action TEXT NOT NULL DEFAULT '{}',
+    lifecycle_state TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_feed_items_tenant
+    ON agent_feed_items (tenant_id, lifecycle_state);
+
+CREATE TABLE IF NOT EXISTS agent_feed_decisions (
+    tenant_id TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    decision_state TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    job_id TEXT UNIQUE,
+    dispatch_payload TEXT,
+    dispatch_status TEXT NOT NULL CHECK (dispatch_status IN
+        ('NOT_REQUESTED', 'PENDING', 'ATTEMPTING', 'DISPATCH_RETURNED', 'RECONCILIATION_REQUIRED', 'CANCELLED')),
+    attempted_at TIMESTAMP,
+    dispatch_returned_at TIMESTAMP,
+    detail TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, action_id),
+    CHECK (attempted_at IS NULL OR dispatch_status IN ('ATTEMPTING', 'DISPATCH_RETURNED', 'RECONCILIATION_REQUIRED'))
+);
+
+CREATE INDEX IF NOT EXISTS agent_feed_decisions_pending
+    ON agent_feed_decisions (dispatch_status, updated_at);
+
+CREATE TABLE IF NOT EXISTS agent_action_requests (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Pending',
+    confidence_score REAL NOT NULL DEFAULT 0.0,
+    product_id TEXT,
+    payload TEXT NOT NULL DEFAULT '{}',
+    source TEXT,
+    agent_type TEXT,
+    description TEXT,
+    department_type TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_action_requests_tenant_status
+    ON agent_action_requests (tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS action_required_queue (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    agent_id TEXT,
+    action_type TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'normal',
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    resolved_by TEXT,
+    resolved_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_action_required_queue_tenant_status
+    ON action_required_queue (tenant_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_approvals (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    department TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    action_risk TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS shared_tasks_v4 (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'default_tenant',
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    agent_id TEXT,
+    priority TEXT NOT NULL DEFAULT 'P2',
+    payload TEXT,
+    parent_plan_id TEXT,
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    auto_dreamed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_shared_tasks_v4_tenant_status
+    ON shared_tasks_v4 (tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS shared_tasks (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'default_tenant',
+    organization_id TEXT NOT NULL DEFAULT 'default_tenant',
+    parent_plan_id TEXT,
+    title TEXT NOT NULL DEFAULT '',
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    assigned_agent_id TEXT,
+    payload TEXT,
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    auto_dreamed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_shared_tasks_org_status
+    ON shared_tasks (organization_id, status);
+
+CREATE TABLE IF NOT EXISTS shared_tasks_decomposition (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT 'default_tenant',
+    organization_id TEXT NOT NULL DEFAULT 'default_tenant',
+    mission_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    assigned_agent_id TEXT,
+    priority TEXT NOT NULL DEFAULT 'P2',
+    payload TEXT,
+    parent_plan_id TEXT,
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    locked_until TIMESTAMP,
+    ultraplan_phase TEXT,
+    deliberation_log TEXT,
+    depth INTEGER,
+    action_risk TEXT,
+    approval_status TEXT,
+    proposed_content TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id TEXT NOT NULL,
+    depends_on_task_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS shared_task_dependencies (
+    task_id TEXT NOT NULL,
+    depends_on_task_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    organization_id TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_session_data (
+    session_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    context_data TEXT NOT NULL,
+    device_signature TEXT,
+    _sync_status TEXT DEFAULT 'pending',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_accessed TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_embeddings (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    agent_id TEXT,
+    task_id TEXT,
+    content TEXT NOT NULL,
+    embedding BLOB,
+    source_type TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_embeddings_tenant
+    ON knowledge_embeddings (tenant_id, source_type);
+
+CREATE TABLE IF NOT EXISTS consolidated_memory (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    agent_id TEXT,
+    content TEXT NOT NULL,
+    embedding BLOB,
+    source_type TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_referenced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reference_count INTEGER NOT NULL DEFAULT 0,
+    reliability_score INTEGER NOT NULL DEFAULT 50,
+    owner_override BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agent_memories (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    raw_content BLOB NOT NULL,
+    summary_embedding BLOB,
+    department TEXT,
+    interaction_data TEXT NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS autodream_memories (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    embedding BLOB,
+    source_type TEXT NOT NULL,
+    topic TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS agent_missions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    mission_log TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS agent_event_subscriptions (
+    tenant_id TEXT NOT NULL,
+    agent_role TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, agent_role, topic)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_event_subscriptions_tenant
+    ON agent_event_subscriptions (tenant_id);
+
+CREATE TABLE IF NOT EXISTS sub_agent_queue (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    parent_task_id TEXT,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'QUEUED',
+    worker_id TEXT,
+    scheduled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked_until TIMESTAMP,
+    completed_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sub_agent_queue_tenant_status
+    ON sub_agent_queue (tenant_id, status, scheduled_at);
+
+CREATE TABLE IF NOT EXISTS ohc_job_queue (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    parent_task_id TEXT,
+    job_type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    next_retry_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ohc_universal_ledger (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    department TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT '',
+    action_type TEXT NOT NULL DEFAULT '',
+    state_change TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS department_tasks (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    department TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    locked_until TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS department_dead_letters (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    department TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS state_machine_transitions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    agent_id TEXT,
+    reason TEXT,
+    task_id TEXT,
+    occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    transitioned_at TIMESTAMP,
+    version BIGINT NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_sm_entity
+    ON state_machine_transitions (tenant_id, entity_id, entity_type);
+
+CREATE TABLE IF NOT EXISTS incidents (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    affected_orders TEXT NOT NULL DEFAULT '[]',
+    affected_inventory TEXT NOT NULL DEFAULT '[]',
+    resolution_plan TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS inbound_signals (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    raw_payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'PROCESSED', 'FAILED')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS daily_work_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    signal_id TEXT REFERENCES inbound_signals(id) ON DELETE SET NULL,
+    intent TEXT NOT NULL,
+    customer_info TEXT,
+    suggested_actions TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING', 'APPROVED', 'DISMISSED')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS tool_integrations (
+    tenant_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    api_url TEXT,
+    integration_code TEXT,
+    status TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS integration_credentials (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    integration_id TEXT NOT NULL,
+    bot_token TEXT,
+    api_token TEXT,
+    from_phone TEXT,
+    chat_id TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS applied_client_mutations (
+    client_mutation_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS business_milestones (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    milestone_type TEXT NOT NULL,
+    reached_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    shared_at TIMESTAMP,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (tenant_id, milestone_type)
+);

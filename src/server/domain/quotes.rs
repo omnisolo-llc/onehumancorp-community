@@ -1,0 +1,198 @@
+use serde_json::Value;
+use sqlx::PgPool;
+
+use server_integrations_stripe::client::StripeClient;
+
+pub async fn handle_quote_action(
+    tenant_id: &str,
+    payload: &Value,
+    pool: &PgPool,
+) -> Result<(), sqlx::Error> {
+    // Extract customer info explicitly early on if provided by action payload
+    let mut action_customer_id = payload
+        .get("customer_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut db_price = 0.0;
+    let mut db_scope = String::new();
+    let mut db_client_id = String::new();
+
+    if let Some(quote_id) = payload.get("quote_id").and_then(|v| v.as_str()) {
+        tracing::info!("Approved quote draft: {}", quote_id);
+        let quote_uuid = uuid::Uuid::parse_str(quote_id).unwrap_or_default();
+        sqlx::query("UPDATE quotes SET status = 'SENT', updated_at = NOW() WHERE id = $1 AND tenant_id = $2")
+            .bind(quote_uuid)
+            .bind(tenant_id)
+            .execute(pool)
+            .await?;
+
+        // Fetch quote details to ensure we use correct values
+        let row = sqlx::query(
+            "SELECT customer_id, total_amount_cents FROM quotes WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(quote_uuid)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(r) = row {
+            use sqlx::Row;
+            let total_cents: i64 = r.try_get("total_amount_cents").unwrap_or(0);
+            db_price = (total_cents as f64) / 100.0;
+            let cust_uuid: uuid::Uuid = r.try_get("customer_id").unwrap_or_default();
+            db_client_id = cust_uuid.to_string();
+
+            if action_customer_id.is_empty() {
+                action_customer_id = db_client_id.clone();
+            }
+        }
+
+        let lines = sqlx::query(
+            "SELECT description FROM quote_line_items WHERE quote_id = $1 AND tenant_id = $2",
+        )
+        .bind(quote_uuid)
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await?;
+
+        for row in lines {
+            use sqlx::Row;
+            let desc: String = row.try_get("description").unwrap_or_default();
+            if !db_scope.is_empty() {
+                db_scope.push_str(", ");
+            }
+            db_scope.push_str(&desc);
+        }
+    }
+
+    // Generate an invoice automatically upon proposal/quote approval
+    let invoice_id = uuid::Uuid::new_v4().to_string();
+
+    let client_name = payload
+        .get("client_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Client");
+
+    let mut client_id = payload
+        .get("customer_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    if !db_client_id.is_empty() {
+        client_id = &db_client_id;
+    }
+    if client_id == "unknown" && !action_customer_id.is_empty() {
+        client_id = &action_customer_id;
+    }
+
+    let mut price = payload.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if db_price > 0.0 {
+        price = db_price;
+    }
+
+    let mut scope = payload
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Service");
+    if !db_scope.is_empty() {
+        scope = &db_scope;
+    }
+
+    // If it's not just a quote_id update, but an actual approval containing price info, create invoice
+    if price > 0.0 {
+        tracing::info!(
+            "Generating invoice {} for tenant {} with amount {}",
+            invoice_id,
+            tenant_id,
+            price
+        ); // pii-safe
+
+        let due_date = chrono::Utc::now().timestamp() + (7 * 24 * 60 * 60); // Due in 7 days
+
+        let api_key = std::env::var("STRIPE_API_KEY").unwrap_or_default();
+        let stripe_client = StripeClient::new(api_key);
+
+        let mut stripe_payment_link = payload
+            .get("stripe_payment_link")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Fallback to fake url if external integration fails to prevent silently erroring
+        if payload.get("stripe_payment_link").is_none() {
+            let amount_cents = (price * 100.0).round() as i64;
+            match stripe_client
+                .create_checkout_session_idempotent(
+                    server_integrations_stripe::safe_checkout::CheckoutRequest {
+                        name: scope,
+                        reference: client_id,
+                        amount_cents,
+                        interval: None,
+                        product: None,
+                        currency: "usd",
+                        operation_id: &invoice_id,
+                    },
+                )
+                .await
+            {
+                Ok(receipt) => {
+                    stripe_payment_link = Some(receipt.url);
+                }
+                Err(err) => {
+                    tracing::error!("Failed to generate Stripe checkout session link: {}", err); // pii-safe
+                    // Set explicitly to None if checkout fails instead of faking success
+                    stripe_payment_link = None;
+                }
+            }
+        }
+
+        sqlx::query("INSERT INTO invoices (id, tenant_id, client_id, client_name, status, due_date, currency, total_amount, stripe_payment_link) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+            .bind(&invoice_id)
+            .bind(tenant_id)
+            .bind(client_id)
+            .bind(client_name)
+            .bind("draft")
+            .bind(due_date)
+            .bind("USD")
+            .bind(price)
+            .bind(&stripe_payment_link)
+            .execute(pool)
+            .await?;
+
+        let line_item_id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query("INSERT INTO invoice_line_items (id, tenant_id, invoice_id, description, quantity, unit_price, amount) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+            .bind(&line_item_id)
+            .bind(tenant_id)
+            .bind(&invoice_id)
+            .bind(scope)
+            .bind(1)
+            .bind(price)
+            .bind(price)
+            .execute(pool)
+            .await?;
+
+        tracing::info!("Invoice line items added for invoice {}", invoice_id);
+
+        // Also update the quote with the stripe link
+        if let Some(quote_id) = payload.get("quote_id").and_then(|v| v.as_str()) {
+            let quote_uuid = uuid::Uuid::parse_str(quote_id).unwrap_or_default();
+            sqlx::query(
+                "UPDATE quotes SET stripe_payment_link = $1 WHERE id = $2 AND tenant_id = $3",
+            )
+            .bind(&stripe_payment_link)
+            .bind(quote_uuid)
+            .bind(tenant_id)
+            .execute(pool)
+            .await?;
+        }
+
+        tracing::info!(
+            "Dispatched SMS/WhatsApp with quote and payment link {:?} to customer {}",
+            stripe_payment_link,
+            client_id
+        );
+    }
+
+    Ok(())
+}

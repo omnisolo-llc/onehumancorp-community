@@ -1,0 +1,27 @@
+[package]
+name = "server_utils"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8.1", features = ["ws", "multipart"] }
+dashmap = "5"
+flate2 = "1"
+rand = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = "0.1"
+url = "2.5.8"
+
+[dev-dependencies]
+chrono = { workspace = true }
+reqwest = { workspace = true }
+temp-env = "0.3.6"
+tower = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+[lib]
+path = "mod.rs"

@@ -1,0 +1,652 @@
+import '@testing-library/jest-dom';
+import { render,screen,act,waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { HelpWidget,WalkthroughProvider,shouldShowMobileHelpLauncher } from './help';
+import { describe,it,expect,vi,beforeEach,afterEach } from 'vitest';
+import { TooltipProvider } from './TooltipRegistry';
+
+const navigationMocks = vi.hoisted(() => ({
+  pathname: '/builder',
+  push: vi.fn(),
+}));
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: navigationMocks.push }),
+  usePathname: () => navigationMocks.pathname,
+}));
+
+describe('HelpWidget', () => {
+  beforeEach(() => {
+    navigationMocks.pathname = '/builder';
+    navigationMocks.push.mockReset();
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/v1/walkthrough/store-setup')) {
+        return Promise.resolve(Response.json([{ targetId: 'bio-input-tooltip', title: 'Test', content: 'Test Content' }], { status: 200 }));
+      }
+      if (url.includes('/api/v1/walkthrough/pos')) {
+        return Promise.resolve(Response.json([{ targetId: 'pos-keypad', title: 'Mock Walkthrough', content: 'Mock Content' }], { status: 200 }));
+      }
+      if (url.includes('/api/v1/walkthrough/assistant')) {
+        return Promise.resolve(Response.json([], { status: 200 }));
+      }
+      if (url.includes('/api/v1/walkthrough/meeting-room')) {
+        return Promise.resolve(Response.json(null, { status: 200 }));
+      }
+      if (url.includes('/api/v1/help/search')) {
+        return Promise.resolve(Response.json([], { status: 200 }));
+      }
+      if (url.includes('/api/v1/help')) {
+        return Promise.resolve(Response.json([
+            { title: "Test Article", desc: "A test article", link: "/help/test", category: "Test Category" },
+            { title: "Another Article", desc: "A test article 2", link: "/help/test2" } // No category
+          ], { status: 200 }));
+      }
+      if (url.includes('/api/v1/videos')) {
+        return Promise.resolve(Response.json([
+            { id: 1, title: "Test Video", duration: "1:00", video_url: "http://example.com/video.mp4" }
+          ], { status: 200 }));
+      }
+      if (url.includes('/api/v1/changelog')) {
+        return Promise.resolve(Response.json([
+            { version: "1.0", contentLines: ["- Added feature A", "### Big update"], screenshot_url: "" }
+          ], { status: 200 }));
+      }
+      if (url.includes('/api/v1/chat')) {
+        return Promise.resolve(Response.json({ reply: "Hello from AI", link: { url: "https://example.com", title: "Example" } }, { status: 200 }));
+      }
+      return Promise.resolve(Response.json([], { status: 200 }));
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(['/website-builder', '/login', '/agent-marketplace', '/integrations', '/agents', '/inbox'])(
+    'hides the mobile launcher on collision route %s',
+    (pathname) => {
+      navigationMocks.pathname = pathname;
+      render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+      expect(screen.getByRole('button', { name: 'Open help chat' }).parentElement?.parentElement).toHaveClass('hidden', 'sm:block');
+    },
+  );
+
+  it('keeps the mobile launcher available on the Help Center route', () => {
+    expect(shouldShowMobileHelpLauncher('/help')).toBe(true);
+    expect(shouldShowMobileHelpLauncher('/login')).toBe(false);
+  });
+
+  it('does not fetch optional help content on the public login route', async () => {
+    navigationMocks.pathname = '/login';
+
+    await act(async () => {
+      render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+      await new Promise(r => setTimeout(r, 20));
+    });
+
+    const requestedUrls = vi.mocked(global.fetch, { partial: true }).mock.calls.map(([url]: [string]) => url);
+    expect(requestedUrls).not.toContain('/api/v1/help');
+    expect(requestedUrls).not.toContain('/api/v1/videos');
+  });
+
+  it('renders the help widget', async () => {
+    await act(async () => {
+      render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+    });
+    expect(screen.getByRole('button', { name: 'Open help chat' })).toBeInTheDocument();
+  });
+
+  it('fetches dynamic walkthroughs when clicked and handles fallback data', async () => {
+    const user = userEvent.setup();
+    render(
+      <div>
+        <div id="bio-input-tooltip">Mock Target 1</div>
+        <div id="pos-keypad">Mock Target 1.5</div>
+        <div id="generate-btn-tooltip">Mock Target 2</div>
+        <div id="ai-chat-trigger">Mock Target 3</div>
+        <div id="omnisolo-help-input-area">Mock Target 4</div>
+        <div id="help-widget-container">Mock Target 5</div>
+        <TooltipProvider>
+          <WalkthroughProvider>
+            <HelpWidget />
+          </WalkthroughProvider>
+        </TooltipProvider>
+      </div>
+    );
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const tourBtn = screen.getByText('Tour: Set up your store');
+    await user.click(tourBtn);
+    expect(global.fetch).toHaveBeenCalledWith('/api/v1/walkthrough/store-setup');
+
+    // Test fallback behavior
+    await user.click(helpBtn);
+    const tourBtn3 = screen.getByText('Tour: Activate your AI Support Agent');
+    await user.click(tourBtn3);
+
+    await user.click(helpBtn);
+    const tourBtn4 = screen.getByText('Tour: Virtual Meeting Room & UltraPlan');
+    await user.click(tourBtn4);
+
+    await user.click(helpBtn);
+    const tourBtn5 = screen.getByText('Tour: KAIROS AI OS Orchestration');
+    await user.click(tourBtn5);
+  });
+
+  it('moves the store setup tour to its target route before showing it', async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <TooltipProvider>
+        <WalkthroughProvider>
+          <>
+            <div id="bio-input-tooltip">Target</div>
+            <HelpWidget />
+          </>
+        </WalkthroughProvider>
+      </TooltipProvider>
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Tour: Set up your store'));
+
+    expect(navigationMocks.push).toHaveBeenCalledWith('/storefront-builder');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    navigationMocks.pathname = '/storefront-builder';
+    rerender(
+      <TooltipProvider>
+        <WalkthroughProvider>
+          <>
+            <div id="bio-input-tooltip">Target</div>
+            <HelpWidget />
+          </>
+        </WalkthroughProvider>
+      </TooltipProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('dialog')).toHaveTextContent('Test Content');
+    });
+  });
+
+  it('switches to the Ask anything tab and submits a message', async () => {
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const chatTab = screen.getByText('Ask anything');
+    await user.click(chatTab);
+
+    expect(screen.getByPlaceholderText('Ask anything...')).toBeInTheDocument();
+
+    const input = screen.getByPlaceholderText('Ask anything...');
+    await user.type(input, 'Test message');
+
+    const sendBtn = screen.getByRole('button', { name: 'Send message' });
+    await user.click(sendBtn);
+
+    await waitFor(() => {
+        expect(screen.getByText('Test message')).toBeInTheDocument();
+        expect(screen.getByText('Hello from AI')).toBeInTheDocument();
+    });
+  });
+
+  it('handles empty chat message gracefully', async () => {
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const chatTab = screen.getByText('Ask anything');
+    await user.click(chatTab);
+
+    const sendBtn = screen.getByRole('button', { name: 'Send message' });
+    expect(sendBtn).toBeDisabled();
+  });
+
+  it('switches to the Videos tab and plays a video', async () => {
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const videosTab = screen.getByText('Videos');
+    await user.click(videosTab);
+
+    await waitFor(() => {
+        expect(screen.getByText('Test Video')).toBeInTheDocument();
+    });
+
+    const videoCard = screen.getByText('Test Video').parentElement?.parentElement;
+    if (videoCard) {
+      await user.click(videoCard);
+    }
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Close video')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByLabelText('Close video'));
+
+    await waitFor(() => {
+        expect(screen.queryByLabelText('Close video')).not.toBeInTheDocument();
+    });
+  });
+
+  it('closes video modal when clicking on the backdrop overlay', async () => {
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const videosTab = screen.getByText('Videos');
+    await user.click(videosTab);
+
+    await waitFor(() => {
+        expect(screen.getByText('Test Video')).toBeInTheDocument();
+    });
+
+    const videoCard = screen.getByText('Test Video').parentElement?.parentElement;
+    if (videoCard) {
+      await user.click(videoCard);
+    }
+
+    const modalBackdrop = await screen.findByRole('dialog');
+    expect(modalBackdrop).toBeInTheDocument();
+
+    await user.click(modalBackdrop);
+
+    await waitFor(() => {
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+  });
+
+  it('does not close video modal when clicking inside the modal content', async () => {
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const videosTab = screen.getByText('Videos');
+    await user.click(videosTab);
+
+    await waitFor(() => {
+        expect(screen.getByText('Test Video')).toBeInTheDocument();
+    });
+
+    const videoCard = screen.getByText('Test Video').parentElement?.parentElement;
+    if (videoCard) {
+      await user.click(videoCard);
+    }
+
+    const modalBackdrop = await screen.findByRole('dialog');
+    expect(modalBackdrop).toBeInTheDocument();
+
+    // Since getByText('Test Video') returns multiple elements (one in list, one in modal), we need to query by role
+    const heading = screen.getAllByRole('heading', { name: 'Test Video' })[1];
+    await user.click(heading);
+
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('switches to the What is New tab and renders content', async () => {
+    const user = userEvent.setup();
+    await act(async () => {
+      render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+    });
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const newTab = screen.getByText('New');
+    await user.click(newTab);
+
+    await waitFor(() => {
+        expect(screen.getByText("What's New")).toBeInTheDocument();
+        expect(screen.getByText("New AI Store Builder")).toBeInTheDocument();
+    });
+  });
+
+  it('renders articles and handles search', async () => {
+    const user = userEvent.setup();
+    await act(async () => {
+      render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+    });
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    await waitFor(() => {
+        expect(screen.getByText('Test Article')).toBeInTheDocument();
+        expect(screen.getByText('Another Article')).toBeInTheDocument();
+        expect(screen.getByRole('heading', { name: 'Test Category' })).toBeInTheDocument();
+        expect(screen.getByRole('heading', { name: 'Other' })).toBeInTheDocument();
+    });
+
+    const searchInput = screen.getByPlaceholderText('Search for help...');
+    await user.type(searchInput, 'nonexistent');
+
+    await waitFor(() => {
+        expect(screen.queryByText('Test Article')).not.toBeInTheDocument();
+        expect(screen.queryByText('Another Article')).not.toBeInTheDocument();
+    });
+  });
+
+  it('preserves the tutorial URL when opening the video player', async () => {
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByRole('button', { name: 'Videos' }));
+    await user.click(await screen.findByText('Test Video'));
+
+    expect(screen.getByRole('dialog').querySelector('video')).toHaveAttribute(
+      'src',
+      'http://example.com/video.mp4',
+    );
+  });
+
+  it('closes the help widget when clicking close button', async () => {
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const closeBtn = screen.getByLabelText('Close Help Widget');
+    await user.click(closeBtn);
+
+    expect(screen.queryByText('In-App Help Center')).not.toBeInTheDocument();
+  });
+
+  it('opens chat on open-help-chat event', async () => {
+    await act(async () => {
+      render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+    });
+
+    act(() => {
+        window.dispatchEvent(new CustomEvent('open-help-chat'));
+    });
+
+    expect(screen.getByPlaceholderText('Ask anything...')).toBeInTheDocument();
+  });
+
+  it('handles chat fetch error', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+        if (url.includes('/api/v1/chat')) {
+            return Promise.resolve(Response.json({}, { status: 500 }));
+        }
+        return Promise.resolve(Response.json([], { status: 200 }));
+    });
+
+    const user = userEvent.setup();
+    render(<div><TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider></div>);
+
+    const helpBtn = screen.getByRole('button', { name: 'Open help chat' });
+    await user.click(helpBtn);
+
+    const chatTab = screen.getByText('Ask anything');
+    await user.click(chatTab);
+
+    const input = screen.getByPlaceholderText('Ask anything...');
+    await user.type(input, 'Test message fail');
+
+    const sendBtn = screen.getByRole('button', { name: 'Send message' });
+    await user.click(sendBtn);
+
+    await waitFor(() => {
+        expect(screen.getByText("Sorry, I'm having trouble connecting right now.")).toBeInTheDocument();
+    });
+  });
+
+  it('can open and close video player', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/v1/videos')) {
+        return Promise.resolve(Response.json([{ id: 1, title: 'Video 1', duration: '1:00', video_url: 'http://video' }], { status: 200 }));
+      }
+      return Promise.resolve(Response.json([], { status: 200 }));
+    });
+
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Videos'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Video 1')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText('Video 1'));
+
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    // click close button
+    await user.click(screen.getByRole('button', { name: 'Close video' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('can open and close video player by clicking outside', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/v1/videos')) {
+        return Promise.resolve(Response.json([{ id: 1, title: 'Video 1', duration: '1:00', video_url: 'http://video' }], { status: 200 }));
+      }
+      return Promise.resolve(Response.json([], { status: 200 }));
+    });
+
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Videos'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Video 1')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText('Video 1'));
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toBeInTheDocument();
+
+    // click outside
+    await user.click(dialog);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('prevents closing video player when clicking inside the video wrapper', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/v1/videos')) {
+        return Promise.resolve(Response.json([{ id: 1, title: 'Video 1', duration: '1:00', video_url: 'http://video' }], { status: 200 }));
+      }
+      return Promise.resolve(Response.json([], { status: 200 }));
+    });
+
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Videos'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Video 1')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText('Video 1'));
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toBeInTheDocument();
+
+    // click inside the wrapper
+    const wrapper = dialog.firstElementChild!;
+    await user.click(wrapper);
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+  });
+
+  it('can open Whats New tab', async () => {
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText("New"));
+
+    expect(screen.getByText('New AI Store Builder')).toBeInTheDocument();
+  });
+
+  it('clears chat', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/v1/chat')) {
+        return Promise.resolve(Response.json({ reply: 'Hello again' }, { status: 200 }));
+      }
+      return Promise.resolve(Response.json([], { status: 200 }));
+    });
+
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Ask anything'));
+
+    const input = screen.getByPlaceholderText('Ask anything...');
+    await user.type(input, 'Hello');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Hello again')).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Clear chat' }));
+    expect(screen.queryByText('Hello again')).not.toBeInTheDocument();
+  });
+
+  it('can close the chat interface when Escape is pressed', async () => {
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Ask anything'));
+
+    const input = screen.getByPlaceholderText('Ask anything...');
+    await user.type(input, '{Escape}');
+
+    expect(screen.queryByPlaceholderText('Ask anything...')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open help chat' })).toHaveFocus();
+  });
+
+  it('does not render protocol-relative agent links', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/v1/chat')) {
+        return Promise.resolve(Response.json({
+            reply: 'Here is a link',
+            link: { url: '//untrusted.example/path', title: 'Untrusted' },
+          }, { status: 200 }));
+      }
+      return Promise.resolve(Response.json([], { status: 200 }));
+    });
+
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByText('Ask anything'));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'Show me a link');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Here is a link')).toBeInTheDocument();
+    });
+    expect(screen.queryByText('Read the full article →')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['/help?article=my-store-1', '/help/add-products'],
+    ['/help?article=payments-1', '/help/accept-payments'],
+    ['/help?article=marketing-tools', '/help/marketing-tools'],
+    ['/help?article=../settings', null],
+  ])('routes legacy Help article response %s to an existing article page', async (url, expected) => {
+    vi.mocked(fetch).mockImplementation(request => Promise.resolve(Response.json(
+      String(request).includes('/api/v1/chat')
+        ? { reply: 'Recorded Help answer', link: { url, title: 'Open article' } }
+        : [],
+    )));
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByRole('button', { name: 'Ask AI (Ask anything)' }));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'How do I add a product?');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(await screen.findByText('Recorded Help answer')).toBeVisible();
+    if (expected) expect(screen.getByRole('link', { name: 'Open article' })).toHaveAttribute('href', expected);
+    else expect(screen.queryByRole('link', { name: 'Open article' })).not.toBeInTheDocument();
+  });
+
+  it('sends Operations questions to the actual Help API instead of inventing a department handoff', async () => {
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByRole('button', { name: 'Ask AI (Ask anything)' }));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'How do Operations work?');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(fetch).toHaveBeenCalledWith('/api/v1/chat', expect.objectContaining({ method: 'POST', body: JSON.stringify({ message: 'How do Operations work?' }) }));
+    expect(await screen.findByText('Hello from AI')).toBeVisible();
+    expect(screen.queryByText('I have routed your request to the Operations department.')).not.toBeInTheDocument();
+  });
+  it('ignores a late reply after Clear chat and permits a fresh message', async () => {
+    let resolve!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementation(url => String(url).includes('/api/v1/chat') ? new Promise<Response>(done => { resolve = done; }) : Promise.resolve(Response.json([])));
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByRole('button', { name: 'Ask AI (Ask anything)' }));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'First question');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await user.click(screen.getByRole('button', { name: 'Clear chat' }));
+    await act(async () => resolve(Response.json({ reply: 'Old reply' })));
+    expect(screen.queryByText('Old reply')).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'Fresh question');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled();
+  });
+  it('does not send another message while the current reply is pending', async () => {
+    let resolve!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementation(url => String(url).includes('/api/v1/chat') ? new Promise<Response>(done => { resolve = done; }) : Promise.resolve(Response.json([])));
+    const user = userEvent.setup();
+    render(<TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>);
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByRole('button', { name: 'Ask AI (Ask anything)' }));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'First');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'Second');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    await act(async () => resolve(Response.json({ reply: 'First answer' })));
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled();
+  });
+
+  it('releases pending chat state after navigation while ignoring the old route reply', async () => {
+    let resolve!: (response: Response) => void;
+    vi.mocked(fetch).mockImplementation(url => String(url).includes('/api/v1/chat') ? new Promise<Response>(done => { resolve = done; }) : Promise.resolve(Response.json([])));
+    const user = userEvent.setup();
+    const view = () => <TooltipProvider><WalkthroughProvider><HelpWidget /></WalkthroughProvider></TooltipProvider>;
+    const { rerender } = render(view());
+    await user.click(screen.getByRole('button', { name: 'Open help chat' }));
+    await user.click(screen.getByRole('button', { name: 'Ask AI (Ask anything)' }));
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'Old route question');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    navigationMocks.pathname = '/help';
+    rerender(view());
+    await user.type(screen.getByPlaceholderText('Ask anything...'), 'New route question');
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeEnabled();
+    await act(async () => resolve(Response.json({ reply: 'Old route answer' })));
+    expect(screen.queryByText('Old route answer')).not.toBeInTheDocument();
+  });
+
+});

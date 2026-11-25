@@ -1,0 +1,84 @@
+"use client";
+
+import React, { useState, useEffect } from "react";
+
+interface SocialPostProposal {
+  id: string;
+  tenant_id: string;
+  product_id: string;
+  content: string;
+  image_url?: string;
+  seo_alt_text?: string;
+  seo_meta_description?: string;
+  status: string;
+  created_at_unix: number;
+}
+
+export default function PromoterPage() {
+  const [proposals, setProposals] = useState<SocialPostProposal[]>([]);
+  const [selectedProposal, setSelectedProposal] = useState<SocialPostProposal | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function loadProposals() {
+      try {
+        const response = await fetch('/api/v1/campaign/proposals');
+        if (response.ok) {
+          const data = await response.json();
+          setProposals(data.proposals || []);
+        }
+      } catch {
+        // Silently handled on load failure during rapid navigation
+      } finally {
+        setLoading(false);
+      }
+    }
+    loadProposals();
+  }, []);
+
+  if (selectedProposal) {
+    return (
+      <div className="p-4 max-w-sm mx-auto">
+        <button onClick={() => setSelectedProposal(null)} className="mb-4 text-blue-500">&larr; Back</button>
+        <h2 className="text-xl font-bold mb-4">Promoter Proposal</h2>
+        <div className="bg-white rounded shadow p-4">
+            {selectedProposal.image_url && <img src={selectedProposal.image_url} alt={selectedProposal.seo_alt_text || 'Product image'} className="w-full h-48 object-cover rounded mb-4" />}
+            <p className="text-sm font-semibold text-gray-700">Caption:</p>
+            <p className="text-gray-900 mb-4">{selectedProposal.content}</p>
+            <details className="mb-4">
+                <summary className="text-sm text-gray-500 cursor-pointer">SEO Details</summary>
+                <div className="mt-2 text-sm text-gray-700">
+                    <p><strong>Alt Text:</strong> {selectedProposal.seo_alt_text || 'N/A'}</p>
+                    <p><strong>Meta Description:</strong> {selectedProposal.seo_meta_description || 'N/A'}</p>
+                </div>
+            </details>
+            <div className="flex gap-2">
+                <button className="flex-1 bg-blue-500 text-white py-2 rounded" id="generate-btn">Approve & Publish</button>
+                <button className="flex-1 bg-gray-200 text-gray-800 py-2 rounded">Edit</button>
+                <button className="flex-1 bg-red-100 text-red-600 py-2 rounded">Discard</button>
+            </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-4 max-w-sm mx-auto">
+      <h1 className="text-2xl font-bold mb-4">The Promoter</h1>
+      <div className="space-y-4">
+        {loading ? (
+          <p className="text-gray-500 text-sm">Loading proposals...</p>
+        ) : proposals.length === 0 ? (
+          <p className="text-gray-500 text-sm">No new proposals generated.</p>
+        ) : (
+          proposals.map((p) => (
+            <div key={p.id} className="bg-white rounded shadow p-4 cursor-pointer" onClick={() => setSelectedProposal(p)}>
+              <p className="font-semibold text-gray-800">New Product Detected!</p>
+              <p className="text-sm text-gray-600 mt-1">The Promoter has generated a social post and SEO tags.</p>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}

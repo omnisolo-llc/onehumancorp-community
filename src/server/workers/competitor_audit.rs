@@ -1,0 +1,162 @@
+use chrono::Utc;
+use std::sync::Arc;
+use tokio::time::{Duration, interval};
+use uuid::Uuid;
+
+pub struct CompetitorAuditWorker {
+    pub db: Arc<crate::db::DB>,
+}
+
+impl CompetitorAuditWorker {
+    pub fn new(db: Arc<crate::db::DB>) -> Self {
+        Self { db }
+    }
+
+    pub fn start(&self) {
+        if !competitor_audit_enabled(
+            std::env::var("OMNISOLO_ENABLE_COMPETITOR_AUDIT")
+                .ok()
+                .as_deref(),
+        ) {
+            tracing::debug!("Competitor audit worker is disabled");
+            return;
+        }
+        let db = self.db.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(3600)); // Run every hour
+
+            loop {
+                interval.tick().await;
+                if let Err(e) = Self::run_audit(&db).await {
+                    ::server_telemetry::record_error_signal(
+                        "[bug] CompetitorAuditWorker run_audit failed",
+                    );
+                    tracing::error!("CompetitorAuditWorker run_audit failed: {}", e);
+                }
+            }
+        });
+    }
+
+    pub async fn run_audit(
+        db: &crate::db::DB,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Periodically probe explicitly configured public competitor update channels.
+
+        let competitors = vec![
+            (
+                "AI coding assistant",
+                "https://api.github.com/repos/cursor/cursor/commits",
+            ),
+            (
+                "OpenClaw",
+                "https://api.github.com/repos/openclaw/openclaw/commits",
+            ),
+            (
+                "Replit Agent",
+                "https://api.github.com/repos/replit/replit/commits",
+            ),
+        ];
+
+        let client = reqwest::Client::builder()
+            .user_agent("OmniSolo-Competitor-Audit-Worker")
+            .build()?;
+
+        for (comp, url) in competitors {
+            let id = Uuid::new_v4().to_string();
+            let probed_at = Utc::now();
+
+            // In a real scenario we might fetch actual data. For now, try fetching to see if endpoint is live.
+            let metrics_data = match client.get(url).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    format!(
+                        "{{\"status\": \"{}\", \"timestamp\": \"{}\"}}",
+                        status,
+                        probed_at.to_rfc3339()
+                    )
+                }
+                Err(e) => {
+                    format!(
+                        "{{\"error\": \"{}\", \"timestamp\": \"{}\"}}",
+                        e,
+                        probed_at.to_rfc3339()
+                    )
+                }
+            };
+
+            match &db.store {
+                crate::db::DbStore::Postgres => {
+                    sqlx::query(
+                        "INSERT INTO competitor_metrics (id, tenant_id, competitor_name, metrics_data, probed_at) VALUES ($1, $2, $3, $4, $5)",
+                    )
+                    .bind(&id)
+                    .bind("system")
+                    .bind(comp)
+                    .bind(&metrics_data)
+                    .bind(probed_at)
+                    .execute(&db.pool)
+                    .await?;
+                }
+                crate::db::DbStore::Sqlite(sqlite_pool) => {
+                    // SQLite fallback implementation
+                    sqlx::query("INSERT INTO competitor_metrics (id, tenant_id, competitor_name, metrics_data, probed_at) VALUES (?, ?, ?, ?, ?)")
+                        .bind(&id)
+                        .bind("system")
+                        .bind(comp)
+                        .bind(&metrics_data)
+                        .bind(probed_at)
+                        .execute(sqlite_pool)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn competitor_audit_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+#[cfg(test)]
+mod tests {
+    // use super::*;
+
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn competitor_audit_is_opt_in() {
+        assert!(!competitor_audit_enabled(None));
+        assert!(!competitor_audit_enabled(Some("false")));
+        assert!(competitor_audit_enabled(Some("true")));
+        assert!(competitor_audit_enabled(Some(" 1 ")));
+    }
+
+    #[tokio::test]
+    async fn test_worker_initialization() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+
+        let db = Arc::new(crate::db::DB {
+            pool: crate::db::secure_pg_pool_options()
+                .acquire_timeout(std::time::Duration::from_millis(10))
+                .connect_lazy("postgres://postgres:postgres@localhost:5432/test")
+                .unwrap(),
+            store: crate::db::DbStore::Sqlite(pool),
+        });
+
+        let worker = CompetitorAuditWorker::new(db.clone());
+        assert!(Arc::ptr_eq(&worker.db, &db));
+        assert_eq!(worker.db.pool.size(), 0);
+        let crate::db::DbStore::Sqlite(pool) = &worker.db.store else {
+            panic!("Worker initialization changed the configured storage backend");
+        };
+        assert_eq!(pool.size(), 0);
+        // Initialization must not start an ambient opt-in network worker.
+        // The scheduling policy is tested separately by competitor_audit_is_opt_in.
+    }
+}

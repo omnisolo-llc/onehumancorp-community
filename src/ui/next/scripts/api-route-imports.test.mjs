@@ -1,0 +1,88 @@
+import { access, readdir, readFile } from "node:fs/promises";
+import path from "node:path";
+import { expect, test } from "vitest";
+
+const appRoot = path.resolve(import.meta.dirname, "../src/app");
+const apiRoot = path.join(appRoot, "api");
+const apiV1Root = path.join(appRoot, "api/v1");
+const importPattern = /\bfrom\s+["']([^"']+)["']/g;
+const extensions = [".ts", ".tsx", ".js", ".jsx"];
+
+function withoutComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "");
+}
+
+async function routeFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) return routeFiles(file);
+    return entry.name === "route.ts" ? [file] : [];
+  }));
+  return nested.flat();
+}
+
+async function productionSourceFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) return productionSourceFiles(file);
+    if (!/\.(?:ts|tsx)$/.test(entry.name)) return [];
+    if (/\.(?:test|spec)\.[^.]+$|\.mock-contract\.[^.]+$/.test(entry.name)) return [];
+    return [file];
+  }));
+  return nested.flat();
+}
+
+async function exists(file) {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolvesImport(routeFile, specifier) {
+  const base = path.resolve(path.dirname(routeFile), specifier);
+  const candidates = [
+    base,
+    ...extensions.map((extension) => `${base}${extension}`),
+    ...extensions.map((extension) => path.join(base, `index${extension}`)),
+  ];
+  return (await Promise.all(candidates.map(exists))).some(Boolean);
+}
+
+test("every relative import in a v1 route resolves to an application module", async () => {
+  const failures = [];
+  for (const routeFile of await routeFiles(apiV1Root)) {
+    const source = withoutComments(await readFile(routeFile, "utf8"));
+    for (const match of source.matchAll(importPattern)) {
+      const specifier = match[1];
+      if (!specifier.startsWith(".")) continue;
+      if (await resolvesImport(routeFile, specifier)) continue;
+      failures.push(`${path.relative(appRoot, routeFile)} -> ${specifier}`);
+    }
+  }
+  expect(failures).toEqual([]);
+});
+
+test("every Next.js API route is namespaced under /api/v1", async () => {
+  const legacyRoutes = (await routeFiles(apiRoot))
+    .filter((routeFile) => !routeFile.startsWith(`${apiV1Root}${path.sep}`))
+    .map((routeFile) => path.relative(appRoot, routeFile));
+
+  expect(legacyRoutes).toEqual([]);
+});
+
+test("every production UI call uses the versioned internal API prefix", async () => {
+  const violations = [];
+  for (const file of await productionSourceFiles(appRoot)) {
+    const source = withoutComments(await readFile(file, "utf8"));
+    for (const match of source.matchAll(/["'`]\/api\/(?!v1(?:\/|[?"'`]))[^"'`\s]*/g)) {
+      violations.push(`${path.relative(appRoot, file)}: ${match[0]}`);
+    }
+  }
+
+  expect(violations).toEqual([]);
+});

@@ -1,0 +1,210 @@
+import { describe, expect, it } from "vitest";
+import { PUBLIC_ROUTE_ENTRIES, classifyRequest } from "./publicRoutes";
+import type { PublicRouteEntry } from "./types";
+
+const TEST_API_CONTRACT = {
+  bodyLimitBytes: 4096,
+  rateLimitPolicy: "next-source-and-rust-account",
+  tenantSource: "validated-organization-field",
+  replayPolicy: "non-idempotent-credential-exchange",
+  cachePolicy: "private-no-store",
+} as const;
+
+const REGISTRATION_API_CONTRACT = {
+  bodyLimitBytes: 4096,
+  rateLimitPolicy: "backend-registration",
+  tenantSource: "none",
+  replayPolicy: "one-time-registration",
+  cachePolicy: "private-no-store",
+} as const;
+
+const CAPABILITIES_API_CONTRACT = {
+  bodyLimitBytes: 4096,
+  rateLimitPolicy: "backend-capabilities",
+  tenantSource: "none",
+  replayPolicy: "read-only",
+  cachePolicy: "private-no-store",
+} as const;
+
+// @ts-expect-error route-handler entries require API contract metadata
+const routeHandlerWithoutApi = { method: "POST", invocation: "route-handler", matcher: { kind: "exact", path: "/api/v1/auth/login" }, reason: "invalid missing API contract", owner: "authentication" } as const satisfies PublicRouteEntry;
+
+// @ts-expect-error page entries cannot declare API contract metadata
+const pageWithApi = { method: "GET", invocation: "page", matcher: { kind: "exact", path: "/login" }, reason: "invalid page API contract", owner: "authentication", api: TEST_API_CONTRACT } as const satisfies PublicRouteEntry;
+
+// @ts-expect-error page entries require an exact matcher
+const pageWithFrameworkPrefix = { method: "GET", invocation: "page", matcher: { kind: "framework-prefix", path: "/_next/static/" }, reason: "invalid page framework prefix", owner: "authentication" } as const satisfies PublicRouteEntry;
+
+// @ts-expect-error framework asset prefixes are GET-only
+const postFrameworkAsset = { method: "POST", invocation: "asset", matcher: { kind: "framework-prefix", path: "/_next/static/" }, reason: "invalid POST framework asset", owner: "framework" } as const satisfies PublicRouteEntry;
+
+// These values also remain compile-time negative contract checks above.
+void [routeHandlerWithoutApi, pageWithApi, pageWithFrameworkPrefix, postFrameworkAsset];
+
+describe("bootstrap public contracts", () => {
+  it("declares all and only the reviewed public contracts", () => {
+    expect(PUBLIC_ROUTE_ENTRIES).toEqual([
+  {
+    method: "GET",
+    invocation: "route-handler",
+    matcher: { kind: "public-site-document", path: "/api/v1/public/sites/" },
+    reason: "read only a currently eligible reviewed publication document",
+    owner: "publication",
+    api: { bodyLimitBytes: 0, responseLimitBytes: 8388608, tenantSource: "current-publication", replayPolicy: "read-only", cachePolicy: "no-store" },
+  },
+
+      {
+        method: "GET",
+        invocation: "page",
+        matcher: { kind: "exact", path: "/login" },
+        reason: "render the credential entry page",
+        owner: "authentication",
+      },
+      {
+        method: "GET",
+        invocation: "page",
+        matcher: { kind: "exact", path: "/register" },
+        reason: "render the closed-by-default registration entry page",
+        owner: "authentication",
+      },
+      {
+        method: "GET",
+        invocation: "page",
+        matcher: { kind: "exact", path: "/verify-email" },
+        reason: "render the email verification page",
+        owner: "authentication",
+      },
+      {
+        method: "GET",
+        invocation: "page",
+        matcher: { kind: "exact", path: "/healthz" },
+        reason: "expose a public liveness check for ingress and orchestration",
+        owner: "authentication",
+      },
+      {
+        method: "POST",
+        invocation: "route-handler",
+        matcher: { kind: "exact", path: "/api/v1/auth/login" },
+        reason: "exchange bounded credentials for an encrypted web session",
+        owner: "authentication",
+        api: {
+          bodyLimitBytes: 4096,
+          rateLimitPolicy: "next-source-and-rust-account",
+          tenantSource: "validated-organization-field",
+          replayPolicy: "non-idempotent-credential-exchange",
+          cachePolicy: "private-no-store",
+        },
+      },
+      {
+        method: "GET",
+        invocation: "route-handler",
+        matcher: { kind: "exact", path: "/api/v1/auth/public-settings" },
+        reason: "render closed-by-default registration and configured identity-provider choices",
+        owner: "authentication",
+        api: { ...REGISTRATION_API_CONTRACT, replayPolicy: "read-only" },
+      },
+      {
+        method: "POST",
+        invocation: "route-handler",
+        matcher: { kind: "exact", path: "/api/v1/auth/registration/email/start" },
+        reason: "start bounded mandatory email verification",
+        owner: "authentication",
+        api: REGISTRATION_API_CONTRACT,
+      },
+      {
+        method: "POST",
+        invocation: "route-handler",
+        matcher: { kind: "exact", path: "/api/v1/auth/registration/email/verify" },
+        reason: "exchange a one-time email code for a registration ticket",
+        owner: "authentication",
+        api: REGISTRATION_API_CONTRACT,
+      },
+      {
+        method: "POST",
+        invocation: "route-handler",
+        matcher: { kind: "exact", path: "/api/v1/auth/register" },
+        reason: "consume a verified registration ticket and establish a sealed session",
+        owner: "authentication",
+        api: REGISTRATION_API_CONTRACT,
+      },
+      {
+        method: "GET",
+        invocation: "route-handler",
+        matcher: { kind: "exact", path: "/api/v1/capabilities" },
+        reason: "expose runtime edition and feature capabilities with single-tenant defaults",
+        owner: "authentication",
+        api: CAPABILITIES_API_CONTRACT,
+      },
+      {
+        method: "GET",
+        invocation: "asset",
+        matcher: { kind: "framework-prefix", path: "/_next/static/" },
+        reason: "load immutable framework assets needed by the login page",
+        owner: "framework",
+      },
+    ]);
+  });
+
+  it.each([
+    ["GET", "/login", "page", "public"],
+    ["GET", "/register", "page", "public"],
+    ["GET", "/verify-email", "page", "public"],
+    ["GET", "/healthz", "page", "public"],
+    ["POST", "/api/v1/auth/login", "route-handler", "public"],
+    ["GET", "/api/v1/auth/public-settings", "route-handler", "public"],
+    ["POST", "/api/v1/auth/registration/email/start", "route-handler", "public"],
+    ["POST", "/api/v1/auth/registration/email/verify", "route-handler", "public"],
+    ["POST", "/api/v1/auth/register", "route-handler", "public"],
+    ["GET", "/api/v1/capabilities", "route-handler", "public"],
+    ["post", "/api/v1/auth/login", "route-handler", "public"],
+    ["GET", "/_next/static/chunks/app.js", "asset", "public"],
+    ["POST", "/login", "server-action", "protected"],
+    ["GET", "/login", "rsc", "protected"],
+    ["GET", "/login", "prefetch", "protected"],
+    ["GET", "/login", "rewrite", "protected"],
+    ["GET", "/api/v1/auth/login", "route-handler", "protected"],
+    ["POST", "/api/v1/auth/login/", "route-handler", "protected"],
+    ["POST", "/API/auth/login", "route-handler", "protected"],
+    ["POST", "/base/en/api/v1/auth/login", "route-handler", "protected"],
+    ["GET", "/(auth)/login", "page", "protected"],
+    ["GET", "/onboarding", "page", "protected"],
+    ["GET", "/help", "page", "protected"],
+    ["GET", "/_next/data/build/login.json", "rsc", "protected"],
+    ["POST", "/unknown", "route-handler", "protected"],
+    ["GET", "/_next/image", "asset", "protected"],
+    ["GET", "/_next/static", "asset", "protected"],
+    ["POST", "/_next/static/chunks/app.js", "asset", "protected"],
+    ["GET", "/_next/static/chunks/app.js", "page", "protected"],
+  ] as const)("classifies %s %s %s", (method, pathname, invocation, access) => {
+    expect(classifyRequest({ method, pathname, invocation }).access).toBe(access);
+  });
+
+  it.each([
+    "//api/v1/auth/login",
+    "/api%2fauth/login",
+    "/%252e%252e/api/v1/auth/login",
+    "/api/v1/auth/login%00",
+    "/api/v1/auth/login%0d%0aX-Test:value",
+    "/api/v1/auth/login%zz",
+  ])("rejects ambiguous public near miss %s", (pathname) => {
+    expect(classifyRequest({ method: "POST", pathname, invocation: "route-handler" })).toEqual({
+      access: "reject",
+      status: 400,
+    });
+  });
+
+  it.each([
+    "/_next/static//app.js",
+    "/_next/static/../app.js",
+    "/_next/static/%2e%2e/app.js",
+  ])("rejects ambiguous static asset near miss %s", (pathname) => {
+    expect(classifyRequest({ method: "GET", pathname, invocation: "asset" })).toEqual({
+      access: "reject",
+      status: 400,
+    });
+  });
+});
+it('permits an anonymous read of a canonical publication document without opening private bio data', () => {
+  expect(classifyRequest({ method: 'GET', pathname: '/api/v1/public/sites/30000000-0000-4000-8000-000000000003', invocation: 'route-handler' }).access).toBe('public');
+  expect(classifyRequest({ method: 'GET', pathname: '/bio/tenant-a', invocation: 'page' }).access).toBe('protected');
+});

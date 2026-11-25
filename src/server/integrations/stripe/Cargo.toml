@@ -1,0 +1,24 @@
+[package]
+name = "server_integrations_stripe"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+async-trait = "0.1"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+server_integrations_core = { path = "../core" }
+server_integrations_mercadopago = { path = "../mercadopago" }
+server_integrations_razorpay = { path = "../razorpay" }
+server_common = { path = "../../common" }
+tokio = { workspace = true }
+sqlx = { version = "0.8", features = ["postgres", "sqlite", "runtime-tokio-rustls", "chrono", "uuid", "macros"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+[lib]
+path = "mod.rs"

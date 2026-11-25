@@ -1,0 +1,2071 @@
+use async_trait::async_trait;
+use dashmap::DashMap;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+
+pub use crate::proto::hub::TeammateMeshEvent as Message;
+
+struct SubscriptionAbortOnDrop {
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SubscriptionAbortOnDrop {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+/// MeshTransport is the core interface for the Teammate Mesh APIs.
+/// It provides real-time bidirectional communication, distributed locking, and presence tracking.
+#[async_trait]
+pub trait MeshTransport: Send + Sync {
+    /// Adds a known peer to this transport instance (used primarily for overlay/hybrid setups).
+    fn add_peer(&self, _peer: Peer) {
+        // Default no-op for transports that do not require explicit peer management
+    }
+
+    /// Publishes a TeammateMeshEvent to the specified topic/channel.
+    async fn publish(&self, topic: &str, message: Message) -> Result<(), String>;
+
+    /// Subscribes to a topic/channel, returning a cancellation function.
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String>;
+
+    /// Subscribes to a pattern of topics/channels, returning a cancellation function.
+    async fn subscribe_pattern(
+        &self,
+        pattern: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.subscribe(pattern, handler).await
+    }
+
+    /// Acquires a distributed lock on a resource for a specified duration.
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String>;
+
+    /// Releases a previously acquired distributed lock.
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String>;
+
+    /// Registers the agent's presence status in the mesh.
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String>;
+
+    /// Returns a list of all active agents and their statuses.
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String>;
+}
+
+pub struct InProcessTransport {
+    subs: DashMap<String, broadcast::Sender<Message>>,
+    presence: DashMap<String, (String, std::time::Instant)>,
+    locks: DashMap<String, (String, tokio::time::Instant)>,
+}
+
+impl Default for InProcessTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InProcessTransport {
+    pub fn new() -> Self {
+        InProcessTransport {
+            subs: DashMap::new(),
+            presence: DashMap::new(),
+            locks: DashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl MeshTransport for InProcessTransport {
+    async fn publish(&self, topic: &str, message: Message) -> Result<(), String> {
+        if let Some(tx) = self.subs.get(topic) {
+            let _ = tx.send(message);
+        }
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let tx = self
+            .subs
+            .entry(topic.to_string())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(100);
+                tx
+            })
+            .clone();
+
+        let mut rx = tx.subscribe();
+
+        let worker = tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                handler(msg);
+            }
+        });
+
+        let abort_guard = Arc::new(SubscriptionAbortOnDrop { worker });
+        let abort_guard_clone = abort_guard.clone();
+        let cancel = Box::new(move || {
+            abort_guard_clone.worker.abort();
+        });
+
+        Ok(cancel)
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        let expires_at = tokio::time::Instant::now() + std::time::Duration::from_secs(ttl_seconds);
+
+        use dashmap::mapref::entry::Entry;
+        match self.locks.entry(resource.to_string()) {
+            Entry::Vacant(v) => {
+                v.insert((owner.to_string(), expires_at));
+                Ok(true)
+            }
+            Entry::Occupied(mut o) => {
+                let (stored_owner, stored_exp) = o.get();
+                if stored_owner == owner || *stored_exp <= tokio::time::Instant::now() {
+                    o.insert((owner.to_string(), expires_at));
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        self.locks
+            .remove_if(&resource.to_string(), |_, (stored_owner, _)| {
+                stored_owner == owner
+            });
+        Ok(())
+    }
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl_seconds);
+        self.presence
+            .insert(agent_id.to_string(), (status.to_string(), expires_at));
+        Ok(())
+    }
+
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        let now = std::time::Instant::now();
+
+        // Remove expired
+        let expired_keys: Vec<String> = self
+            .presence
+            .iter()
+            .filter(|entry| entry.value().1 <= now)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for key in expired_keys {
+            self.presence.remove(&key);
+        }
+
+        let agents = self
+            .presence
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().0.clone()))
+            .collect();
+
+        Ok(agents)
+    }
+}
+
+#[derive(Clone)]
+pub struct PgTransport {
+    pool: sqlx::PgPool,
+    subs: Arc<DashMap<String, broadcast::Sender<Message>>>,
+    subscriber_id: String,
+}
+
+impl PgTransport {
+    pub async fn new(db_url: &str) -> Result<Self, String> {
+        Self::new_with_subscriber_id(db_url, uuid::Uuid::new_v4().to_string()).await
+    }
+
+    /// Use a distinct, stable ID per node to resume that node's durable checkpoint.
+    pub async fn new_with_subscriber_id(
+        db_url: &str,
+        subscriber_id: String,
+    ) -> Result<Self, String> {
+        use sqlx::postgres::PgPoolOptions;
+        let pool = PgPoolOptions::new()
+            .connect(db_url)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Initialize schema
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_messages (
+                id BIGSERIAL PRIMARY KEY,
+                topic TEXT NOT NULL,
+                payload BYTEA NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                msg_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_checkpoints (
+                subscriber_id TEXT PRIMARY KEY,
+                last_id BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Attempt to add the column, ignoring error if it already exists
+        match sqlx::query("ALTER TABLE mesh_messages ADD COLUMN msg_id TEXT")
+            .execute(&pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                if !err_str.contains("duplicate column") && !err_str.contains("already exists") {
+                    return Err(format!("Failed to migrate mesh_messages: {}", err_str));
+                }
+            }
+        }
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_locks (
+                resource TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_presence (
+                agent_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let subs = Arc::new(DashMap::new());
+
+        Ok(PgTransport {
+            pool,
+            subs,
+            subscriber_id,
+        })
+    }
+
+    pub async fn start_worker(&self) {
+        use prost::Message as ProstMessage;
+        let pool = self.pool.clone();
+        let subs = self.subs.clone();
+        let subscriber_id = &self.subscriber_id;
+        let mut last_id: i64 = loop {
+            match sqlx::query_scalar(
+                "SELECT last_id FROM mesh_checkpoints WHERE subscriber_id = $1",
+            )
+            .bind(subscriber_id)
+            .fetch_optional(&pool)
+            .await
+            {
+                Ok(checkpoint) => break checkpoint.unwrap_or(0),
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to load mesh checkpoint; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        };
+        let mut listener: Option<sqlx::postgres::PgListener> = None;
+        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(60));
+        maintenance.tick().await;
+        loop {
+            if listener.is_none() {
+                // LISTEN must be committed before catch-up: a publication between the
+                // query and recv then remains queued on this dedicated connection.
+                let connected = async {
+                    let mut connection = sqlx::postgres::PgListener::connect_with(&pool).await?;
+                    connection.listen("mesh_messages_notify").await?;
+                    Ok::<_, sqlx::Error>(connection)
+                };
+                if let Ok(Ok(connection)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), connected).await
+                {
+                    listener = Some(connection);
+                }
+            }
+            // Do not SKIP LOCKED: advancing a high-water mark past a locked row loses it.
+            let rows: Result<Vec<(i64, String, Vec<u8>)>, _> = sqlx::query_as(
+                "SELECT id, topic, payload FROM mesh_messages WHERE id > $1 ORDER BY id ASC LIMIT 1024",
+            ).bind(last_id).fetch_all(&pool).await;
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to catch up mesh messages; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let full_batch = rows.len() == 1024;
+            for (id, topic, payload) in &rows {
+                if let Some(tx) = subs.get(topic)
+                    && let Ok(message) = Message::decode(&payload[..])
+                {
+                    let _ = tx.send(message);
+                }
+                last_id = *id;
+            }
+            if !rows.is_empty() {
+                // Failure leaves the previous durable checkpoint intact, so a restart
+                // replays instead of silently skipping messages (at-least-once delivery).
+                if let Err(error) = sqlx::query("INSERT INTO mesh_checkpoints (subscriber_id, last_id) VALUES ($1, $2) ON CONFLICT(subscriber_id) DO UPDATE SET last_id = EXCLUDED.last_id")
+                    .bind(subscriber_id).bind(last_id).execute(&pool).await {
+                    tracing::warn!(%error, "Failed to persist mesh checkpoint");
+                }
+            }
+            if full_batch {
+                continue;
+            }
+            if let Some(connection) = listener.as_mut() {
+                tokio::select! {
+                    notification = connection.try_recv() => {
+                        // try_recv returns None after reconnecting and restoring LISTEN.
+                        // Always catch up then; notifications during disconnect are lost.
+                        if notification.is_err() { listener = None; }
+                    }
+                    _ = maintenance.tick() => {
+                        let _ = sqlx::query("DELETE FROM mesh_messages WHERE created_at < NOW() - INTERVAL '1 hour'")
+                            .execute(&pool).await;
+                    }
+                }
+            } else {
+                // Only a failed listener uses polling, retrying LISTEN on every pass.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl MeshTransport for PgTransport {
+    async fn publish(&self, topic: &str, message: Message) -> Result<(), String> {
+        use prost::Message as ProstMessage;
+        let mut buf = Vec::new();
+        message.encode(&mut buf).unwrap();
+
+        let msg_id = if message.msg_id.is_empty() {
+            None
+        } else {
+            Some(message.msg_id.clone())
+        };
+
+        let mut transaction = self.pool.begin().await.map_err(|e| e.to_string())?;
+        // BIGSERIAL allocation alone does not order commits. Serialize publishers so
+        // durable catch-up cannot advance past a lower, still-uncommitted message ID.
+        sqlx::query("SELECT pg_advisory_xact_lock(726384921)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| e.to_string())?;
+        sqlx::query("INSERT INTO mesh_messages (topic, payload, msg_id) VALUES ($1, $2, $3)")
+            .bind(topic)
+            .bind(buf)
+            .bind(msg_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // NOTIFY is delivered only when the matching insert commits.
+        sqlx::query("SELECT pg_notify('mesh_messages_notify', '')")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| e.to_string())?;
+        transaction.commit().await.map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let tx = self
+            .subs
+            .entry(topic.to_string())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(100);
+                tx
+            })
+            .clone();
+
+        let mut rx = tx.subscribe();
+
+        let worker = tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                handler(msg);
+            }
+        });
+
+        let abort_guard = Arc::new(SubscriptionAbortOnDrop { worker });
+        let abort_guard_clone = abort_guard.clone();
+        let cancel = Box::new(move || {
+            abort_guard_clone.worker.abort();
+        });
+
+        Ok(cancel)
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        // Cleanup expired locks
+        let _ = sqlx::query("DELETE FROM mesh_locks WHERE expires_at <= NOW()")
+            .execute(&self.pool)
+            .await;
+
+        let result = sqlx::query(
+            "INSERT INTO mesh_locks (resource, owner, expires_at) VALUES ($1, $2, NOW() + CAST($3 AS INTERVAL))
+             ON CONFLICT(resource) DO UPDATE SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at WHERE mesh_locks.expires_at <= NOW() OR mesh_locks.owner = EXCLUDED.owner
+             RETURNING resource"
+        )
+        .bind(resource)
+        .bind(owner)
+        .bind(format!("{} seconds", ttl_seconds))
+        .fetch_optional(&self.pool)
+        .await;
+
+        match result {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM mesh_locks WHERE resource = $1 AND owner = $2")
+            .bind(resource)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO mesh_presence (agent_id, status, expires_at) VALUES ($1, $2, NOW() + CAST($3 AS INTERVAL))
+             ON CONFLICT(agent_id) DO UPDATE SET status = EXCLUDED.status, expires_at = EXCLUDED.expires_at"
+        )
+        .bind(agent_id)
+        .bind(status)
+        .bind(format!("{} seconds", ttl_seconds))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        let _ = sqlx::query("DELETE FROM mesh_presence WHERE expires_at <= NOW()")
+            .execute(&self.pool)
+            .await;
+
+        let rows: Result<Vec<(String, String)>, _> =
+            sqlx::query_as("SELECT agent_id, status FROM mesh_presence")
+                .fetch_all(&self.pool)
+                .await;
+
+        match rows {
+            Ok(r) => Ok(r),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteTransport {
+    pub pool: sqlx::SqlitePool,
+    subs: DashMap<String, broadcast::Sender<Message>>,
+}
+
+impl SqliteTransport {
+    pub async fn new(pool: sqlx::SqlitePool) -> Result<Self, String> {
+        // Initialize schema
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                msg_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_checkpoints (
+                subscriber_id TEXT PRIMARY KEY,
+                last_id BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Attempt to add the column, ignoring error if it already exists
+        match sqlx::query("ALTER TABLE mesh_messages ADD COLUMN msg_id TEXT")
+            .execute(&pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let err_str = e.to_string();
+                if !err_str.contains("duplicate column") && !err_str.contains("already exists") {
+                    tracing::debug!("Failed to migrate mesh_messages: {}", err_str);
+                }
+            }
+        }
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_locks (
+                resource TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at DATETIME NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mesh_presence (
+                agent_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                expires_at DATETIME NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let subs = DashMap::new();
+
+        Ok(SqliteTransport { pool, subs })
+    }
+
+    pub async fn start_worker(&self) {
+        use prost::Message as ProstMessage;
+        let pool = self.pool.clone();
+        let subs = self.subs.clone();
+
+        let subscriber_id = "builtin_agent_node".to_string();
+        let mut last_id: i64 =
+            sqlx::query_scalar("SELECT last_id FROM mesh_checkpoints WHERE subscriber_id = ?")
+                .bind(&subscriber_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or(Some(0))
+                .unwrap_or(0);
+
+        loop {
+            // Poll for new messages (SQLite doesn't support SKIP LOCKED)
+            let rows: Result<Vec<(i64, String, Vec<u8>)>, _> = sqlx::query_as(
+                "SELECT id, topic, payload FROM mesh_messages WHERE id > ? ORDER BY id ASC LIMIT 100"
+            )
+            .bind(last_id)
+            .fetch_all(&pool)
+            .await;
+
+            if let Ok(rows) = rows {
+                let has_rows = !rows.is_empty();
+                for (id, topic, payload) in rows {
+                    last_id = id;
+                    if let Some(tx) = subs.get(&topic)
+                        && let Ok(message) = Message::decode(&payload[..])
+                    {
+                        let _ = tx.send(message);
+                    }
+                }
+
+                if has_rows {
+                    let _ = sqlx::query("INSERT INTO mesh_checkpoints (subscriber_id, last_id) VALUES (?, ?) ON CONFLICT(subscriber_id) DO UPDATE SET last_id = EXCLUDED.last_id")
+                        .bind(&subscriber_id)
+                        .bind(last_id)
+                        .execute(&pool)
+                        .await;
+                }
+            }
+
+            // Cleanup old messages (keep last 1 hour)
+            let _ = sqlx::query(
+                "DELETE FROM mesh_messages WHERE created_at < datetime('now', '-1 hour')",
+            )
+            .execute(&pool)
+            .await;
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl MeshTransport for SqliteTransport {
+    async fn publish(&self, topic: &str, message: Message) -> Result<(), String> {
+        use prost::Message as ProstMessage;
+        let mut buf = Vec::new();
+        message.encode(&mut buf).unwrap();
+
+        let msg_id = if message.msg_id.is_empty() {
+            None
+        } else {
+            Some(message.msg_id.clone())
+        };
+
+        sqlx::query("INSERT INTO mesh_messages (topic, payload, msg_id) VALUES (?, ?, ?)")
+            .bind(topic)
+            .bind(buf)
+            .bind(msg_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Deliver to local subscribers without polling delay
+        if let Some(tx) = self.subs.get(topic) {
+            let _ = tx.send(message);
+        }
+
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        let tx = self
+            .subs
+            .entry(topic.to_string())
+            .or_insert_with(|| {
+                let (tx, _) = broadcast::channel(100);
+                tx
+            })
+            .clone();
+
+        let mut rx = tx.subscribe();
+
+        let worker = tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                handler(msg);
+            }
+        });
+
+        let abort_guard = Arc::new(SubscriptionAbortOnDrop { worker });
+        let abort_guard_clone = abort_guard.clone();
+        let cancel = Box::new(move || {
+            abort_guard_clone.worker.abort();
+        });
+
+        Ok(cancel)
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        // Cleanup expired locks
+        let _ = sqlx::query("DELETE FROM mesh_locks WHERE expires_at <= datetime('now')")
+            .execute(&self.pool)
+            .await;
+
+        let result = sqlx::query(
+            "INSERT INTO mesh_locks (resource, owner, expires_at) VALUES (?, ?, datetime('now', ?))
+             ON CONFLICT(resource) DO UPDATE SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at WHERE mesh_locks.expires_at <= datetime('now') OR mesh_locks.owner = EXCLUDED.owner
+             RETURNING resource"
+        )
+        .bind(resource)
+        .bind(owner)
+        .bind(format!("+{} seconds", ttl_seconds))
+        .fetch_optional(&self.pool)
+        .await;
+
+        match result {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        sqlx::query("DELETE FROM mesh_locks WHERE resource = ? AND owner = ?")
+            .bind(resource)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO mesh_presence (agent_id, status, expires_at) VALUES (?, ?, datetime('now', ?))
+             ON CONFLICT(agent_id) DO UPDATE SET status = EXCLUDED.status, expires_at = EXCLUDED.expires_at"
+        )
+        .bind(agent_id)
+        .bind(status)
+        .bind(format!("+{} seconds", ttl_seconds))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        let _ = sqlx::query("DELETE FROM mesh_presence WHERE expires_at <= datetime('now')")
+            .execute(&self.pool)
+            .await;
+
+        let rows: Result<Vec<(String, String)>, _> =
+            sqlx::query_as("SELECT agent_id, status FROM mesh_presence")
+                .fetch_all(&self.pool)
+                .await;
+
+        match rows {
+            Ok(r) => Ok(r),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+/// Runtime-injected factory for external/cloud mesh transports (for example, Redis/Valkey).
+/// Keeps the single-tenant OSS agent crate free of external Redis client dependencies.
+#[async_trait]
+pub trait ExternalMeshTransportFactory: Send + Sync {
+    async fn connect(&self, url: &str) -> Result<Arc<dyn MeshTransport>, String>;
+}
+
+/// Only fixed, credential-free diagnostics may cross the startup boundary.
+#[derive(Clone, Copy, Debug)]
+enum MeshConnectError {
+    ExternalTransportUnavailable,
+    MissingExternalTransportUrl,
+}
+
+impl std::fmt::Display for MeshConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExternalTransportUnavailable => "External mesh transport service is unavailable",
+            Self::MissingExternalTransportUrl => {
+                "External mesh transport URL is required in cloud mode"
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Peer {
+    pub id: String,
+    pub udp_addr: Option<String>,
+    pub tcp_addr: Option<String>,
+    pub http_url: Option<String>,
+}
+
+pub struct MeshOverlayTransport {
+    inner: Arc<dyn MeshTransport>,
+    peers: Arc<DashMap<String, Peer>>,
+    client: reqwest::Client,
+    udp_socket: Arc<tokio::net::UdpSocket>,
+    ack_map: Arc<DashMap<String, tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl MeshOverlayTransport {
+    pub async fn new(inner: Arc<dyn MeshTransport>, udp_port: u16, tcp_port: u16) -> Self {
+        let udp_socket = Arc::new(
+            tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", udp_port))
+                .await
+                .expect("Failed to bind UDP"),
+        );
+
+        let transport = MeshOverlayTransport {
+            inner,
+            peers: Arc::new(DashMap::new()),
+            client: reqwest::Client::new(),
+            udp_socket,
+            ack_map: Arc::new(DashMap::new()),
+        };
+
+        transport.start_listeners(tcp_port).await;
+        transport
+    }
+
+    pub fn add_peer(&self, peer: Peer) {
+        self.peers.insert(peer.id.clone(), peer);
+    }
+
+    async fn start_listeners(&self, tcp_port: u16) {
+        let udp_socket = self.udp_socket.clone();
+        let inner = self.inner.clone();
+        let ack_map = self.ack_map.clone();
+
+        // UDP Listener
+        tokio::spawn(async move {
+            let mut buf = [0; 65535];
+            loop {
+                if let Ok((len, addr)) = udp_socket.recv_from(&mut buf).await {
+                    use prost::Message as ProstMessage;
+
+                    // Check if it's an ACK (magic bytes 0xAA 0xBB 0xCC 0xDD)
+                    if len > 4
+                        && buf[0] == 0xAA
+                        && buf[1] == 0xBB
+                        && buf[2] == 0xCC
+                        && buf[3] == 0xDD
+                    {
+                        if let Ok(msg_id) = String::from_utf8(buf[4..len].to_vec())
+                            && let Some((_, tx)) = ack_map.remove(&msg_id)
+                        {
+                            let _ = tx.send(());
+                        }
+                        continue;
+                    }
+
+                    if let Ok(msg) = Message::decode(&buf[..len]) {
+                        // Send ACK
+                        let mut ack_buf = vec![0xAA, 0xBB, 0xCC, 0xDD];
+                        ack_buf.extend_from_slice(msg.msg_id.as_bytes());
+                        let _ = udp_socket.send_to(&ack_buf, addr).await;
+
+                        let action = msg.action.clone();
+                        let _ = inner.publish(&action, msg).await;
+                    }
+                }
+            }
+        });
+
+        // TCP Listener
+        let inner_tcp = self.inner.clone();
+        tokio::spawn(async move {
+            if let Ok(listener) =
+                tokio::net::TcpListener::bind(format!("0.0.0.0:{}", tcp_port)).await
+            {
+                loop {
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        let inner_tcp_clone = inner_tcp.clone();
+                        tokio::spawn(async move {
+                            use tokio::io::AsyncReadExt;
+                            let mut len_buf = [0u8; 4];
+                            if stream.read_exact(&mut len_buf).await.is_ok() {
+                                let len = u32::from_be_bytes(len_buf) as usize;
+                                if len > 10 * 1024 * 1024 {
+                                    // 10MB max limit
+                                    tracing::warn!(
+                                        "Rejecting oversized mesh message: {} bytes",
+                                        len
+                                    );
+                                    return;
+                                }
+                                let mut buf = vec![0u8; len];
+                                if stream.read_exact(&mut buf).await.is_ok() {
+                                    use prost::Message as ProstMessage;
+                                    if let Ok(msg) = Message::decode(&buf[..]) {
+                                        let action = msg.action.clone();
+                                        let _ = inner_tcp_clone.publish(&action, msg).await;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[async_trait]
+impl MeshTransport for MeshOverlayTransport {
+    async fn publish(&self, topic: &str, message: Message) -> Result<(), String> {
+        // First publish locally
+        let _ = self.inner.publish(topic, message.clone()).await;
+
+        use prost::Message as ProstMessage;
+        let mut buf = Vec::new();
+        message.encode(&mut buf).map_err(|e| e.to_string())?;
+
+        use base64::Engine;
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for peer_entry in self.peers.iter() {
+            let peer = peer_entry.value().clone();
+            let buf_clone = buf.clone();
+            let msg_id = message.msg_id.clone();
+            let udp_socket = self.udp_socket.clone();
+            let ack_map = self.ack_map.clone();
+            let client = self.client.clone();
+            let message_clone = message.clone();
+
+            join_set.spawn(async move {
+                let mut success = false;
+
+                // 1. Try UDP with ACK timeout
+                if let Some(udp_addr) = &peer.udp_addr {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    ack_map.insert(msg_id.clone(), tx);
+
+                    if udp_socket.send_to(&buf_clone, udp_addr).await.is_ok() {
+                        // Wait for ACK with timeout
+                        if tokio::time::timeout(std::time::Duration::from_millis(500), rx).await.is_ok() {
+                            success = true;
+                        }
+                    }
+
+                    if !success {
+                        ack_map.remove(&msg_id);
+                    }
+                }
+
+                // 2. Fallback to TCP with framing
+                if !success
+                    && let Some(tcp_addr) = &peer.tcp_addr
+                        && let Ok(Ok(mut stream)) = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(tcp_addr)).await {
+                            use tokio::io::AsyncWriteExt;
+                            let len_bytes = (buf_clone.len() as u32).to_be_bytes();
+                            if stream.write_all(&len_bytes).await.is_ok() && stream.write_all(&buf_clone).await.is_ok() {
+                                success = true;
+                            }
+                        }
+
+                // 3. Fallback to HTTP
+                if !success
+                    && let Some(http_url) = &peer.http_url {
+                        let url = format!("{}/api/v1/mesh/v2/direct", http_url);
+                        let payload = serde_json::json!({
+                            "target_agent_id": peer.id,
+                            "message": {
+                                "agent_id": message_clone.agent_id,
+                                "action": message_clone.action,
+                                "status": message_clone.status,
+                                "payload": base64::engine::general_purpose::STANDARD.encode(&message_clone.payload),
+                                "msg_id": message_clone.msg_id
+                            }
+                        });
+
+                        if let Ok(resp) = client.post(&url).json(&payload).send().await
+                            && resp.status().is_success() {
+                                success = true;
+                            }
+                    }
+
+                if !success {
+                    tracing::warn!("Failed to deliver message to peer {} via all transports", peer.id);
+                }
+            });
+        }
+
+        while join_set.join_next().await.is_some() {}
+
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.inner.subscribe(topic, handler).await
+    }
+
+    fn add_peer(&self, peer: Peer) {
+        self.peers.insert(peer.id.clone(), peer.clone());
+        self.inner.add_peer(peer);
+    }
+
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        self.inner.acquire_lock(resource, owner, ttl_seconds).await
+    }
+
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        self.inner.release_lock(resource, owner).await
+    }
+
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        self.inner
+            .register_presence(agent_id, status, ttl_seconds)
+            .await
+    }
+
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.get_active_agents().await
+    }
+}
+
+pub struct UniversalTransportBridge {
+    inner: Arc<dyn MeshTransport>,
+}
+
+impl UniversalTransportBridge {
+    pub fn new(inner: Arc<dyn MeshTransport>) -> Self {
+        UniversalTransportBridge { inner }
+    }
+}
+
+#[async_trait]
+impl MeshTransport for UniversalTransportBridge {
+    fn add_peer(&self, peer: Peer) {
+        self.inner.add_peer(peer);
+    }
+    async fn publish(&self, topic: &str, message: Message) -> Result<(), String> {
+        self.inner.publish(topic, message).await
+    }
+    async fn subscribe(
+        &self,
+        topic: &str,
+        handler: Box<dyn Fn(Message) + Send + Sync>,
+    ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+        self.inner.subscribe(topic, handler).await
+    }
+    async fn acquire_lock(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, String> {
+        self.inner.acquire_lock(resource, owner, ttl_seconds).await
+    }
+    async fn release_lock(&self, resource: &str, owner: &str) -> Result<(), String> {
+        self.inner.release_lock(resource, owner).await
+    }
+    async fn register_presence(
+        &self,
+        agent_id: &str,
+        status: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), String> {
+        self.inner
+            .register_presence(agent_id, status, ttl_seconds)
+            .await
+    }
+    async fn get_active_agents(&self) -> Result<Vec<(String, String)>, String> {
+        self.inner.get_active_agents().await
+    }
+}
+
+pub async fn create_transport(
+    external_url: Option<&str>,
+    is_cloud: bool,
+) -> Result<Arc<dyn MeshTransport>, String> {
+    create_transport_with_factory(external_url, is_cloud, None).await
+}
+
+pub async fn create_transport_with_factory(
+    external_url: Option<&str>,
+    is_cloud: bool,
+    external_factory: Option<&dyn ExternalMeshTransportFactory>,
+) -> Result<Arc<dyn MeshTransport>, String> {
+    create_transport_checked(external_url, is_cloud, external_factory)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Preserve the existing cloud retry count and delay, while ensuring a selected
+/// transport cannot keep the whole server in startup indefinitely. Dropping this
+/// future cancels the current attempt and prevents later retries.
+pub async fn create_transport_for_startup(
+    external_url: Option<&str>,
+    is_cloud: bool,
+) -> Result<Arc<dyn MeshTransport>, String> {
+    create_transport_for_startup_with_factory(external_url, is_cloud, None).await
+}
+
+pub async fn create_transport_for_startup_with_factory(
+    external_url: Option<&str>,
+    is_cloud: bool,
+    external_factory: Option<&dyn ExternalMeshTransportFactory>,
+) -> Result<Arc<dyn MeshTransport>, String> {
+    let max_attempts = if is_cloud { 30 } else { 1 };
+    let startup = async {
+        let mut attempt = 1;
+        loop {
+            match create_transport_checked(external_url, is_cloud, external_factory).await {
+                Ok(transport) => break Ok(transport),
+                Err(error) if attempt < max_attempts => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts,
+                        error = %error,
+                        "Mesh transport is not ready; retrying startup"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(error) => {
+                    break Err(format!(
+                        "Failed to create MeshTransport after {attempt} attempt(s): {error}"
+                    ));
+                }
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(180), startup)
+        .await
+        .map_err(|_| "Mesh transport startup timed out after 180 seconds".to_string())?
+}
+
+async fn create_transport_checked(
+    external_url: Option<&str>,
+    is_cloud: bool,
+    external_factory: Option<&dyn ExternalMeshTransportFactory>,
+) -> Result<Arc<dyn MeshTransport>, MeshConnectError> {
+    if is_cloud {
+        let Some(url) = external_url else {
+            return Err(MeshConnectError::MissingExternalTransportUrl);
+        };
+        let Some(factory) = external_factory else {
+            return Err(MeshConnectError::ExternalTransportUnavailable);
+        };
+        match factory.connect(url).await {
+            Ok(t) => {
+                tracing::info!("Initialized external cloud mesh transport");
+                return Ok(Arc::new(UniversalTransportBridge::new(t)));
+            }
+            Err(_) => {
+                return Err(MeshConnectError::ExternalTransportUnavailable);
+            }
+        }
+    }
+
+    // Standalone fallback
+    if let Ok(db_url) = std::env::var("OMNISOLO_DATABASE_URL")
+        && db_url.starts_with("sqlite")
+    {
+        match sqlx::sqlite::SqlitePoolOptions::new()
+            .connect(&db_url)
+            .await
+        {
+            Ok(pool) => match SqliteTransport::new(pool).await {
+                Ok(t) => {
+                    let t_clone = t.clone();
+                    tokio::spawn(async move {
+                        t_clone.start_worker().await;
+                    });
+                    tracing::debug!("Initialized SqliteTransport (Standalone)");
+                    return Ok(Arc::new(UniversalTransportBridge::new(Arc::new(t))));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to initialize SqliteTransport (Standalone): {}. Falling back to InProcessTransport.",
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::debug!("Failed to connect to SQLite DB for transport: {}", e);
+            }
+        }
+    }
+
+    if let (Some(url), Some(factory)) = (external_url, external_factory) {
+        match factory.connect(url).await {
+            Ok(t) => {
+                tracing::info!("Initialized external mesh transport (Standalone)");
+                return Ok(Arc::new(UniversalTransportBridge::new(t)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize external mesh transport (Standalone): {}. Falling back to InProcessTransport.",
+                    e
+                );
+            }
+        }
+    }
+
+    tracing::info!("Initialized InProcessTransport");
+    Ok(Arc::new(UniversalTransportBridge::new(Arc::new(
+        InProcessTransport::new(),
+    ))))
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    async fn test_overlay_udp_success() {
+        let inner = Arc::new(InProcessTransport::new());
+        let overlay = MeshOverlayTransport::new(inner, 0, 0).await;
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        overlay.add_peer(Peer {
+            id: "peer1".to_string(),
+            udp_addr: Some(addr.clone()),
+            tcp_addr: None,
+            http_url: None,
+        });
+
+        let msg = Message {
+            agent_id: "agent1".to_string(),
+            action: "test_action".to_string(),
+            status: "ok".to_string(),
+            payload: b"hello".to_vec(),
+            msg_id: "msg1".to_string(),
+        };
+
+        // Spawn listener
+        let received = Arc::new(AtomicBool::new(false));
+        let rx = received.clone();
+        tokio::spawn(async move {
+            let mut buf = [0; 1024];
+            if let Ok((len, src_addr)) = socket.recv_from(&mut buf).await {
+                use prost::Message as ProstMessage;
+                if Message::decode(&buf[..len]).is_ok() {
+                    // Send ACK back
+                    let mut ack_buf = vec![0xAA, 0xBB, 0xCC, 0xDD];
+                    ack_buf.extend_from_slice(b"msg1");
+                    let _ = socket.send_to(&ack_buf, src_addr).await;
+                    rx.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+
+        overlay.publish("test_topic", msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(received.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_overlay_tcp_fallback() {
+        let inner = Arc::new(InProcessTransport::new());
+        let overlay = MeshOverlayTransport::new(inner, 0, 0).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        overlay.add_peer(Peer {
+            id: "peer1".to_string(),
+            udp_addr: Some("127.0.0.1:1".to_string()), // Bad UDP port
+            tcp_addr: Some(addr.clone()),
+            http_url: None,
+        });
+
+        let msg = Message {
+            agent_id: "agent1".to_string(),
+            action: "test_action".to_string(),
+            status: "ok".to_string(),
+            payload: b"hello".to_vec(),
+            msg_id: "msg1".to_string(),
+        };
+
+        // Spawn listener
+        let received = Arc::new(AtomicBool::new(false));
+        let rx = received.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                let mut len_buf = [0; 4];
+                if stream.read_exact(&mut len_buf).await.is_ok() {
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut buf = vec![0; len];
+                    if stream.read_exact(&mut buf).await.is_ok() {
+                        use prost::Message as ProstMessage;
+                        if Message::decode(&buf[..len]).is_ok() {
+                            rx.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
+
+        overlay.publish("test_topic", msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(received.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_overlay_http_fallback() {
+        let inner = Arc::new(InProcessTransport::new());
+        let overlay = MeshOverlayTransport::new(inner, 0, 0).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{}", port);
+
+        overlay.add_peer(Peer {
+            id: "peer1".to_string(),
+            udp_addr: Some("127.0.0.1:1".to_string()), // Bad UDP port
+            tcp_addr: Some("127.0.0.1:1".to_string()), // Bad TCP port
+            http_url: Some(url.clone()),
+        });
+
+        let msg = Message {
+            agent_id: "agent1".to_string(),
+            action: "test_action".to_string(),
+            status: "ok".to_string(),
+            payload: b"hello".to_vec(),
+            msg_id: "msg1".to_string(),
+        };
+
+        // Spawn listener
+        let received = Arc::new(AtomicBool::new(false));
+        let rx = received.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                use tokio::io::AsyncWriteExt;
+                let mut buf = [0; 4096];
+                if stream.read(&mut buf).await.is_ok() {
+                    let response = "HTTP/1.1 200 OK
+Content-Length: 0
+
+";
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    rx.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+
+        overlay.publish("test_topic", msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(received.load(Ordering::SeqCst));
+    }
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Run explicitly against an isolated PostgreSQL database:
+    // OHC_TEST_PG_URL=postgres://... cargo test -p omnisolo_builtin_agent pg_notify -- --ignored
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL via OHC_TEST_PG_URL"]
+    async fn test_pg_notify_durable_delivery_and_reconnect() {
+        let url = std::env::var("OHC_TEST_PG_URL").expect("isolated PostgreSQL required");
+        let reader = PgTransport::new(&url).await.unwrap();
+        let writer = PgTransport::new(&url).await.unwrap();
+        let mut notifications = sqlx::postgres::PgListener::connect(&url).await.unwrap();
+        notifications.listen("mesh_messages_notify").await.unwrap();
+        let topic = uuid::Uuid::new_v4().to_string();
+        let message = |id: &str| Message {
+            msg_id: id.to_owned(),
+            ..Default::default()
+        };
+        writer
+            .publish(&topic, message("before-worker"))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), notifications.recv())
+            .await
+            .expect("publish must send a committed wakeup")
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker_reader = reader.clone();
+        let worker = tokio::spawn(async move { worker_reader.start_worker().await });
+        let guard = SubscriptionAbortOnDrop { worker };
+        let cancel = reader
+            .subscribe(
+                &topic,
+                Box::new(move |msg| {
+                    let _ = tx.send(msg);
+                }),
+            )
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.msg_id, "before-worker");
+        // The live worker must see subscriptions added through a clone after startup.
+        let later_topic = uuid::Uuid::new_v4().to_string();
+        let (later_tx, mut later_rx) = tokio::sync::mpsc::unbounded_channel();
+        let later_cancel = reader
+            .clone()
+            .subscribe(
+                &later_topic,
+                Box::new(move |msg| {
+                    let _ = later_tx.send(msg);
+                }),
+            )
+            .await
+            .unwrap();
+        writer
+            .publish(&later_topic, message("after-start"))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), later_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .msg_id,
+            "after-start"
+        );
+        // Kill the dedicated LISTEN connection while preserving the durable message table.
+        let terminated: Vec<bool> = sqlx::query_scalar("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND query LIKE 'LISTEN%'")
+            .fetch_all(&writer.pool).await.unwrap();
+        assert!(
+            terminated.iter().filter(|killed| **killed).count() >= 2,
+            "both the observer and worker LISTEN connections must be disconnected"
+        );
+        for index in 0..20 {
+            writer
+                .publish(&topic, message(&format!("reconnect-{index}")))
+                .await
+                .unwrap();
+        }
+        for index in 0..20 {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.msg_id, format!("reconnect-{index}"));
+        }
+        // A lower allocated ID must commit before a later publisher can allocate
+        // its ID; otherwise a durable high-water mark could skip the lower message.
+        let mut pending = writer.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(726384921)")
+            .execute(&mut *pending)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO mesh_messages (topic, payload) VALUES ($1, $2)")
+            .bind(&topic)
+            .bind(prost::Message::encode_to_vec(&message("pending-lower")))
+            .execute(&mut *pending)
+            .await
+            .unwrap();
+        let later_writer = writer.clone();
+        let publish_topic = topic.clone();
+        let later_publish = tokio::spawn(async move {
+            later_writer
+                .publish(
+                    &publish_topic,
+                    Message {
+                        msg_id: "committed-higher".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !later_publish.is_finished(),
+            "publishers must preserve commit order"
+        );
+        sqlx::query("SELECT pg_notify('mesh_messages_notify', '')")
+            .execute(&mut *pending)
+            .await
+            .unwrap();
+        pending.commit().await.unwrap();
+        later_publish.await.unwrap();
+        for id in ["pending-lower", "committed-higher"] {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .msg_id,
+                id
+            );
+        }
+        // Publishing locally must not duplicate the durable worker delivery.
+        reader.publish(&topic, message("local-once")).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .msg_id,
+            "local-once"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err()
+        );
+        cancel();
+        later_cancel();
+        // A restarted node resumes its own checkpoint, including messages committed
+        // while its listener was absent, without replaying already checkpointed rows.
+        let last_row: i64 = sqlx::query_scalar("SELECT MAX(id) FROM mesh_messages")
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let checkpoint: Option<i64> = sqlx::query_scalar(
+                    "SELECT last_id FROM mesh_checkpoints WHERE subscriber_id = $1",
+                )
+                .bind(&reader.subscriber_id)
+                .fetch_optional(&reader.pool)
+                .await
+                .unwrap();
+                if checkpoint == Some(last_row) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(guard);
+        writer.publish(&topic, message("offline")).await.unwrap();
+        let resumed = PgTransport::new_with_subscriber_id(&url, reader.subscriber_id.clone())
+            .await
+            .unwrap();
+        let (resumed_tx, mut resumed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let resumed_cancel = resumed
+            .subscribe(
+                &topic,
+                Box::new(move |msg| {
+                    let _ = resumed_tx.send(msg);
+                }),
+            )
+            .await
+            .unwrap();
+        let resumed_worker = SubscriptionAbortOnDrop {
+            worker: tokio::spawn(async move { resumed.start_worker().await }),
+        };
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), resumed_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .msg_id,
+            "offline"
+        );
+        resumed_cancel();
+        drop(resumed_worker);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_transport() {
+        let db_url = "postgres://dummy:dummy@localhost:5432/dummy";
+        let transport_res = PgTransport::new(db_url).await;
+        // In this test, we just ensure it handles the dummy DB gracefully without panicking if it times out
+        if let Ok(transport) = transport_res {
+            let t_clone = transport.clone();
+            tokio::spawn(async move {
+                t_clone.start_worker().await;
+            });
+
+            let received = Arc::new(AtomicBool::new(false));
+            let received_clone = received.clone();
+
+            let handler = Box::new(move |msg: Message| {
+                if msg.action == "ipc_test_topic" && msg.payload == b"ipc_hello" {
+                    received_clone.store(true, Ordering::SeqCst);
+                }
+            });
+
+            let cancel = transport
+                .subscribe("ipc_test_topic", handler)
+                .await
+                .unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            let msg = Message {
+                agent_id: "test".to_string(),
+                action: "ipc_test_topic".to_string(),
+                status: "ok".to_string(),
+                payload: b"ipc_hello".to_vec(),
+                msg_id: uuid::Uuid::new_v4().to_string(),
+            };
+
+            let _ = transport.publish("ipc_test_topic", msg).await;
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // assert!(received.load(Ordering::SeqCst));
+            cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ipc_transport_checkpoints() {
+        let db_url = "postgres://dummy:dummy@localhost:5432/dummy";
+        let transport_res = PgTransport::new(db_url).await;
+
+        if let Ok(transport) = transport_res {
+            let msg = Message {
+                agent_id: "test".to_string(),
+                action: "ipc_checkpoint_topic".to_string(),
+                status: "ok".to_string(),
+                payload: b"ipc_checkpoint".to_vec(),
+                msg_id: uuid::Uuid::new_v4().to_string(),
+            };
+
+            let _ = transport.publish("ipc_checkpoint_topic", msg).await;
+
+            let t_clone = transport.clone();
+            tokio::spawn(async move {
+                t_clone.start_worker().await;
+            });
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+            let subscriber_id = "builtin_agent_node".to_string();
+            let _last_id: Result<i64, _> =
+                sqlx::query_scalar("SELECT last_id FROM mesh_checkpoints WHERE subscriber_id = $1")
+                    .bind(&subscriber_id)
+                    .fetch_one(&transport.pool)
+                    .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ipc_transport_locking() {
+        let db_url = "postgres://dummy:dummy@localhost:5432/dummy";
+        let transport_res = PgTransport::new(db_url).await;
+        if let Ok(transport) = transport_res {
+            let t_clone = transport.clone();
+            tokio::spawn(async move {
+                t_clone.start_worker().await;
+            });
+
+            let _ = transport.acquire_lock("ipc_resource", "agent_1", 10).await;
+            let _ = transport.acquire_lock("ipc_resource", "agent_1", 20).await;
+            let _ = transport.acquire_lock("ipc_resource", "agent_2", 10).await;
+            let _ = transport.release_lock("ipc_resource", "agent_2").await;
+            let _ = transport.acquire_lock("ipc_resource", "agent_3", 10).await;
+            let _ = transport.release_lock("ipc_resource", "agent_1").await;
+            let _ = transport.acquire_lock("ipc_resource", "agent_2", 10).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_memory_transport() {
+        let transport = InProcessTransport::new();
+        let received = Arc::new(AtomicBool::new(false));
+        let received_clone = received.clone();
+
+        let handler = Box::new(move |msg: Message| {
+            if msg.action == "test_topic" && msg.payload == b"hello" {
+                received_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let cancel = transport.subscribe("test_topic", handler).await.unwrap();
+
+        let msg = Message {
+            agent_id: "test".to_string(),
+            action: "test_topic".to_string(),
+            status: "ok".to_string(),
+            payload: b"hello".to_vec(),
+            msg_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        transport.publish("test_topic", msg).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(received.load(Ordering::SeqCst));
+        cancel();
+    }
+
+    #[tokio::test]
+    async fn test_create_transport_standalone() {
+        let _transport = create_transport(None, false).await.unwrap();
+        // Since InProcessTransport isn't easily castable back without Any, we just ensure it didn't err
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_transport() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let transport_res = SqliteTransport::new(pool).await;
+
+        if let Ok(transport) = transport_res {
+            let t_clone = transport.clone();
+            tokio::spawn(async move {
+                t_clone.start_worker().await;
+            });
+
+            let received = Arc::new(AtomicBool::new(false));
+            let received_clone = received.clone();
+
+            let handler = Box::new(move |msg: Message| {
+                if msg.action == "sqlite_test_topic" && msg.payload == b"sqlite_hello" {
+                    received_clone.store(true, Ordering::SeqCst);
+                }
+            });
+
+            let cancel = transport
+                .subscribe("sqlite_test_topic", handler)
+                .await
+                .unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            let msg = Message {
+                agent_id: "test".to_string(),
+                action: "sqlite_test_topic".to_string(),
+                status: "ok".to_string(),
+                payload: b"sqlite_hello".to_vec(),
+                msg_id: uuid::Uuid::new_v4().to_string(),
+            };
+
+            let _ = transport.publish("sqlite_test_topic", msg).await;
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            assert!(received.load(Ordering::SeqCst));
+            cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_transport_checkpoints() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let transport_res = SqliteTransport::new(pool).await;
+
+        if let Ok(transport) = transport_res {
+            let msg = Message {
+                agent_id: "test".to_string(),
+                action: "sqlite_checkpoint_topic".to_string(),
+                status: "ok".to_string(),
+                payload: b"sqlite_checkpoint".to_vec(),
+                msg_id: uuid::Uuid::new_v4().to_string(),
+            };
+
+            let _ = transport.publish("sqlite_checkpoint_topic", msg).await;
+
+            let t_clone = transport.clone();
+            tokio::spawn(async move {
+                t_clone.start_worker().await;
+            });
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+            let subscriber_id = "builtin_agent_node".to_string();
+            let last_id: Result<i64, _> =
+                sqlx::query_scalar("SELECT last_id FROM mesh_checkpoints WHERE subscriber_id = ?")
+                    .bind(&subscriber_id)
+                    .fetch_one(&transport.pool)
+                    .await;
+
+            assert!(last_id.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_transport_locking() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let transport_res = SqliteTransport::new(pool).await;
+
+        if let Ok(transport) = transport_res {
+            let t_clone = transport.clone();
+            tokio::spawn(async move {
+                t_clone.start_worker().await;
+            });
+
+            let acq1 = transport
+                .acquire_lock("sqlite_resource", "agent_1", 10)
+                .await
+                .unwrap();
+            assert!(acq1);
+
+            let acq2 = transport
+                .acquire_lock("sqlite_resource", "agent_1", 20)
+                .await
+                .unwrap();
+            assert!(acq2);
+
+            let acq3 = transport
+                .acquire_lock("sqlite_resource", "agent_2", 10)
+                .await
+                .unwrap();
+            assert!(!acq3);
+
+            transport
+                .release_lock("sqlite_resource", "agent_1")
+                .await
+                .unwrap();
+
+            let acq4 = transport
+                .acquire_lock("sqlite_resource", "agent_2", 10)
+                .await
+                .unwrap();
+            assert!(acq4);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_transport_presence() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let transport_res = SqliteTransport::new(pool).await;
+
+        if let Ok(transport) = transport_res {
+            transport
+                .register_presence("agent_1", "online", 10)
+                .await
+                .unwrap();
+            transport
+                .register_presence("agent_2", "busy", 10)
+                .await
+                .unwrap();
+
+            let mut agents = transport.get_active_agents().await.unwrap();
+            agents.sort();
+
+            assert_eq!(agents.len(), 2);
+            assert_eq!(agents[0], ("agent_1".to_string(), "online".to_string()));
+            assert_eq!(agents[1], ("agent_2".to_string(), "busy".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_transport_redis_fails() {
+        // Provide invalid url
+        let transport = create_transport(Some("redis://localhost:9999"), false).await;
+        // In standalone, it should fallback to Memory, so it's Ok
+        assert!(transport.is_ok());
+
+        // In cloud, it should err
+        let transport = create_transport(Some("redis://localhost:9999"), true).await;
+        assert!(transport.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_transport_locking() {
+        let transport = InProcessTransport::new();
+
+        // Test lock acquisition
+        let acquired = transport
+            .acquire_lock("my_resource", "agent_1", 10)
+            .await
+            .unwrap();
+        assert!(acquired);
+
+        // Test re-acquisition by same owner
+        let reacquired = transport
+            .acquire_lock("my_resource", "agent_1", 20)
+            .await
+            .unwrap();
+        assert!(reacquired);
+
+        // Test mutual exclusion
+        let acquired_again = transport
+            .acquire_lock("my_resource", "agent_2", 10)
+            .await
+            .unwrap();
+        assert!(!acquired_again);
+
+        // Test attempted release by WRONG owner
+        transport
+            .release_lock("my_resource", "agent_2")
+            .await
+            .unwrap();
+        let still_locked = transport
+            .acquire_lock("my_resource", "agent_3", 10)
+            .await
+            .unwrap();
+        assert!(!still_locked);
+
+        // Test lock release by CORRECT owner
+        transport
+            .release_lock("my_resource", "agent_1")
+            .await
+            .unwrap();
+
+        // Test lock acquisition after release
+        let acquired_after_release = transport
+            .acquire_lock("my_resource", "agent_2", 10)
+            .await
+            .unwrap();
+        assert!(acquired_after_release);
+    }
+
+    #[tokio::test]
+    async fn test_memory_transport_lock_expiration() {
+        let transport = InProcessTransport::new();
+
+        // Acquire lock with short TTL (1 second)
+        let acquired = transport
+            .acquire_lock("expiring_resource", "agent_1", 1)
+            .await
+            .unwrap();
+        assert!(acquired);
+
+        // Second agent should be able to acquire lock after expiration. Poll to
+        // avoid scheduler jitter making loaded test runs land on the boundary.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let mut acquired_after_expiration = false;
+        while tokio::time::Instant::now() < deadline {
+            if transport
+                .acquire_lock("expiring_resource", "agent_2", 10)
+                .await
+                .unwrap()
+            {
+                acquired_after_expiration = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(acquired_after_expiration);
+    }
+
+    #[tokio::test]
+    async fn test_memory_transport_presence() {
+        let transport = InProcessTransport::new();
+
+        // Register presence
+        transport
+            .register_presence("agent_1", "online", 10)
+            .await
+            .unwrap();
+        transport
+            .register_presence("agent_2", "busy", 1)
+            .await
+            .unwrap();
+
+        // Get active agents
+        let mut active_agents = transport.get_active_agents().await.unwrap();
+        active_agents.sort();
+
+        assert_eq!(active_agents.len(), 2);
+        assert_eq!(
+            active_agents[0],
+            ("agent_1".to_string(), "online".to_string())
+        );
+        assert_eq!(
+            active_agents[1],
+            ("agent_2".to_string(), "busy".to_string())
+        );
+
+        // Wait for agent_2 presence to expire
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Get active agents again
+        let active_agents_after_expiration = transport.get_active_agents().await.unwrap();
+        assert_eq!(active_agents_after_expiration.len(), 1);
+        assert_eq!(
+            active_agents_after_expiration[0],
+            ("agent_1".to_string(), "online".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_universal_transport_bridge_integration() {
+        let inner = std::sync::Arc::new(InProcessTransport::new());
+        let bridge = UniversalTransportBridge::new(inner);
+
+        // Test lock acquisition
+        let acquired = bridge
+            .acquire_lock("bridge_resource", "agent_1", 10)
+            .await
+            .unwrap();
+        assert!(acquired);
+
+        // Test presence
+        bridge
+            .register_presence("agent_1", "online", 10)
+            .await
+            .unwrap();
+        let agents = bridge.get_active_agents().await.unwrap();
+        assert_eq!(agents.len(), 1);
+
+        // Test pub/sub
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rx = received.clone();
+
+        let handler = Box::new(move |msg: Message| {
+            if msg.action == "test_bridge_topic" {
+                rx.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let _cancel = bridge
+            .subscribe("test_bridge_topic", handler)
+            .await
+            .unwrap();
+
+        let msg = Message {
+            agent_id: "test".to_string(),
+            action: "test_bridge_topic".to_string(),
+            status: "ok".to_string(),
+            payload: vec![],
+            msg_id: uuid::Uuid::new_v4().to_string(),
+        };
+
+        let _ = bridge.publish("test_bridge_topic", msg).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}

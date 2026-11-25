@@ -1,0 +1,32 @@
+{
+  "skill_pack": "viral_widgets",
+  "version": "1.0.0",
+  "mcp_server": "ohc-viral-widgets-mcp",
+  "protocol_version": "2025-03-26",
+  "required_mcp_tools": [
+    "viral_widgets.list",
+    "viral_widgets.get_schema",
+    "viral_widgets.configure",
+    "viral_widgets.generate_embed"
+  ],
+  "standing_authority_policy": "draft_first_require_owner_confirmation",
+  "skills": [
+    {
+      "id": "viral_widgets_configurator",
+      "file": "SKILL.md",
+      "name": "Viral Widgets Configurator",
+      "summary": "End-to-end owner interview, validation, confirmation, and CSP-safe embed generation for all viral widgets."
+    },
+    {
+      "id": "viral_referral_and_discount_widgets",
+      "file": "referral_and_discount_widgets.md",
+      "name": "Viral Referral & Discount Widget Configuration",
+      "summary": "Margin, redemption code, and standing-authority workflow for incentive and gamification widgets."
+    },
+    {
+      "id": "viral_booking_and_social_proof_widgets",
+      "file": "booking_and_social_proof_widgets.md",
+      "summary": "Consent, truthfulness, WCAG 2.2 AA, and CSP-safe workflow for booking, milestone, testimonial, and social-proof widgets."
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+import React from 'react';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import PreOrderWidgetPage from './page';
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({
+    push: vi.fn(),
+  }),
+}));
+
+
+describe('PreOrderWidgetPage', () => {
+  it('exposes real selected theme state and preserves repeat selection', () => {
+    render(<PreOrderWidgetPage />);
+    const light=screen.getByRole('button',{name:'Light'});
+    const dark=screen.getByRole('button',{name:'Dark'});
+    expect(light).toHaveAttribute('aria-pressed','true');
+    expect(dark).toHaveAttribute('aria-pressed','false');
+    fireEvent.click(dark);
+    expect(light).toHaveAttribute('aria-pressed','false');
+    expect(dark).toHaveAttribute('aria-pressed','true');
+    fireEvent.click(dark);
+    expect(dark).toHaveAttribute('aria-pressed','true');
+    fireEvent.click(screen.getByText('Get Widget Embed Code'));
+    expect(screen.getByText(/data-theme="dark"/)).toBeInTheDocument();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows soft paywall when checkbox is checked without pro and includes viral loop option', () => {
+    render(<PreOrderWidgetPage />);
+
+    // Click checkbox
+    const checkbox = screen.getByLabelText('Remove "Powered by OmniSolo" branding');
+    fireEvent.click(checkbox);
+
+    // Check if soft paywall shows up
+    expect(screen.getAllByText('Upgrade to Pro')).toBeDefined();
+
+    // Check if viral loop option is present
+    expect(screen.getByText('Check trial availability')).toBeDefined();
+
+    // Checkbox should be un-checked
+    expect((checkbox as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('updates embed code and preview based on branding toggle', () => {
+    render(<PreOrderWidgetPage />);
+
+    // Initially, branding should be present
+    expect(screen.getByText('⚡ Powered by OmniSolo')).toBeDefined();
+
+    // Open Modal
+    fireEvent.click(screen.getByText('Get Widget Embed Code'));
+
+    // Check embed code in modal
+    const embedContainer = screen.getByText(/<script src="https:\/\/cloud\.omnisolo\.co\/widgets\/pre-order\.js" async><\/script>/);
+    expect(embedContainer.parentElement?.textContent).toContain('Powered by OmniSolo');
+  });
+
+  it('renders the configuration form correctly', () => {
+    render(<PreOrderWidgetPage />);
+    expect(screen.getByText('Pre-Order Waitlist Engine')).toBeInTheDocument();
+    expect(screen.getByText('Product Name')).toBeInTheDocument();
+    expect(screen.getByText('Special Offer (Optional)')).toBeInTheDocument();
+    expect(screen.getByText('Theme')).toBeInTheDocument();
+  });
+
+  it('updates the live preview when form is filled', () => {
+    render(<PreOrderWidgetPage />);
+    const nameInput = screen.getByPlaceholderText('e.g. The Vegan Chocolate Cake');
+    fireEvent.change(nameInput, { target: { value: 'Limited Sneakers' } });
+
+    // Check that live preview reflects the change
+    expect(screen.getByText('Limited Sneakers')).toBeInTheDocument();
+  });
+
+  it('shows the embed modal when button is clicked', () => {
+    render(<PreOrderWidgetPage />);
+
+    // Check that modal is not initially visible
+    expect(screen.queryByText('Embed Your Waitlist')).not.toBeInTheDocument();
+
+    const embedButton = screen.getByText('Get Widget Embed Code');
+    fireEvent.click(embedButton);
+
+    // Check that modal is visible
+    expect(screen.getByText('Embed Your Waitlist')).toBeInTheDocument();
+  });
+});
