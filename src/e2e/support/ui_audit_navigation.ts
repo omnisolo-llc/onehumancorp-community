@@ -107,9 +107,20 @@ export function createAuditNavigation(baseURL: string, authenticate: (page: Page
       }
       const documentation = destination.pathname === '/api-docs' ? observeApiDocumentation(page, origin) : undefined;
       try {
-        // Only a GET navigation may be repeated after observed authentication loss.
+        // Only a GET navigation may be repeated after observed authentication
+        // loss or a transient Chromium Linux ERR_NETWORK_CHANGED blip.
         // No target preparation, form fill or user action occurs before this gate.
-        const response = await page.goto(destination.href, { waitUntil: 'load' });
+        let response: Response | null = null;
+        for (let navAttempt = 0; navAttempt < 3; navAttempt += 1) {
+          try {
+            response = await page.goto(destination.href, { waitUntil: 'load' });
+            break;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!/ERR_NETWORK_CHANGED|chrome-error:\/\//.test(message) || navAttempt === 2) throw error;
+            await page.waitForTimeout(250 * (navAttempt + 1));
+          }
+        }
         await page.waitForLoadState('networkidle', { timeout: 100 }).catch(() => undefined);
         await page.waitForTimeout(100);
         if (destination.pathname === '/share-card') {

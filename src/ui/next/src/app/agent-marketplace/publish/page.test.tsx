@@ -24,3 +24,22 @@ it('does not send private edits during rendering and restores them only for the 
  let view=render(<Page/>);await ready();fireEvent.change(screen.getByLabelText('System Prompt'),{target:{value:'Unsubmitted private draft'}});expect(backend.posts()).toHaveLength(0);
  view.unmount();await act(async()=>{});view=render(<Page/>);await ready();expect(screen.getByLabelText('System Prompt')).toHaveValue('Unsubmitted private draft');expect(backend.posts()).toHaveLength(0);view.unmount();
 });
+it('keeps main aria-busy while verifying access and clears it once publication controls are enabled',async()=>{
+ let releaseIdentity!:(response:Response)=>void;
+ let identityReleased=false;
+ backend.fetch.mockImplementation(async(url,init)=>{
+  if(url==='/api/v1/auth/session-identity'&&!identityReleased){
+   return new Promise<Response>(resolve=>{releaseIdentity=response=>{identityReleased=true;resolve(response);};});
+  }
+  return backend.route(url,init);
+ });
+ render(<Page/>);
+ const main=screen.getByRole('main');
+ expect(main).toHaveAttribute('aria-busy','true');
+ expect(screen.getByRole('button',{name:'Review Publication'})).toBeDisabled();
+ await waitFor(()=>expect(releaseIdentity).toBeDefined());
+ await act(async()=>{releaseIdentity(Response.json({...backend.state.owner,expiresAt:Date.now()+60_000}));});
+ await ready();
+ expect(main).toHaveAttribute('aria-busy','false');
+ expect(screen.getByRole('button',{name:'Review Publication'})).toBeEnabled();
+});

@@ -70,6 +70,7 @@ test("all application pages render through the real authenticated service", asyn
       !request.url().startsWith("data:") &&
       !failure.includes("ERR_ABORTED") &&
       !failure.includes("NS_BINDING_ABORTED") &&
+      !failure.includes("ERR_NETWORK_CHANGED") &&
       !failure.includes("aborted")
     ) {
       requestFailures.push(`${failure} ${request.url()}`);
@@ -79,7 +80,7 @@ test("all application pages render through the real authenticated service", asyn
     if (message.type() === "error") {
       const text = message.text();
       if (text.includes("Failed to load resource: the server responded with a status of 404")) return;
-      if (text.includes("Failed to fetch") || text.includes("ERR_ABORTED") || text.includes("aborted")) return;
+      if (text.includes("Failed to fetch") || text.includes("ERR_ABORTED") || text.includes("ERR_NETWORK_CHANGED") || text.includes("aborted")) return;
       consoleErrors.push({ text, url: message.location().url });
     }
   });
@@ -92,47 +93,78 @@ test("all application pages render through the real authenticated service", asyn
 
   for (const route of discoverApplicationRoutes(undefined, { tenant: actor.tenantId })) {
     try {
-      const response = await page.goto(new URL(route, baseUrl).toString(), {
-        waitUntil: "domcontentloaded",
-        timeout: 45_000,
-      });
-      if (!response) {
-        routeFailures.push(`${route} did not return a document`);
-        continue;
-      }
-      if (response.status() >= 400) {
-        routeFailures.push(`${response.status()} ${route}`);
-      }
-      // The root route also redirects here; retain that document until its
-      // owned savings response is verified before the next navigation.
-      if (new URL(response.url()).pathname === '/dashboard') {
-        const savings = page.getByRole('region', { name: 'Recorded time savings' });
-        await expect(savings.getByRole('heading', { name: 'Recorded time savings' })).toBeVisible();
-        await expect(savings.getByText('Recorded time-savings data is unavailable.', { exact: true })).toBeVisible();
-        await expect(savings.getByText(/hours saved|inquiries handled|appointments scheduled/i)).toHaveCount(0);
-        // Retain the actual policy body before navigation can evict its document.
-        await Promise.all(policyChecks);
-      }
-      if (route === '/goose-mcp') {
-        await expect(page.getByRole('alert').filter({ hasText: runtimeUnavailableMessage })).toBeVisible();
-        await expect(page.getByText('No extensions found.', { exact: true })).toHaveCount(0);
-        await expect(page.getByRole('button', { name: 'Execute', exact: true })).toHaveCount(0);
-      }
-      if (route === '/sona') {
-        await expect(page.getByRole('alert').filter({ hasText: runtimeUnavailableMessage })).toBeVisible();
-        await expect(page.getByText('No patterns recorded yet.', { exact: true })).toHaveCount(0);
-      }
-      if (route === '/settings') {
-        await expect(page.getByText('Voice settings are unavailable in this deployment. No provider action can be started.', { exact: true })).toBeVisible();
-        await expect(page.getByRole('checkbox', { name: 'Enable AI Voice Receptionist', exact: true })).toBeDisabled();
-        await expect(page.getByRole('button', { name: 'Get Number', exact: true })).toHaveCount(0);
-      }
-      const body = await page.locator("body").innerText();
-      if (/Generated Offering|AI description|mock data|fake data/i.test(body)) {
-        contentFailures.push(`${route} contains fabricated data`);
-      }
-      if (/OneHumanCorp|One Human Corp|Powered by OHC/i.test(body.replaceAll("OmniSolo OneHumanCorp", "OmniSolo"))) {
-        contentFailures.push(`${route} contains legacy branding`);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        let networkChanged = false;
+        const onRouteRequestFailed = (request: { failure(): { errorText: string } | null }) => {
+          if (request.failure()?.errorText?.includes("ERR_NETWORK_CHANGED")) networkChanged = true;
+        };
+        const trackFailures = typeof page.on === "function" && typeof page.off === "function";
+        if (trackFailures) page.on("requestfailed", onRouteRequestFailed);
+        try {
+          const response = await page.goto(new URL(route, baseUrl).toString(), {
+            waitUntil: "domcontentloaded",
+            timeout: 45_000,
+          });
+          if (!response) {
+            if (networkChanged && attempt < 2) {
+              if (typeof page.waitForTimeout === "function") await page.waitForTimeout(250 * (attempt + 1));
+              continue;
+            }
+            routeFailures.push(`${route} did not return a document`);
+            break;
+          }
+          if (response.status() >= 400) {
+            routeFailures.push(`${response.status()} ${route}`);
+          }
+          // The root route also redirects here; retain that document until its
+          // owned savings response is verified before the next navigation.
+          if (new URL(response.url()).pathname === '/dashboard') {
+            const savings = page.getByRole('region', { name: 'Recorded time savings' });
+            await expect(savings.getByRole('heading', { name: 'Recorded time savings' })).toBeVisible();
+            await expect(savings.getByText('Recorded time-savings data is unavailable.', { exact: true })).toBeVisible();
+            await expect(savings.getByText(/hours saved|inquiries handled|appointments scheduled/i)).toHaveCount(0);
+            // Retain the actual policy body before navigation can evict its document.
+            await Promise.all(policyChecks);
+          }
+          if (route === '/goose-mcp') {
+            await expect(page.getByRole('alert').filter({ hasText: runtimeUnavailableMessage })).toBeVisible();
+            await expect(page.getByText('No extensions found.', { exact: true })).toHaveCount(0);
+            await expect(page.getByRole('button', { name: 'Execute', exact: true })).toHaveCount(0);
+            await Promise.all(policyChecks);
+          }
+          if (route === '/sona') {
+            await expect(page.getByRole('alert').filter({ hasText: runtimeUnavailableMessage })).toBeVisible();
+            await expect(page.getByText('No patterns recorded yet.', { exact: true })).toHaveCount(0);
+            await Promise.all(policyChecks);
+          }
+          if (route === '/settings') {
+            await expect(page.getByText('Voice settings are unavailable in this deployment. No provider action can be started.', { exact: true })).toBeVisible();
+            await expect(page.getByRole('checkbox', { name: 'Enable AI Voice Receptionist', exact: true })).toBeDisabled();
+            await expect(page.getByRole('button', { name: 'Get Number', exact: true })).toHaveCount(0);
+            await Promise.all(policyChecks);
+          }
+          if (networkChanged && attempt < 2) {
+            if (typeof page.waitForTimeout === "function") await page.waitForTimeout(250 * (attempt + 1));
+            continue;
+          }
+          const body = await page.locator("body").innerText();
+          if (/Generated Offering|AI description|mock data|fake data/i.test(body)) {
+            contentFailures.push(`${route} contains fabricated data`);
+          }
+          if (/OneHumanCorp|One Human Corp|Powered by OHC/i.test(body.replaceAll("OmniSolo OneHumanCorp", "OmniSolo"))) {
+            contentFailures.push(`${route} contains legacy branding`);
+          }
+          break;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if ((networkChanged || /ERR_NETWORK_CHANGED|chrome-error:\/\//.test(message)) && attempt < 2) {
+            if (typeof page.waitForTimeout === "function") await page.waitForTimeout(250 * (attempt + 1));
+            continue;
+          }
+          throw error;
+        } finally {
+          if (trackFailures) page.off("requestfailed", onRouteRequestFailed);
+        }
       }
     } catch (error) {
       routeFailures.push(`${route}: ${error instanceof Error ? error.message : String(error)}`);

@@ -83,3 +83,64 @@ it('still rejects all unfinished destination API and RSC requests at the unchang
   expect(f.now()).toBeGreaterThanOrEqual(5000);
   expect(f.now()).toBeLessThan(5500);
 });
+
+it('reloads a baseline dashboard read immediately when ERR_NETWORK_CHANGED aborts initial fetches', async () => {
+  vi.mocked(e2eDbTransaction).mockImplementation(async operation => operation(async (sql, parameters = []) => {
+    if (sql.includes('SELECT u.id')) return [{ id: parameters[0], tenant_id: parameters[2] }];
+    if (sql.includes('AS tenants')) return [{ tenants: 5, feed: 8, approvals: 2, inbox: 1, products: 2, opportunities: 2, onboarding: 0, quotes: 1, quote_lines: 1 }];
+    return [];
+  }));
+  const listeners = new Map<string, ((event: unknown) => void)[]>();
+  const emit = (name: string, event: unknown) => listeners.get(name)?.forEach(listener => listener(event));
+  let url = 'about:blank';
+  let rootVisits = 0;
+  const waiters: { predicate: (response: BrowserResponse) => boolean; resolve: (response: BrowserResponse) => void }[] = [];
+  const makeRequest = (destination: string, errorText?: string) => ({
+    url: () => destination, method: () => 'GET', resourceType: () => 'fetch',
+    frame: () => ({ url: () => url }),
+    failure: () => (errorText ? { errorText } : null),
+  }) as unknown as Request;
+  const makeResponse = (req: Request, status = 200) => ({
+    request: () => req, url: () => req.url(), status: () => status,
+    headers: () => ({ 'content-type': 'application/json' }), json: async () => ({}), finished: async () => null,
+  }) as unknown as BrowserResponse;
+  const goto = vi.fn(async (destination: string) => {
+    if (destination === 'about:blank') { url = destination; return { status: () => 200 }; }
+    url = `${origin}/dashboard`;
+    rootVisits += 1;
+    if (rootVisits === 1) {
+      const abortedFeed = makeRequest(`${origin}/api/v1/ui/dashboard/unified-feed`, 'net::ERR_NETWORK_CHANGED');
+      emit('request', abortedFeed);
+      emit('requestfailed', abortedFeed);
+    } else {
+      for (const path of ['/api/v1/ui/dashboard/unified-feed', '/api/v1/growth/milestone', '/api/v1/growth/team-invites/aggregated-metrics']) {
+        const req = makeRequest(`${origin}${path}`);
+        const res = makeResponse(req, 200);
+        emit('request', req);
+        emit('response', res);
+        for (const waiter of waiters) if (waiter.predicate(res)) waiter.resolve(res);
+        emit('requestfinished', req);
+      }
+    }
+    return { status: () => 200 };
+  });
+  const context = {
+    on: (name: string, callback: (event: unknown) => void) => listeners.set(name, [...listeners.get(name) ?? [], callback]),
+    addInitScript: vi.fn(), newPage: async () => page, close: vi.fn(),
+  } as unknown as BrowserContext;
+  const page = {
+    context: () => context, goto, url: () => url,
+    waitForLoadState: vi.fn(async () => undefined), waitForTimeout: vi.fn(async () => undefined),
+    waitForFunction: async () => ({ dispose: vi.fn() }), evaluate: vi.fn(),
+    waitForResponse: (predicate: (response: BrowserResponse) => boolean) => new Promise<BrowserResponse>(resolve => waiters.push({ predicate, resolve })),
+    getByRole: () => ({ waitFor: vi.fn() }), getByText: () => ({ waitFor: vi.fn() }),
+    locator: () => ({ waitFor: vi.fn() }),
+    request: { get: async () => ({ status: () => 200, json: async () => ({ userId: owned.actor.userId, tenantId: owned.actor.tenantId }) }) },
+  } as unknown as Page;
+  const browser = { newContext: async () => context } as unknown as Browser;
+  const owned = await createDashboardAuditCase(browser, origin, { width: 1280, height: 720 });
+  const receipt = await owned.navigate('/');
+  expect(receipt.finalUrl).toBe(`${origin}/dashboard`);
+  expect(rootVisits).toBe(2);
+  expect(goto.mock.calls.map(([dest]) => dest)).toEqual([`${origin}/`, 'about:blank', `${origin}/`]);
+});

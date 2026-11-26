@@ -290,3 +290,92 @@ for (const readable of [true, false]) {
     assert.deepEqual([...policyResult.verifiedPolicyUrls], [valid.url]);
   });
 }
+
+for (const [route, policyInput] of [
+  ['/goose-mcp', { ...valid, status: 503, url: valid.origin + '/api/v1/agents/goose', body: { error: runtime.runtimeUnavailableMessage } }],
+  ['/sona', { ...valid, status: 503, url: valid.origin + '/api/v1/sona', body: { error: runtime.runtimeUnavailableMessage } }],
+  ['/settings', { ...valid, status: 403, url: valid.origin + '/api/v1/settings/voice', body: { success: false,
+    error: 'hosted_global_provisioning_unavailable', provisioning_available: false,
+    provisioning_block_reason: 'hosted_global_provisioning_unavailable' } }],
+]) {
+  test(`the maintained crawl retains ${route} until its policy body settles before navigating onward`, async () => {
+    const policyResult = results(), navigations = [];
+    let resolveBody, enteredRoute;
+    const body = new Promise(resolve => { resolveBody = resolve; });
+    const entered = new Promise(resolve => { enteredRoute = resolve; });
+    const exports = {};
+    const locator = () => ({
+      filter: () => locator(),
+      getByRole: () => locator(),
+      getByText: () => locator(),
+    });
+    vm.runInNewContext(compile(`async function crawl() {
+      const routeFailures: string[] = [], contentFailures: string[] = [];
+      ${routeLoop.getText(source)}
+      return routeFailures;
+    }; exports.crawl = crawl;`), {
+      exports, URL, baseUrl: valid.origin, actor, discoverApplicationRoutes: () => [route, '/next'],
+      policyChecks: policyResult.policyChecks,
+      runtimeUnavailableMessage: runtime.runtimeUnavailableMessage,
+      page: {
+        goto: async url => {
+          const pathname = new URL(url).pathname;
+          navigations.push(pathname);
+          if (pathname === route) {
+            record(policyInput, policyResult, actor, () => body);
+            enteredRoute();
+          }
+          return { status: () => 200, url: () => url };
+        },
+        getByRole: () => locator(),
+        getByText: () => locator(),
+        locator: () => ({ innerText: async () => 'Policy route' }),
+      },
+      expect: () => ({
+        toBeVisible: async () => {},
+        toHaveCount: async () => {},
+        toBeDisabled: async () => {},
+      }),
+    });
+    const crawl = exports.crawl();
+    await entered;
+    await new Promise(setImmediate);
+    assert.deepEqual([...navigations], [route], `${route} must await policyChecks before navigating to /next`);
+    resolveBody(policyInput.body);
+    assert.deepEqual(Array.from(await crawl), []);
+    await Promise.all(policyResult.policyChecks);
+    assert.deepEqual(navigations, [route, '/next']);
+    assert.deepEqual([...policyResult.verifiedPolicyUrls], [policyInput.url]);
+  });
+}
+
+test('the maintained crawl retries a read-only route after ERR_NETWORK_CHANGED without cascading', async () => {
+  const policyResult = results(), visits = [];
+  let analyticsAttempts = 0;
+  const exports = {};
+  vm.runInNewContext(compile(`async function crawl() {
+    const routeFailures: string[] = [], contentFailures: string[] = [];
+    ${routeLoop.getText(source)}
+    return routeFailures;
+  }; exports.crawl = crawl;`), {
+    exports, URL, baseUrl: valid.origin, actor, discoverApplicationRoutes: () => ['/analytics', '/after-analytics'],
+    policyChecks: policyResult.policyChecks,
+    runtimeUnavailableMessage: runtime.runtimeUnavailableMessage,
+    page: {
+      goto: async url => {
+        const pathname = new URL(url).pathname;
+        visits.push(pathname);
+        if (pathname === '/analytics' && ++analyticsAttempts === 1) {
+          throw new Error(`page.goto: net::ERR_NETWORK_CHANGED at ${url}`);
+        }
+        return { status: () => 200, url: () => url };
+      },
+      waitForTimeout: async () => {},
+      getByRole: () => ({ filter: () => ({}) }),
+      locator: () => ({ innerText: async () => 'Analytics' }),
+    },
+    expect: () => ({ toBeVisible: async () => {}, toHaveCount: async () => {} }),
+  });
+  assert.deepEqual(Array.from(await exports.crawl()), []);
+  assert.deepEqual(visits, ['/analytics', '/analytics', '/after-analytics']);
+});

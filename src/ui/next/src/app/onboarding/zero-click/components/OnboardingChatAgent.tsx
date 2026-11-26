@@ -40,6 +40,7 @@ export function OnboardingChatAgent({ onComplete }: OnboardingChatAgentProps) {
   const busy = useRef(false);
   const epoch = useRef(0);
   const unknownPreparation = useRef(false);
+  const pendingSaves = useRef(new Set<Promise<void>>());
   useEffect(() => () => { epoch.current += 1; busy.current = false; }, []);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -97,15 +98,26 @@ export function OnboardingChatAgent({ onComplete }: OnboardingChatAgentProps) {
     }
   }, [messages, isLoading, isProvisioning, isLoaded]);
 
-  const saveStateToBackend = async (chatMessagesToSave: ChatMessage[]) => {
-    try {
-      await fetchForOnboardingOwner('/api/v1/onboarding/state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: -2, chatMessages: chatMessagesToSave }),
-      }, viewOwner);
-    } catch (err) {
-      console.error('Failed to save chat state', err);
+  const saveStateToBackend = (chatMessagesToSave: ChatMessage[]) => {
+    const write = (async () => {
+      try {
+        await fetchForOnboardingOwner('/api/v1/onboarding/state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ step: -2, chatMessages: chatMessagesToSave }),
+        }, viewOwner);
+      } catch (err) {
+        console.error('Failed to save chat state', err);
+      }
+    })();
+    pendingSaves.current.add(write);
+    void write.finally(() => { pendingSaves.current.delete(write); });
+    return write;
+  };
+
+  const waitForPendingSaves = async (active: () => boolean) => {
+    while (active() && pendingSaves.current.size > 0) {
+      await Promise.allSettled([...pendingSaves.current]);
     }
   };
 
@@ -150,6 +162,8 @@ export function OnboardingChatAgent({ onComplete }: OnboardingChatAgentProps) {
     const active = () => version === epoch.current;
     try {
       if ([...manualPrompt].length > 4000) throw new Error('Your setup description exceeds 4000 characters. Keep a shorter description before continuing manually.');
+      await waitForPendingSaves(active);
+      if (!active()) return;
       const owner = await initializeOnboardingDraft();
       if (!active()) return;
       const currentOwner = onboardingOwner();
@@ -169,6 +183,8 @@ export function OnboardingChatAgent({ onComplete }: OnboardingChatAgentProps) {
     const active = () => version === epoch.current;
     setIsProvisioning(true); setError(null);
     try {
+      await waitForPendingSaves(active);
+      if (!active()) return;
       if (unknownPreparation.current) {
         const response = await fetchForOnboardingOwner('/api/v1/onboarding/state', {}, viewOwner);
         if (!response.ok) throw new Error('Could not check the previous setup. Reload before retrying.');

@@ -174,3 +174,12 @@ it('an unresolved share-card redirect fails without repeating navigation or clic
   await expect(f.navigate(f.page, '/share-card')).rejects.toThrow('redirect timeout');
   expect(f.goto).toHaveBeenCalledTimes(1); expect(f.fill).not.toHaveBeenCalled();
 });
+
+it('recovers a read-only GET navigation interrupted by Chromium ERR_NETWORK_CHANGED', async () => {
+  const f = fixture();
+  f.goto.mockRejectedValueOnce(new Error('page.goto: net::ERR_NETWORK_CHANGED at https://fixture.test/dashboard'));
+  const receipt = await f.navigate(f.page, '/dashboard');
+  expect(receipt.finalUrl).toBe('https://fixture.test/dashboard');
+  expect(f.goto).toHaveBeenCalledTimes(2);
+  expect(f.authenticate).toHaveBeenCalledTimes(1);
+});

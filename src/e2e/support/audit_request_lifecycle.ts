@@ -40,6 +40,8 @@ export function observeAuditRequests(context: BrowserContext, baseURL: string) {
   const origin = new URL(baseURL).origin;
   const pending = new Map<Request, RequestRecord>();
   const recent: RequestRecord[] = [];
+  const networkChangeListeners = new Set<() => void>();
+  let networkChanges = 0;
   let sequence = 0;
   context.on('request', request => {
     const url = new URL(request.url());
@@ -71,9 +73,26 @@ export function observeAuditRequests(context: BrowserContext, baseURL: string) {
     if (recent.length > 20) recent.shift();
   };
   context.on('requestfinished', request => retire(request, 'finished'));
-  context.on('requestfailed', request => retire(request, 'failed'));
+  context.on('requestfailed', request => {
+    // Host Docker veth interface churn on Linux triggers Chromium's
+    // NetworkChangeNotifierLinux (net::ERR_NETWORK_CHANGED) across loopback.
+    if (request.failure()?.errorText?.includes('ERR_NETWORK_CHANGED')) {
+      try {
+        if (new URL(request.url()).origin === origin) {
+          networkChanges += 1;
+          for (const notify of networkChangeListeners) notify();
+        }
+      } catch { /* ignore malformed URL */ }
+    }
+    retire(request, 'failed');
+  });
   return {
     get size() { return pending.size; },
+    get networkChangeCount() { return networkChanges; },
+    onNetworkChange(listener: () => void) {
+      networkChangeListeners.add(listener);
+      return () => { networkChangeListeners.delete(listener); };
+    },
     snapshot() {
       const now = Date.now();
       const describe = ({ startedMs, ...record }: RequestRecord) => ({ ...record, elapsedMs: Math.max(0, now - startedMs) });

@@ -71,8 +71,9 @@ export default function AgentMarketplacePage() {
     const result = await session.perform({ kind: 'install', request_id: crypto.randomUUID(), definition: review });
     if (result?.status === 'installed_inactive') setReview(null);
   }
+  const busy = session.phase === 'verifying' || session.phase === 'working' || (loading && !!session.scope.current);
   const canInstall = session.phase === 'ready' && !loading && !error && !cursors.installed;
-  return <main className="min-h-screen bg-[#f4f6f8] p-8 font-outfit">
+  return <main aria-busy={busy} className="min-h-screen bg-[#f4f6f8] p-8 font-outfit">
     <div className="max-w-6xl mx-auto">
       <header className="flex justify-between gap-4 mb-6"><div><h1 className="text-4xl font-bold">Agent Marketplace</h1><p>Review public definitions and save inactive copies for your account.</p></div><Link href="/agent-marketplace/publish">Publish New Agent</Link></header>
       <p role="status" aria-label="Agent operation status">{session.message}</p>

@@ -63,7 +63,7 @@ export default function PublishAgentPage() {
     const receipt = await session.perform(pending.operation, true);
     if (receipt?.status === 'published') { setReview(null); router.push('/agent-marketplace'); }
   }
-  return <main className="min-h-screen bg-[#f4f6f8] p-8 font-outfit">
+  return <main aria-busy={session.phase === 'verifying' || session.phase === 'working'} className="min-h-screen bg-[#f4f6f8] p-8 font-outfit">
     <div className="max-w-3xl mx-auto">
       <h1 className="text-4xl font-bold mb-2">Publish New Agent</h1>
       <p className="mb-6">Prepare a versioned agent definition, then review its public fields before publication.</p>

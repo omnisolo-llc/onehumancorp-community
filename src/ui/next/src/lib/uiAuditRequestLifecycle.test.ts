@@ -102,3 +102,37 @@ it.each([
   const f = fixture(); f.emit('request', request('http://127.0.0.1:3000' + path));
   expect(snapshot(f.tracker).pending[0].path).toBe(expected);
 });
+
+it('tracks and notifies same-origin ERR_NETWORK_CHANGED failures without triggering on aborts or foreign origins', () => {
+  const f = fixture();
+  const notifications = vi.fn();
+  const stop = f.tracker.onNetworkChange(notifications);
+  const aborted = request('http://127.0.0.1:3000/api/v1/ui/dashboard/unified-feed');
+  f.emit('request', aborted);
+  f.emit('requestfailed', aborted);
+  expect(f.tracker.networkChangeCount).toBe(0);
+  expect(notifications).not.toHaveBeenCalled();
+
+  const foreignChanged = {
+    ...request('https://outside.invalid/api/v1/ui/dashboard/unified-feed'),
+    failure: () => ({ errorText: 'net::ERR_NETWORK_CHANGED' }),
+  } as unknown as Request;
+  f.emit('requestfailed', foreignChanged);
+  expect(f.tracker.networkChangeCount).toBe(0);
+  expect(notifications).not.toHaveBeenCalled();
+
+  const sameOriginChanged = {
+    ...request('http://127.0.0.1:3000/api/v1/ui/dashboard/unified-feed'),
+    failure: () => ({ errorText: 'net::ERR_NETWORK_CHANGED' }),
+  } as unknown as Request;
+  f.emit('request', sameOriginChanged);
+  f.emit('requestfailed', sameOriginChanged);
+  expect(f.tracker.networkChangeCount).toBe(1);
+  expect(notifications).toHaveBeenCalledTimes(1);
+  expect(f.tracker.size).toBe(0);
+
+  stop();
+  f.emit('requestfailed', sameOriginChanged);
+  expect(f.tracker.networkChangeCount).toBe(2);
+  expect(notifications).toHaveBeenCalledTimes(1);
+});

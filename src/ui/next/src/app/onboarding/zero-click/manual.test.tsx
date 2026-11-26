@@ -3,6 +3,7 @@ import { afterEach,beforeEach,expect,it,vi } from 'vitest';
 import { notifyQueueIdentityChange } from '@/lib/sync/queueIdentity';
 import { installOnboardingLocks } from '../testLocks';
 import { initializeOnboardingDraft,useOnboardingStore } from '../store';
+import { onboardingWriteVersion } from '../draftWriteGate';
 import { OnboardingChatAgent } from './components/OnboardingChatAgent';
 const navigation=vi.hoisted(()=>({push:vi.fn()}));vi.mock('next/navigation',()=>({useRouter:()=>navigation}));
 let owner={userId:'owner-a',tenantId:'tenant-a'};let chat:()=>Promise<Response>;
@@ -36,4 +37,41 @@ it('allows an explicit edited manual description while retaining the original co
  await send();await screen.findByRole('button',{name:'Review Details Manually'});fireEvent.change(screen.getByLabelText('Description for manual setup'),{target:{value:'Reviewed bicycle restoration services'}});
  await act(async()=>fireEvent.click(screen.getByRole('button',{name:'Review Details Manually'})));await waitFor(()=>expect(navigation.push).toHaveBeenCalledWith('/onboarding'));
  expect(useOnboardingStore.getState().bio).toBe('Reviewed bicycle restoration services');expect(screen.getByText('I restore bicycles in Portland',{selector:'div'})).toBeVisible();expect(mutations()).toHaveLength(0);
+});
+
+it('waits for an in-flight chat state save to finish before navigating to manual setup',async()=>{
+ let resolveSave!:(response:Response)=>void;
+ const base=vi.mocked(fetch).getMockImplementation()!;
+ vi.mocked(fetch).mockImplementation((url,init)=>String(url).endsWith('/state')&&init?.method==='POST'?new Promise<Response>(resolve=>{resolveSave=resolve;}):base(url,init));
+ let writeVersionAtPush:string|null=null;
+ navigation.push.mockImplementation(()=>{writeVersionAtPush=onboardingWriteVersion(owner);});
+ await send();
+ const manual=await screen.findByRole('button',{name:'Review Details Manually'});
+ await waitFor(()=>expect(resolveSave).toBeDefined());
+ fireEvent.click(manual);
+ await act(async()=>{await Promise.resolve();await Promise.resolve();});
+ expect(navigation.push).not.toHaveBeenCalled();
+ await act(async()=>{resolveSave(new Response(null,{status:204}));});
+ await waitFor(()=>expect(navigation.push).toHaveBeenCalledWith('/onboarding'));
+ expect(writeVersionAtPush).not.toBeNull();
+ expect(writeVersionAtPush).toBe(onboardingWriteVersion(owner));
+ expect(useOnboardingStore.getState()).toMatchObject({step:2,bio:'I restore bicycles in Portland',businessDescription:'I restore bicycles in Portland'});
+});
+
+it('still opens manual setup after a pending background chat state save fails',async()=>{
+ let rejectSave!:(cause:Error)=>void;
+ const base=vi.mocked(fetch).getMockImplementation()!;
+ vi.mocked(fetch).mockImplementation((url,init)=>String(url).endsWith('/state')&&init?.method==='POST'?new Promise<Response>((_resolve,reject)=>{rejectSave=reject;}):base(url,init));
+ const errorSpy=vi.spyOn(console,'error').mockImplementation(()=>{});
+ try {
+  await send();
+  const manual=await screen.findByRole('button',{name:'Review Details Manually'});
+  await waitFor(()=>expect(rejectSave).toBeDefined());
+  fireEvent.click(manual);
+  await act(async()=>{await Promise.resolve();await Promise.resolve();});
+  expect(navigation.push).not.toHaveBeenCalled();
+  await act(async()=>{rejectSave(new Error('Background state save failed'));});
+  await waitFor(()=>expect(navigation.push).toHaveBeenCalledWith('/onboarding'));
+  expect(useOnboardingStore.getState()).toMatchObject({step:2,bio:'I restore bicycles in Portland'});
+ } finally { errorSpy.mockRestore(); }
 });

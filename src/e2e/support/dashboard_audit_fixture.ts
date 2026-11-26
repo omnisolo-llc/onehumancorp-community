@@ -147,48 +147,89 @@ export async function createDashboardAuditCase(browser: Browser, baseURL: string
       const quoteRoute = quoteAuditRoutes.has(route);
       // Authentication is request-only inside navigate; do not mount an
       // unrelated dashboard whose startup work would outlive this document.
-      const initialReads = (quoteRoute ? [] : initialRouteReads[route]).map(path => page.waitForResponse(response =>
-        new URL(response.url()).origin === new URL(baseURL).origin && new URL(response.url()).pathname === path && response.request().method() === 'GET'));
-      // Complete the real initial reads before discovery; no API substitution.
-      const [receipt, responses] = await Promise.all([quoteRoute
-        ? navigateQuoteAudit(page, baseURL, route, ownedQuoteAuditRecord(actor), navigate)
-        : navigate(page, route), Promise.all(initialReads)]);
-      for (const response of responses) {
-        if (response.status() !== 200) throw new Error(`${route} baseline read failed: HTTP ${response.status()}`);
-        await response.finished();
+      // Only a read-only baseline GET interrupted by Chromium's Linux host
+      // network-change signal (net::ERR_NETWORK_CHANGED) may be reloaded here.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const startNetworkChanges = pending.networkChangeCount;
+        let stopNetworkWatch = () => {};
+        const networkChanged = new Promise<never>((_resolve, reject) => {
+          stopNetworkWatch = pending.onNetworkChange(() => reject(new Error(`${route} baseline read interrupted by net::ERR_NETWORK_CHANGED`)));
+        });
+        void networkChanged.catch(() => undefined);
+        const initialReads = (quoteRoute ? [] : initialRouteReads[route]).map(path => page.waitForResponse(response =>
+          new URL(response.url()).origin === new URL(baseURL).origin && new URL(response.url()).pathname === path && response.request().method() === 'GET'));
+        for (const read of initialReads) void read.catch(() => undefined);
+        const navigation = quoteRoute
+          ? navigateQuoteAudit(page, baseURL, route, ownedQuoteAuditRecord(actor), navigate)
+          : navigate(page, route);
+        void navigation.catch(() => undefined);
+        try {
+          // Complete the real initial reads before discovery; no API substitution.
+          const [receipt, responses] = await Promise.race([
+            Promise.all([navigation, Promise.all(initialReads)]),
+            networkChanged,
+          ]);
+          for (const response of responses) {
+            if (response.status() !== 200) throw new Error(`${route} baseline read failed: HTTP ${response.status()}`);
+            await response.finished();
+          }
+          await Promise.race([
+            (async () => {
+              if (route === '/inventory') {
+                await waitForInventoryAuditReady(page);
+              } else if (route === '/inbox') {
+                await page.getByText('Loading inbox messages...', { exact: true }).waitFor({ state: 'hidden' });
+                await page.getByTestId('inbox-settled').waitFor({ state: 'visible' });
+              } else if (route === '/field-ops/jobs') {
+                await page.getByText('Loading schedule...', { exact: true }).waitFor({ state: 'hidden' });
+                await page.getByRole('heading', { name: "Today's Route", exact: true }).waitFor({ state: 'visible' });
+              } else if (route === '/' || route === '/dashboard') {
+                await page.getByText('Loading business metrics…', { exact: true }).waitFor({ state: 'hidden' });
+                await page.getByText('Loading Agent Proposals...', { exact: true }).waitFor({ state: 'hidden' });
+                await page.getByText('Loading recorded orders…', { exact: true }).waitFor({ state: 'hidden' });
+                await page.locator('[data-testid="unlock-pro-features-widget"][aria-busy="false"]').waitFor({ state: 'visible' });
+                await page.locator('[data-testid="offline-queue-readiness"][data-state="ready"]').waitFor({ state: 'attached' });
+                await page.getByText(/Checking \d+ pending actions\.\.\./).waitFor({ state: 'hidden' });
+              } else if (route === '/unified-feed' || route === '/dashboard/unified-feed') {
+                await page.getByText('Loading feed...', { exact: true }).waitFor({ state: 'hidden' });
+              } else if (route === '/onboarding' || route === '/share-card') {
+                await page.getByText('Preparing your setup…', { exact: true }).waitFor({ state: 'hidden' });
+                await page.getByRole('button', { name: 'Upload Image', exact: true }).waitFor({ state: 'visible' });
+              } else if (route === '/feed') {
+                await page.getByText('Checking your feed...', { exact: true }).waitFor({ state: 'hidden' });
+              }
+            })(),
+            networkChanged,
+          ]);
+          if (pending.networkChangeCount !== startNetworkChanges) {
+            throw new Error(`${route} baseline read interrupted by net::ERR_NETWORK_CHANGED`);
+          }
+          const deadline = Date.now() + 5000;
+          while (true) {
+            // Rendering after completed responses is scheduled in the browser realm.
+            await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+            if (pending.size === 0) break;
+            if (Date.now() >= deadline) throw new Error(`${route} baseline reads did not settle before discovery; requests=${JSON.stringify(pending.snapshot())}`);
+            await page.waitForTimeout(25);
+          }
+          if (pending.networkChangeCount !== startNetworkChanges) {
+            throw new Error(`${route} baseline read interrupted by net::ERR_NETWORK_CHANGED`);
+          }
+          return receipt;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const transientNetwork = pending.networkChangeCount !== startNetworkChanges
+            || /ERR_NETWORK_CHANGED|chrome-error:\/\//.test(message);
+          if (!transientNetwork || attempt === 2) throw error;
+          // Retire the interrupted document before retrying the read-only GET.
+          await Promise.race([navigation.catch(() => undefined), page.waitForTimeout(250 * (attempt + 1))]);
+          await page.waitForTimeout(250 * (attempt + 1));
+          await page.goto('about:blank', { waitUntil: 'commit' }).catch(() => undefined);
+        } finally {
+          stopNetworkWatch();
+        }
       }
-      if (route === '/inventory') {
-        await waitForInventoryAuditReady(page);
-      } else if (route === '/inbox') {
-        await page.getByText('Loading inbox messages...', { exact: true }).waitFor({ state: 'hidden' });
-        await page.getByTestId('inbox-settled').waitFor({ state: 'visible' });
-      } else if (route === '/field-ops/jobs') {
-        await page.getByText('Loading schedule...', { exact: true }).waitFor({ state: 'hidden' });
-        await page.getByRole('heading', { name: "Today's Route", exact: true }).waitFor({ state: 'visible' });
-      } else if (route === '/' || route === '/dashboard') {
-        await page.getByText('Loading business metrics…', { exact: true }).waitFor({ state: 'hidden' });
-        await page.getByText('Loading Agent Proposals...', { exact: true }).waitFor({ state: 'hidden' });
-        await page.getByText('Loading recorded orders…', { exact: true }).waitFor({ state: 'hidden' });
-        await page.locator('[data-testid="unlock-pro-features-widget"][aria-busy="false"]').waitFor({ state: 'visible' });
-        await page.locator('[data-testid="offline-queue-readiness"][data-state="ready"]').waitFor({ state: 'attached' });
-        await page.getByText(/Checking \d+ pending actions\.\.\./).waitFor({ state: 'hidden' });
-      } else if (route === '/unified-feed' || route === '/dashboard/unified-feed') {
-        await page.getByText('Loading feed...', { exact: true }).waitFor({ state: 'hidden' });
-      } else if (route === '/onboarding' || route === '/share-card') {
-        await page.getByText('Preparing your setup…', { exact: true }).waitFor({ state: 'hidden' });
-        await page.getByRole('button', { name: 'Upload Image', exact: true }).waitFor({ state: 'visible' });
-      } else if (route === '/feed') {
-        await page.getByText('Checking your feed...', { exact: true }).waitFor({ state: 'hidden' });
-      }
-      const deadline = Date.now() + 5000;
-      while (true) {
-        // Rendering after completed responses is scheduled in the browser realm.
-        await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-        if (pending.size === 0) break;
-        if (Date.now() >= deadline) throw new Error(`${route} baseline reads did not settle before discovery; requests=${JSON.stringify(pending.snapshot())}`);
-        await page.waitForTimeout(25);
-      }
-      return receipt;
+      throw new Error(`${route} baseline reads did not complete`);
     } };
   } catch (error) {
     await context.close();
